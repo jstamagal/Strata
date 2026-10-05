@@ -20,6 +20,7 @@
 #undef __ballot_sync
 #endif
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -35,9 +36,47 @@
 #include <set>
 #include <tuple>
 #endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+#include "rocblas_tuning.hpp"
+#include <hip/hip_runtime_api.h>
+#include <rocblas/rocblas.h>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <system_error>
+#include <tuple>
+#endif
+
+#if defined(__HIPCC__)
+#include <hip/hip_fp16.h>
+#endif
 
 namespace strata::prefill {
 namespace {
+#if defined(__HIPCC__)
+// Y's rows, written by an FP16-out GEMM as FP16 at the start of each FP32 row (ldc = 2 ldy halves), widened in place.
+// Float c overwrites halves 2c and 2c+1, so a row is walked from its end in blocks: a block's halves are read into
+// registers, the block syncs, then writes its floats - which only cover halves of blocks already read.
+__global__ void widen_rows_f16(float* __restrict__ Y, int64_t n, int64_t ldy) {
+    float* y = Y + (int64_t) blockIdx.x * ldy;
+    const __half* h = reinterpret_cast<const __half*>(y);
+    const int64_t nb = (n + blockDim.x - 1) / blockDim.x;
+    for (int64_t b = nb - 1; b >= 0; --b) {
+        const int64_t c = b * blockDim.x + threadIdx.x;
+        const float v = c < n ? __half2float(h[c]) : 0.0f;
+        __syncthreads();
+        if (c < n) y[c] = v;
+        __syncthreads();
+    }
+}
+// BF16 weight rows -> FP16, saturated (bench/results/2026-10-04-rdna2-fp16-prompt: none leaves FP16's range)
+__global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restrict__ d, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x) {
+        const float f = __uint_as_float((uint32_t) s[i] << 16);
+        d[i] = __float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f));   // as hf_sat: a NaN stays NaN
+    }
+}
+#endif
 
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -295,11 +334,169 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
 }
 #endif
 
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+// The rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING: a table file, or a directory holding
+// <arch>-rocblas-<version>.txt for this card and rocBLAS build; src/prefill/rocblas_tuning.hpp).  rocBLAS's own
+// pick for some shapes is up to 6x slower than the best kernel it holds for them (gfx1030: tools/hip/tune_rocblas.cpp).
+struct RocBlasState {
+    rocblas_handle handle = nullptr;
+    strata::prefill::rocblas_tuning::Table table;
+    struct Pick { bool tuned = false; int solution = 0; int refusals = 0; };
+    std::map<std::tuple<int, int, int, int>, Pick> cache;   // (T, N, K, ldy) -> the solution to run, or the default
+    uint64_t tuned_launches = 0;
+    uint64_t fallbacks = 0;
+
+    ~RocBlasState() {
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            std::fprintf(stderr, "prefill gemm: rocBLAS tuning summary tuned_launches=%llu fallbacks=%llu\n",
+                         (unsigned long long) tuned_launches, (unsigned long long) fallbacks);
+        }
+        if (handle) rocblas_destroy_handle(handle);
+    }
+};
+
+std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
+    const char* path = std::getenv("STRATA_ROCBLAS_TUNING");
+    if (!path || !*path) return nullptr;
+    auto state = std::make_unique<RocBlasState>();
+    if (rocblas_create_handle(&state->handle) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS handle creation failed; its default kernels run\n");
+        return nullptr;
+    }
+    rocblas_set_stream(state->handle, (hipStream_t) stream);
+    char version[128] = {0};
+    if (rocblas_get_version_string(version, sizeof version) != rocblas_status_success) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS version query failed; its default kernels run\n");
+        return nullptr;
+    }
+    int device = 0;
+    hipDeviceProp_t properties{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        std::fprintf(stderr, "prefill gemm: HIP device query failed; rocBLAS's default kernels run\n");
+        return nullptr;
+    }
+    std::string arch(properties.gcnArchName);
+    if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
+    std::filesystem::path file(path);
+    std::error_code ec;
+    if (std::filesystem::is_directory(file, ec)) {
+        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
+        std::string tag(version);
+        while (!tag.empty() && tag.back() == '.') tag.pop_back();
+        file /= arch + "-rocblas-" + tag + ".txt";
+    }
+    std::string error;
+    if (!state->table.load(file.string(), arch, version, error)) {
+        std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
+                     file.string().c_str());
+        return nullptr;
+    }
+    // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
+    // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
+    {
+        uint16_t* tiny = nullptr;
+        if (hipMalloc(&tiny, 4 * 64 * 64 * 2) == hipSuccess) {
+            const float one = 1.0f, zero = 0.0f;
+            (void) rocblas_gemm_ex(state->handle, rocblas_operation_transpose, rocblas_operation_none, 64, 64, 64, &one,
+                                   tiny, rocblas_datatype_f16_r, 64, tiny + 64 * 64, rocblas_datatype_f16_r, 64, &zero,
+                                   tiny + 2 * 64 * 64, rocblas_datatype_f16_r, 128, tiny + 2 * 64 * 64,
+                                   rocblas_datatype_f16_r, 128, rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+            (void) hipStreamSynchronize((hipStream_t) stream);
+            (void) hipFree(tiny);
+        }
+    }
+    size_t tuned_rows = 0;
+    for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
+    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
+                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
+    return state;
+}
+
+// Gemm::f16_inplace's product through the table's solution for its shape.  False when the shape has no row, or the
+// launch was refused (then the default kernel runs, and for that shape from now on).
+bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t ldy) {
+    auto* state = static_cast<RocBlasState*>(opaque_state);
+    if (!state || T <= 0 || N <= 0 || K <= 0 || T > INT_MAX || N > INT_MAX || K > INT_MAX || ldy > INT_MAX / 2) return false;
+    const auto key = std::make_tuple((int) T, (int) N, (int) K, (int) ldy);
+    auto it = state->cache.find(key);
+    if (it == state->cache.end()) {
+        RocBlasState::Pick pick;
+        if (const auto* row = state->table.closest((int) N, (int) K, (int) ldy, (int) T); row && row->tuned) {
+            pick.tuned = true;
+            pick.solution = row->solution;
+        }
+        if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+            if (pick.tuned)
+                std::fprintf(stderr, "prefill gemm: rocBLAS solution %d for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             pick.solution, (long long) T, (long long) N, (long long) K, (long long) ldy);
+            else
+                std::fprintf(stderr, "prefill gemm: rocBLAS default kernel; no row for T=%lld N=%lld K=%lld ldy=%lld\n",
+                             (long long) T, (long long) N, (long long) K, (long long) ldy);
+        }
+        it = state->cache.emplace(key, pick).first;
+    }
+    if (!it->second.tuned) return false;
+    const float one = 1.0f, zero = 0.0f;
+    const rocblas_status status = rocblas_gemm_ex(
+        state->handle, rocblas_operation_transpose, rocblas_operation_none, (int) N, (int) T, (int) K, &one, W,
+        rocblas_datatype_f16_r, (int) K, X, rocblas_datatype_f16_r, (int) K, &zero, Y, rocblas_datatype_f16_r,
+        (int) (2 * ldy), Y, rocblas_datatype_f16_r, (int) (2 * ldy), rocblas_datatype_f32_r,
+        rocblas_gemm_algo_solution_index, it->second.solution, 0);
+    if (status == rocblas_status_success) {
+        ++state->tuned_launches;
+        return true;
+    }
+    // A refusal writes nothing (the default kernel runs now).  The first one can be rocBLAS still setting up for the
+    // kernel (its device workspace: seen as invalid_value once, success after); a solution refused three times is
+    // dropped for this shape.
+    ++state->fallbacks;
+    if (++it->second.refusals >= 3) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld "
+                             "three times; the default kernel runs for this shape\n", it->second.solution, (int) status,
+                     (long long) T, (long long) N, (long long) K, (long long) ldy);
+        it->second.tuned = false;
+    } else if (std::getenv("STRATA_ROCBLAS_VERBOSE")) {
+        std::fprintf(stderr, "prefill gemm: rocBLAS solution %d refused (status %d) for T=%lld N=%lld K=%lld ldy=%lld; "
+                             "the default kernel this time\n", it->second.solution, (int) status, (long long) T,
+                     (long long) N, (long long) K, (long long) ldy);
+    }
+    return false;
+}
+#endif
+
 }  // namespace
+
+bool prompt_f16() {
+#if defined(__HIPCC__)
+    constexpr int kMaxDev = 64;
+    static std::atomic<int8_t> cached[kMaxDev] = {};   // 0 unknown, 1 off, 2 on
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
+    if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
+    bool on = false;
+    const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
+    hipDeviceProp_t p{};
+    if (e && e[0] == '0') on = false;
+    else if (e && e[0] == '1') on = true;
+    else if (hipGetDeviceProperties(&p, dev) == hipSuccess) on = std::strncmp(p.gcnArchName, "gfx103", 6) == 0;
+    else (void) hipGetLastError();
+    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - the prompt's 16-bit GEMMs run FP16 in and out (rocBLAS "
+                                 "is tuned only for that there; STRATA_HIP_PROMPT_F16=0 keeps BF16 in / FP32 out)\n",
+                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName);
+    cached[dev].store(on ? 2 : 1, std::memory_order_relaxed);
+    return on;
+#else
+    return false;
+#endif
+}
 
 Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    delete static_cast<RocBlasState*>(rocblas_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
@@ -328,6 +525,9 @@ bool Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems,
     scratch_elems_ = scratch_elems;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws_bytes).release();
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
 #endif
     return true;
 }
@@ -366,6 +566,9 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     note(cublasSetMathMode(h, CUBLAS_DEFAULT_MATH), "cublasSetMathMode");
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     hipblaslt_state_ = create_hipblaslt_state(workspace_, ws).release();
+#endif
+#if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
+    rocblas_state_ = create_rocblas_state(stream).release();
 #endif
     if (scratch_elems > 0) {
         if (const cudaError_t e = cudaMalloc((void**) &scratch_, (size_t) scratch_elems * 2); e != cudaSuccess) {
@@ -465,6 +668,20 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+#if defined(__HIPCC__)
+    if (f16_io_) {   // X is the FP16 image (set_act_f16); W goes through the dequantization scratch as FP16
+        // the only accumulating BF16 product is the BF16X2 low part, which bf16x2_mode() turns off with this path
+        if (beta != 0.0f) { std::fprintf(stderr, "prefill gemm: an accumulating BF16 GEMM on the FP16 prompt path\n"); std::exit(1); }
+        const int64_t rows = std::min<int64_t>(N, scratch_elems_ / K);
+        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        for (int64_t r0 = 0; r0 < N; r0 += rows) {
+            const int64_t n = std::min(rows, N - r0);
+            bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
+            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
+        }
+        return;
+    }
+#endif
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
@@ -520,6 +737,9 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                float beta) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+#if defined(__HIPCC__)
+    if (f16_io_ && beta == 0.0f) { f16_inplace(X, W, Y, T, N, K, ldy); return; }
+#endif
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
@@ -533,6 +753,25 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx f16");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
+}
+
+void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__)
+    const float one = 1.0f, zero = 0.0f;
+    bool done = false;
+#if defined(STRATA_ROCBLAS_AVAILABLE)
+    done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
+#endif
+    if (!done) {
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &one, W,
+                        CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) K, &zero, Y, CUDA_R_16F, (int) (2 * ldy),
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx f16 out");
+    }
+    widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy);
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+#endif
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
