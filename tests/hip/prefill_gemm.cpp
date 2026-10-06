@@ -103,6 +103,11 @@ int main() {
         ok=run(gemm,stream,true,17,48,2560,64,1) && ok;
         ok=run(gemm,stream,false,32,640,2560,648,0) && ok;
         ok=run(gemm,stream,false,64,2560,640,2560,1) && ok;
+        // RDNA2 (gfx103x) runs N >= 64 as an SGEMM on FP32 copies, the activations in slices of 32M floats
+        // (Gemm::rdna2_sgemm): at K = 10240 a slice is 3,276 rows, so these cross a slice boundary (padded ldy, beta 1).
+        // Other cards run them on the native path.
+        ok=run(gemm,stream,false,3300,64,10240,72,1) && ok;
+        ok=run(gemm,stream,true,3300,64,10240,64,0) && ok;
     }
     {
         // The FP16-io mode.  The scratch holds 64 rows at K = 2560, so bf16()'s W conversion slices N = 96 in two
