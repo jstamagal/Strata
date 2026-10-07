@@ -8,10 +8,11 @@
 //
 // The header may also name the width of the card it was measured on (`mp=40`): HIP's multiProcessorCount, which is
 // the compute units on GCN/CDNA and the workgroup processors (two CUs each) on RDNA, so 40 on an RX 6900 XT's 80 CUs.
-// One architecture name covers cards of different widths (gfx1030: RX 6800 with 60 CUs, mp 30; 6800 XT 72, mp 36;
-// 6900 XT and 6950 XT 80, mp 40; and cards run as gfx1030 through HSA_OVERRIDE_GFX_VERSION), and where several
-// kernels are close, which one is fastest follows the width (tiles per wave of the card).  A table of another width still loads (its indices are valid there);
-// the engine says so, and a table measured on the card itself (a per-device cache, see cache_path) comes first.
+// One architecture name covers cards of different widths (gfx1030: RX 6800 and Radeon PRO W6800 with 60 CUs,
+// mp 30; RX 6800 XT and Radeon PRO V620 72, mp 36; RX 6900 XT and 6950 XT 80, mp 40; and cards run as gfx1030
+// through HSA_OVERRIDE_GFX_VERSION), and where several kernels are close, which one is fastest follows the width
+// (tiles per wave of the card).  A table of another width still loads (its indices are valid there); the engine
+// says so, and a table measured on the card itself (a per-device cache, see cache_path) comes first.
 #pragma once
 
 #include <climits>

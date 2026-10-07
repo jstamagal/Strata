@@ -664,8 +664,9 @@ default by `--min-gain` (1.05), `default` otherwise - a `default` row is what ke
 reaching token counts where rocBLAS's own choice measured best. The file's header names the architecture, the version
 and the width of the card it was measured on (`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e mp=40`: HIP's
 `multiProcessorCount`, which on RDNA counts workgroup processors of two CUs each, so 40 on an RX 6900 XT; older tables
-without `mp=` still load). One architecture covers cards of several widths - gfx1030 is the RX 6800 (60 CUs, mp 30),
-6800 XT (72, mp 36) and 6900 XT / 6950 XT (80, mp 40), and smaller RDNA2 cards run as gfx1030 through
+without `mp=` still load). One architecture covers cards of several widths - gfx1030 is the RX 6800 and Radeon PRO
+W6800 (60 CUs, mp 30), the RX 6800 XT and Radeon PRO V620 (72, mp 36; the W6800 and V620 are the RDNA2 cards on
+ROCm's support list) and the RX 6900 XT / 6950 XT (80, mp 40), and smaller RDNA2 cards run as gfx1030 through
 `HSA_OVERRIDE_GFX_VERSION` - with the same memory system, so where kernels are close the fastest one can differ; a
 table from another width still loads (its solutions are valid there) and the engine logs the mismatch.
 `tune_rocblas --to-cache` writes the card's own table to a per-device cache directory (`STRATA_TUNING_CACHE`, default
