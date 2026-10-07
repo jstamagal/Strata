@@ -5,6 +5,13 @@
 // made by that tool names, per shape and token bucket, the solution index to run instead; Gemm::f16_inplace reads it
 // through STRATA_ROCBLAS_TUNING.  Indices are valid for one architecture and one rocBLAS build (its full version
 // string), and the table carries both; any other pair is refused and the default kernels run.
+//
+// The header may also name the width of the card it was measured on (`mp=40`): HIP's multiProcessorCount, which is
+// the compute units on GCN/CDNA and the workgroup processors (two CUs each) on RDNA, so 40 on an RX 6900 XT's 80 CUs.
+// One architecture name covers cards of different widths (gfx1030: RX 6800 with 60 CUs, mp 30; 6800 XT 72, mp 36;
+// 6900 XT and 6950 XT 80, mp 40; and cards run as gfx1030 through HSA_OVERRIDE_GFX_VERSION), and where several
+// kernels are close, which one is fastest follows the width (tiles per wave of the card).  A table of another width still loads (its indices are valid there);
+// the engine says so, and a table measured on the card itself (a per-device cache, see cache_path) comes first.
 #pragma once
 
 #include <climits>
@@ -31,8 +38,11 @@ struct Row {
 class Table {
 public:
     /// `expected_version`: rocblas_get_version_string() of the library the engine runs with.
+    /// mp(): the header's multiprocessor count when it names one, 0 otherwise; the caller compares it.
     bool load(const std::string& path, const std::string& expected_arch, const std::string& expected_version,
               std::string& err) {
+        rows_.clear();
+        mp_ = 0;
         std::ifstream input(path);
         if (!input) {
             err = "cannot open rocBLAS tuning file";
@@ -48,10 +58,19 @@ public:
             if (first == std::string::npos) continue;
             std::istringstream row(line.substr(first));
             if (!saw_header) {
-                std::string magic, arch, version, extra;
-                if (!(row >> magic >> arch >> version) || (row >> extra) || magic != "STRATA_ROCBLAS_TUNING_V1") {
+                std::string magic, arch, version, mp, extra;
+                if (!(row >> magic >> arch >> version) || magic != "STRATA_ROCBLAS_TUNING_V1") {
                     err = "invalid rocBLAS tuning header at line " + std::to_string(line_number);
                     return false;
+                }
+                if (row >> mp) {
+                    char* end = nullptr;
+                    const long value = mp.rfind("mp=", 0) == 0 ? std::strtol(mp.c_str() + 3, &end, 10) : 0;
+                    if (!end || *end || value <= 0 || value > 65535 || (row >> extra)) {
+                        err = "invalid rocBLAS tuning header at line " + std::to_string(line_number);
+                        return false;
+                    }
+                    mp_ = (int) value;
                 }
                 if (arch != expected_arch) {
                     err = "rocBLAS tuning architecture mismatch: file=" + arch + " runtime=" + expected_arch;
@@ -66,8 +85,9 @@ public:
                 saw_header = true;
                 continue;
             }
-            std::string type, solution, extra;
+            std::string solution, extra;
             Row parsed;
+            std::string type;
             if (!(row >> type >> parsed.n >> parsed.k >> parsed.ldy >> parsed.t_bucket >> solution) || (row >> extra) ||
                 type != "f16o" || parsed.n <= 0 || parsed.k <= 0 || parsed.ldy < parsed.n || parsed.t_bucket <= 0) {
                 err = "invalid rocBLAS tuning row at line " + std::to_string(line_number);
@@ -119,11 +139,41 @@ public:
     const std::vector<Row>& rows() const { return rows_; }
     const std::string& arch() const { return arch_; }
     const std::string& version() const { return version_; }
+    int mp() const { return mp_; }
 
 private:
     std::string arch_;
     std::string version_;
+    int mp_ = 0;
     std::vector<Row> rows_;
 };
+
+/// The version string as it goes into a file name (trailing dots dropped: "5.6.0.8d1ae90e.").
+inline std::string version_tag(std::string version) {
+    while (!version.empty() && version.back() == '.') version.pop_back();
+    return version;
+}
+
+/// The per-device cache directory: STRATA_TUNING_CACHE (empty or "0": none), else $XDG_CACHE_HOME/strata, else
+/// %LOCALAPPDATA%/Strata/cache (Windows, which sets no HOME), else $HOME/.cache/strata.  Empty when there is none.
+inline std::string cache_dir() {
+    if (const char* v = std::getenv("STRATA_TUNING_CACHE")) {
+        if (!*v || (v[0] == '0' && !v[1])) return {};
+        return v;
+    }
+    if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) return std::string(x) + "/strata";
+    if (const char* l = std::getenv("LOCALAPPDATA"); l && *l) return std::string(l) + "/Strata/cache";
+    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/strata";
+    return {};
+}
+
+/// The file of one card width and library build in the cache directory, `<arch>-mp<N>-rocblas-<version>[-<what>].txt`
+/// (empty without a cache directory).
+inline std::string cache_path(const std::string& arch, int mp, const std::string& version, const std::string& what) {
+    const std::string dir = cache_dir();
+    if (dir.empty()) return {};
+    return dir + "/" + arch + "-mp" + std::to_string(mp) + "-rocblas-" + version_tag(version) +
+           (what.empty() ? "" : "-" + what) + ".txt";
+}
 
 }  // namespace strata::prefill::rocblas_tuning

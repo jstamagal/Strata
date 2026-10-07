@@ -398,19 +398,32 @@ std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
     }
     std::string arch(properties.gcnArchName);
     if (const auto suffix = arch.find(':'); suffix != std::string::npos) arch.resize(suffix);
+    const int mp = properties.multiProcessorCount;   // RDNA: workgroup processors (40 on an RX 6900 XT)
+    namespace rt = strata::prefill::rocblas_tuning;
     std::filesystem::path file(path);
     std::error_code ec;
     if (std::filesystem::is_directory(file, ec)) {
-        // the table of this card and this rocBLAS build (its version string, trailing dots dropped)
-        std::string tag(version);
-        while (!tag.empty() && tag.back() == '.') tag.pop_back();
-        file /= arch + "-rocblas-" + tag + ".txt";
+        // the table of this card and this rocBLAS build (its version string, trailing dots dropped): one measured on
+        // this card (the per-device cache; tune_rocblas --to-cache), else one of this width (mp), else the architecture's
+        const std::string tag = rt::version_tag(version);
+        const std::string own = rt::cache_path(arch, mp, version, "");
+        const std::filesystem::path width = file / (arch + "-mp" + std::to_string(mp) + "-rocblas-" + tag + ".txt");
+        if (!own.empty() && std::filesystem::is_regular_file(own, ec)) file = own;
+        else if (std::filesystem::is_regular_file(width, ec)) file = width;
+        else file /= arch + "-rocblas-" + tag + ".txt";
     }
     std::string error;
     if (!state->table.load(file.string(), arch, version, error)) {
         std::fprintf(stderr, "prefill gemm: %s (%s); rocBLAS's default kernels run\n", error.c_str(),
                      file.string().c_str());
         return nullptr;
+    }
+    if (state->table.mp() > 0 && state->table.mp() != mp) {
+        std::fprintf(stderr,
+                     "prefill gemm: the rocBLAS table was measured on a card with %d multiprocessors and this one has "
+                     "%d; its solutions are valid here but may not be the fastest (tune_rocblas --to-cache measures "
+                     "this card)\n",
+                     state->table.mp(), mp);
     }
     // rocBLAS loads its kernel library on the first product through a handle; a solution-index call before that
     // fails (rocblas_status_internal_error) although the index is valid.  One tiny default product opens it.
@@ -428,8 +441,8 @@ std::unique_ptr<RocBlasState> create_rocblas_state(void* stream) {
     }
     size_t tuned_rows = 0;
     for (const auto& row : state->table.rows()) tuned_rows += row.tuned ? 1 : 0;
-    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, rocBLAS %s)\n",
-                 state->table.rows().size(), tuned_rows, arch.c_str(), version);
+    std::fprintf(stderr, "prefill gemm: rocBLAS tuning enabled (%zu rows, %zu with a solution, %s, mp %d, rocBLAS %s; %s)\n",
+                 state->table.rows().size(), tuned_rows, arch.c_str(), mp, version, file.string().c_str());
     return state;
 }
 

@@ -661,8 +661,18 @@ engine's dense GEMM shapes; `--case T,N,K,ldy` adds one, `--tokens` changes the 
 against the default kernel's output (within FP16 rounding, no write outside the N x T result) and that they also run at
 smaller, odd token counts, and writes one row per shape and bucket: the winning solution index where it beats the
 default by `--min-gain` (1.05), `default` otherwise - a `default` row is what keeps a neighbouring bucket's solution from
-reaching token counts where rocBLAS's own choice measured best. The file's header names the architecture and version
-(`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e`); save it as `tools/hip/<arch>-rocblas-<version>.txt` (the version
+reaching token counts where rocBLAS's own choice measured best. The file's header names the architecture, the version
+and the width of the card it was measured on (`STRATA_ROCBLAS_TUNING_V1 gfx1030 5.6.0.8d1ae90e mp=40`: HIP's
+`multiProcessorCount`, which on RDNA counts workgroup processors of two CUs each, so 40 on an RX 6900 XT; older tables
+without `mp=` still load). One architecture covers cards of several widths - gfx1030 is the RX 6800 (60 CUs, mp 30),
+6800 XT (72, mp 36) and 6900 XT / 6950 XT (80, mp 40), and smaller RDNA2 cards run as gfx1030 through
+`HSA_OVERRIDE_GFX_VERSION` - with the same memory system, so where kernels are close the fastest one can differ; a
+table from another width still loads (its solutions are valid there) and the engine logs the mismatch.
+`tune_rocblas --to-cache` writes the card's own table to a per-device cache directory (`STRATA_TUNING_CACHE`, default
+`$XDG_CACHE_HOME/strata`, else `%LOCALAPPDATA%\Strata\cache` on Windows, else `~/.cache/strata`) as
+`<arch>-mp<N>-rocblas-<version>.txt`, and with `STRATA_ROCBLAS_TUNING` pointing at a directory the engine takes that
+file first, then `<arch>-mp<N>-rocblas-<version>.txt` in the directory, then `<arch>-rocblas-<version>.txt`; its
+`rocBLAS tuning enabled` line names the file. Save a table as `tools/hip/<arch>-rocblas-<version>.txt` (the version
 with trailing dots dropped) for setup, or point `STRATA_ROCBLAS_TUNING` at the file. `STRATA_ROCBLAS_VERBOSE=1` prints
 the solution picked for each shape and a `tuned_launches=... fallbacks=...` summary at exit; a solution rocBLAS refuses
 at run time (status 11 once while it sets up its workspace is normal) falls back to the default kernel for that call, and

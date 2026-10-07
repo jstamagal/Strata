@@ -13,6 +13,11 @@
 //
 //   cmake --build build-hip --target tune_rocblas
 //   ./build-hip/tune_rocblas --tuning-out tools/hip/<arch>-rocblas-<version>.txt
+//   ./build-hip/tune_rocblas --to-cache     # this card's own table, which the engine takes before a shipped one
+//
+// The header names the card's width (mp=N, HIP's multiProcessorCount: 40 on an RX 6900 XT, whose 80 CUs are 40
+// workgroup processors): an architecture covers cards of several widths, and where kernels are close the fastest one
+// follows the width (src/prefill/rocblas_tuning.hpp).
 //
 // Defaults: the engine's 14 FP16 dense shapes at T = 256 ... 8192 (--tokens); --case T,N,K,ldy adds one shape.
 #define ROCBLAS_BETA_FEATURES_API
@@ -26,12 +31,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <random>
 #include <string>
 #include <vector>
+
+#include "../../src/prefill/rocblas_tuning.hpp"
 
 namespace {
 #define HIP_CHECK(call) do { const hipError_t e = (call); if (e != hipSuccess) { \
@@ -54,6 +62,7 @@ struct Options {
     std::string tuning_out;
     double min_gain = 1.05;
     bool explicit_shapes = false;
+    bool to_cache = false;
 };
 struct Err { double rel_l2 = 0, max_abs = 0; bool finite = true, ok = true; size_t padding_writes = 0; };
 struct Row { Shape s; bool tuned; int solution; float default_ms, best_ms; };
@@ -81,7 +90,8 @@ int positive(const std::string& s, const char* label) {
     return (int) v;
 }
 void usage(const char* p) {
-    std::printf("Usage: %s [--case T,N,K,ldy]... [--tokens T1,T2,...] [--min-gain 1.05] [--tuning-out PATH]\n", p);
+    std::printf("Usage: %s [--case T,N,K,ldy]... [--tokens T1,T2,...] [--min-gain 1.05] [--tuning-out PATH | --to-cache]\n", p);
+    std::printf("--to-cache writes <cache>/<arch>-mp<N>-rocblas-<version>.txt (STRATA_TUNING_CACHE, else ~/.cache/strata).\n");
     std::printf("Defaults: the engine's 14 FP16 dense shapes (ldy = N) at T = 256,512,768,1024,1536,2048,4096,8192.\n");
 }
 Options options(int argc, char** argv) {
@@ -104,6 +114,7 @@ Options options(int argc, char** argv) {
             for (const auto& x : csv(next())) o.tokens.push_back(positive(x, "token bucket"));
         } else if (a == "--min-gain") { o.min_gain = std::atof(next().c_str()); if (o.min_gain < 1.0) o.min_gain = 1.0; }
         else if (a == "--tuning-out") o.tuning_out = next();
+        else if (a == "--to-cache") o.to_cache = true;
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); usage(argv[0]); std::exit(2); }
     }
     if (!o.explicit_shapes) {
@@ -152,7 +163,7 @@ Err compare(const std::vector<uint16_t>& ref, const std::vector<uint16_t>& got, 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const Options o = options(argc, argv);
+    Options o = options(argc, argv);
     rocblas_handle h; RB_CHECK(rocblas_create_handle(&h));
     hipStream_t stream; HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     RB_CHECK(rocblas_set_stream(h, stream));
@@ -160,7 +171,15 @@ int main(int argc, char** argv) {
     int device = 0; hipDeviceProp_t prop{};
     HIP_CHECK(hipGetDevice(&device)); HIP_CHECK(hipGetDeviceProperties(&prop, device));
     std::string arch(prop.gcnArchName); if (const auto c = arch.find(':'); c != std::string::npos) arch.resize(c);
-    std::printf("meta device_arch=%s rocblas_version=%s shapes=%zu min_gain=%.3f\n", arch.c_str(), ver, o.shapes.size(), o.min_gain);
+    const int mp = prop.multiProcessorCount;
+    if (o.to_cache) {
+        o.tuning_out = strata::prefill::rocblas_tuning::cache_path(arch, mp, ver, "");
+        if (o.tuning_out.empty()) { std::fprintf(stderr, "--to-cache: no cache directory (STRATA_TUNING_CACHE, HOME)\n"); return 2; }
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(o.tuning_out).parent_path(), ec);
+    }
+    std::printf("meta device_arch=%s mp=%d rocblas_version=%s shapes=%zu min_gain=%.3f\n", arch.c_str(), mp, ver,
+                o.shapes.size(), o.min_gain);
     hipEvent_t ea, eb; HIP_CHECK(hipEventCreate(&ea)); HIP_CHECK(hipEventCreate(&eb));
 
     std::vector<Row> rows;
@@ -266,7 +285,7 @@ int main(int argc, char** argv) {
         f << "# rocBLAS solution indices for the prompt path's FP16-out GEMMs; valid for this architecture and rocBLAS build only\n";
         f << "# rows: type N K ldy T solution   (type f16o: FP16 in, FP16 out, FP32 compute; Gemm::f16_inplace)\n";
         f << "# solution: rocBLAS's solution index, or `default` where its own choice measured best at that bucket\n";
-        f << "STRATA_ROCBLAS_TUNING_V1 " << arch << " " << ver << "\n";
+        f << "STRATA_ROCBLAS_TUNING_V1 " << arch << " " << ver << " mp=" << mp << "\n";
         size_t tuned = 0;
         for (const auto& r : rows) {
             f << "f16o " << r.s.n << " " << r.s.k << " " << r.s.ldy << " " << r.s.t << " ";

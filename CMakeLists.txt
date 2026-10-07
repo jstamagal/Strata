@@ -275,6 +275,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # the rocBLAS solution table: the header's compute-unit count, the QSA scorer's `sel` cache rows, save then load
+  # (synthetic tables: no model, no GPU)
+  add_executable(rocblas_tuning_table_test tests/prefill/rocblas_tuning_table_test.cpp)
+  target_include_directories(rocblas_tuning_table_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  add_test(NAME rocblas_tuning_table_test COMMAND rocblas_tuning_table_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
