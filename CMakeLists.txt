@@ -517,6 +517,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_window_plan_test PRIVATE strata_engine)
     add_test(NAME expert_window_plan_test COMMAND expert_window_plan_test)
     set_tests_properties(expert_window_plan_test PROPERTIES TIMEOUT 60)
+  # #796 part B: the prompt loan's residency bookkeeping exists whenever borrowing can happen - the mode matrix of
+  # the one pure predicate, no GPU needed at run time
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/borrow_residency_test.cpp")
+    enable_testing()
+    add_executable(borrow_residency_test tests/core/borrow_residency_test.cpp)
+    target_link_libraries(borrow_residency_test PRIVATE strata_prefill)
+    add_test(NAME borrow_residency_test COMMAND borrow_residency_test)
+    set_tests_properties(borrow_residency_test PROPERTIES TIMEOUT 60)
   endif()
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
