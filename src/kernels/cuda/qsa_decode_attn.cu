@@ -586,7 +586,6 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
 #if defined(STRATA_ATTN_PRE75_BUILT)
 // CUDA: the current device is below sm_75; HIP: it is gfx103x (per device: a layer split can mix cards).
 // STRATA_ATTN_PRE75=0 turns PR #540's kernel off (A/B); on HIP =1 also runs it on another wave32 card.
-)
 bool pre75_attn() {
     static const int env = [] {
         const char* e = std::getenv("STRATA_ATTN_PRE75");
