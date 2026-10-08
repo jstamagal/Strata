@@ -13,12 +13,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-<<<<<<< HEAD
-#include <limits>
-=======
 #include <deque>
->>>>>>> 730d6c8 (Pipelined decode: PLE rows read ahead, a ticket per stage-0 window, the chain before the verdict's bookkeeping (opt-in)
-)
+#include <limits>
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
@@ -249,7 +245,6 @@ struct PleTable::Impl {
                 b.dropped = false;
             }
     }
-)
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
