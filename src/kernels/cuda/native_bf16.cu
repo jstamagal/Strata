@@ -229,7 +229,8 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
 template <int B>
 void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
-    constexpr int RPB = 4;
+    // Two output rows retain activation reuse with half the four-row tile's accumulator/LDS state.
+    constexpr int RPB = 2;
     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
