@@ -7616,7 +7616,8 @@ int main(int argc, char** argv) {
             res_upload();
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
-        std::function<void()> adapt_fence;
+        // In the pipeline, residency invalidation and reader snapshots are owned by the service thread.
+        std::function<bool(const std::vector<int32_t>&, std::vector<int32_t>&)> adapt_fence;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
@@ -7673,19 +7674,13 @@ int main(int argc, char** argv) {
                                            (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                 pin_blobs(std::move(spans), pin_live);
             }
-            // --pipeline-windows: windows are in flight while the tier adapts.  The evicted experts stop being planned
-            // for the GPU first (the pool computes them on the CPU from the rows every layer publishes, see
-            // Verifier::set_always_publish); then every copy into their slots waits until all the work the stages'
-            // streams hold now has completed: any window that may still read those slots was launched before this.
+            // --pipeline-windows: atomically relative to host plan publication, mark the victims nonresident and
+            // retire only their already-published layer readers before rewriting slots.  The worker waits on HOST.
             std::vector<int32_t> fenced_slots;
             if (adapt_fence && !swaps.empty()) {
-                for (const Swap& s : swaps) {
-                    const size_t out = (size_t) s.layer * g.n_expert + s.out;
-                    fenced_slots.push_back(host_res[out]);
-                    host_res[out] = strata::core::kNotResident;
-                }
-                std::atomic_thread_fence(std::memory_order_seq_cst);
-                adapt_fence();
+                std::vector<int32_t> victims;
+                for (const Swap& s : swaps) victims.push_back((int32_t) ((int64_t) s.layer * g.n_expert + s.out));
+                if (!adapt_fence(victims, fenced_slots)) return false;
             }
             bool main_live = false;
             // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
@@ -7721,7 +7716,7 @@ int main(int argc, char** argv) {
                 }
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
-                host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                if (!adapt_fence) host_res[out] = strata::core::kNotResident;   // pipeline service thread did this already
                 srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
@@ -10451,6 +10446,7 @@ int main(int argc, char** argv) {
                 std::thread pl_adapt_thr;
                 std::atomic<bool> pl_adapt_done{true};
                 bool pl_adapt_ok = true;
+                std::atomic<bool> pl_retire_abort{false};
                 // an error ends the engine, as the serial loop's do: every GPU wait is released first (#267), so no
                 // window in flight keeps spinning on a flag nobody raises, and the tier's thread can finish (the
                 // asynchronous tier's job does host work alone: it ends)
@@ -10458,6 +10454,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pipelined decode: %s\n", m.c_str());
                     strata::core::diag_pipeline_fn().store(nullptr);
                     strata::core::release_gpu_waits(stderr);
+                    pl_retire_abort.store(true, std::memory_order_release);
                     if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
                     if (ajob) {
                         ajob->wait();
@@ -10520,43 +10517,64 @@ int main(int argc, char** argv) {
                     B.ready = true;
                     B.made = true;
                 };
-                // events after all the work both stages' streams hold now, and whether they have passed
-                cudaEvent_t fence_ev[2] = {nullptr, nullptr}, exch_ev[2] = {nullptr, nullptr};
-                {
-                    const strata::core::OnDevice on0(dev0);
-                    cudaEventCreateWithFlags(&fence_ev[0], cudaEventDisableTiming);
-                    cudaEventCreateWithFlags(&exch_ev[0], cudaEventDisableTiming);
-                }
-                {
-                    const strata::core::OnDevice on1(stages[0]->dev);
-                    cudaEventCreateWithFlags(&fence_ev[1], cudaEventDisableTiming);
-                    cudaEventCreateWithFlags(&exch_ev[1], cudaEventDisableTiming);
-                }
-                auto stage_record = [&](cudaEvent_t* ev) {
-                    {
-                        const strata::core::OnDevice on(dev0);
-                        cudaEventRecord(ev[0], s0);
-                        (void) cudaStreamQuery(s0);
+                struct Reader {
+                    strata::core::Verifier* v;
+                    strata::core::Verifier::ReaderFence fence;
+                };
+                using Readers = std::vector<Reader>;
+                auto snapshot_readers = [&](const std::vector<int32_t>& ids) {
+                    Readers readers;
+                    std::vector<int64_t> layers;
+                    for (int32_t i : ids) layers.push_back((int64_t) i / g.n_expert);
+                    std::sort(layers.begin(), layers.end());
+                    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+                    for (int64_t layer : layers)
+                        for (int par = 0; par < 2; ++par) {
+                            auto* v = PV[stage_of(layer)][par];
+                            const auto fence = v->pl_reader_fence(layer);
+                            if (fence.generation != 0) readers.push_back({v, fence});
+                        }
+                    return readers;
+                };
+                auto readers_passed = [](const Readers& readers) {
+                    for (const Reader& r : readers) if (!r.v->pl_reader_passed(r.fence)) return false;
+                    return true;
+                };
+                // Single outstanding worker request: release/acquire hands its ids and output slots to the main
+                // service thread, which invalidates residency BETWEEN pool calls, snapshots readers and acks retirement.
+                std::atomic<int> retire_state{0};   // 0 ack/idle, 1 requested, 2 readers retiring
+                std::vector<int32_t> retire_ids;
+                std::vector<int32_t>* retire_slots = nullptr;
+                Readers slot_readers;
+                adapt_fence = [&](const std::vector<int32_t>& ids, std::vector<int32_t>& slots) {
+                    retire_ids = ids;
+                    retire_slots = &slots;
+                    retire_state.store(1, std::memory_order_release);
+                    while (retire_state.load(std::memory_order_acquire) != 0 &&
+                           !pl_retire_abort.load(std::memory_order_acquire)) std::this_thread::yield();
+                    return !pl_retire_abort.load(std::memory_order_acquire);
+                };
+                auto retire_tick = [&]() {
+                    if (retire_state.load(std::memory_order_acquire) == 1) {
+                        for (int32_t i : retire_ids) {
+                            retire_slots->push_back(host_res[(size_t) i]);
+                            host_res[(size_t) i] = strata::core::kNotResident;
+                        }
+                        slot_readers = snapshot_readers(retire_ids);
+                        retire_state.store(2, std::memory_order_release);
                     }
-                    const strata::core::OnDevice on(stages[0]->dev);
-                    cudaEventRecord(ev[1], PV[1][0]->stream());
-                    (void) cudaStreamQuery(PV[1][0]->stream());
-                };
-                auto stage_passed = [&](cudaEvent_t* ev) {
-                    return cudaEventQuery(ev[0]) != cudaErrorNotReady && cudaEventQuery(ev[1]) != cudaErrorNotReady;
-                };
-                // adapt()'s fence, on the tier's thread: it waits on the HOST.  A device-side wait (the refill streams
-                // waiting for the stages' events) would queue copies behind windows that need this loop, beside it.
-                adapt_fence = [&]() {
-                    stage_record(fence_ev);
-                    while (!stage_passed(fence_ev)) std::this_thread::yield();
+                    if (retire_state.load(std::memory_order_acquire) == 2 && readers_passed(slot_readers)) {
+                        slot_readers.clear();
+                        retire_state.store(0, std::memory_order_release);
+                    }
                 };
                 src.prepare_overrides();
                 // The swaps land in two steps.  Once their copies are done, the incoming experts are resident (the plans
                 // from then on use their slots).  What gives their RAM back - the resident RAM mode's exchange, the
                 // released or unpinned pages - waits until every window that may still pull them over PCIe (a plan
-                // published before that point) has completed: both stages' streams are fenced there.
+                // published before that point) has completed.  Snapshot just those layers' readers on the host.
                 bool exch_wait = false;
+                Readers ram_readers;
                 std::vector<int32_t> pl_landed;
                 auto pl_release = [&]() {
                     unpin_blobs(pin_live);
@@ -10567,7 +10585,7 @@ int main(int argc, char** argv) {
                 };
                 auto pl_apply = [&]() {
                     if (exch_wait) {
-                        if (stage_passed(exch_ev)) pl_release();
+                        if (readers_passed(ram_readers)) pl_release();
                         return;
                     }
                     if (pending.empty() || cudaEventQuery(adapt_ev) != cudaSuccess) return;
@@ -10581,7 +10599,7 @@ int main(int argc, char** argv) {
                     pending.clear();
                     pending_age = 0;
                     res_upload();
-                    stage_record(exch_ev);
+                    ram_readers = snapshot_readers(pl_landed);
                     exch_wait = true;
                 };
                 // --adapt-async: the asynchronous tier beside the windows (see adapt_tick).  A stage is idle when neither
@@ -10701,6 +10719,8 @@ int main(int argc, char** argv) {
                             if (!adapt_tick(false, false)) return die("an adaptive refill failed");
                         }
                     }
+                    // ---- retire adaptive readers between plan publications; never race a pool's residency read
+                    retire_tick();
                     // ---- every window in flight served
                     if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
                     if (A.s1 && !A.s1_done) {
@@ -11012,15 +11032,17 @@ int main(int argc, char** argv) {
                 }
                 pl_drain();   // nothing in flight: both stages' commits and the drafter have landed
                 strata::core::diag_pipeline_fn().store(nullptr);
-                if (pl_adapt_thr.joinable()) pl_adapt_thr.join();   // its copies waited only for finished work
+                while (pl_adapt_thr.joinable() && !pl_adapt_done.load(std::memory_order_acquire)) {
+                    retire_tick();   // a worker may publish its last retirement request while pl_drain runs
+                    std::this_thread::yield();
+                }
+                if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
                 adapt_fence = nullptr;
                 if (exch_wait) pl_release();   // every window has completed (drained)
                 // --adapt-async: both stages idle now: the copies still due are queued and the round in flight goes on
                 // unfenced (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the next request find
                 // nothing pipelined in flight) at the next tick, the next request's drain
                 a_pl_settle();
-                for (cudaEvent_t ev : fence_ev) if (ev) cudaEventDestroy(ev);
-                for (cudaEvent_t ev : exch_ev) if (ev) cudaEventDestroy(ev);
                 if (pl_trace_path != nullptr && !pl_trace.empty()) {
                     if (std::FILE* f = std::fopen(pl_trace_path, "a")) {
                         std::fprintf(f, "# request p0=%lld\n", (long long) (n - 1));

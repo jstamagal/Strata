@@ -3118,6 +3118,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
+    ++pl_generation_;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
     return true;
 }
@@ -3247,6 +3248,26 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
         fl_since_ms_ = fl_flush_ms_ = now_ms();
     }
     return 1;
+}
+
+Verifier::ReaderFence Verifier::pl_reader_fence(int64_t layer) const {
+    if (!fl_active_ || layer < lb_ || layer >= le_) return {};
+    // Device-planned graphs can still read slots that have not been published to the host.
+    if (ar_on() || device_plan_) return {pl_generation_, UINT32_MAX};
+    const int G = groups_[fl_T_] > 0 ? groups_[fl_T_] : 1;
+    const int64_t first = (layer - lb_) * G;
+    const int64_t published = std::min<int64_t>(G, fl_k_ - first);
+    if (published <= 0) return {};   // the service thread invalidates residency before publishing these plans
+    if (layer + 1 == le_) return {pl_generation_, UINT32_MAX};
+    // Graph order is post(l,A), pre(l+1,A), post(l,B), pre(l+1,B).  Retire the last OLD published group only.
+    return {pl_generation_, (uint32_t) (first + G + published)};
+}
+
+bool Verifier::pl_reader_passed(const ReaderFence& fence) const {
+    if (fence.generation == 0 || fence.generation != pl_generation_ || !fl_active_) return true;
+    if (fence.ring != UINT32_MAX && *(volatile uint32_t*) h_seq_ >= fence.ring) return true;
+    const OnDevice on_device(device_);
+    return cudaEventQuery(ev_done_) == cudaSuccess;
 }
 
 bool Verifier::done(std::string& err) {

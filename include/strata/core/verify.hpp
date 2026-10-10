@@ -244,6 +244,11 @@ public:
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
     int service(PoolMultiFn pool, void* user, std::string& err);
     bool in_flight() const { return fl_active_; }
+    /// Main-service-thread-only adaptive retirement.  Only already published plans can read the old slot/RAM
+    /// image.  A next-layer doorbell proves those reads finished; device-planned/final-layer readers use ev_done_.
+    struct ReaderFence { uint64_t generation = 0; uint32_t ring = 0; };
+    ReaderFence pl_reader_fence(int64_t layer) const;
+    bool pl_reader_passed(const ReaderFence& fence) const;
     /// The window's graph (and its profile copy) completed; false while it runs.  An error sets `err`.
     bool done(std::string& err);
     /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).
@@ -352,6 +357,7 @@ private:
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
     int fl_T_ = 0;
+    uint64_t pl_generation_ = 0;   ///< protects reader retirement against a parity verifier's next launch/reset
     int64_t fl_k_ = 0, fl_total_ = 0;
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
     int32_t pl_prev_[2] = {-1, -1};
