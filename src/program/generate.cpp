@@ -7618,6 +7618,15 @@ int main(int argc, char** argv) {
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         // In the pipeline, residency invalidation and reader snapshots are owned by the service thread.
         std::function<bool(const std::vector<int32_t>&, std::vector<int32_t>&)> adapt_fence;
+        struct LayerCopy {
+            int32_t layer, in, out, slot;
+            const uint8_t* source;
+            size_t bytes;
+            SwapHome home;
+        };
+        std::function<bool(int64_t)> adapt_layer_enabled;
+        std::function<bool(const std::vector<LayerCopy>&)> adapt_layers;
+        bool layer_mode_reported = false;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
@@ -7674,65 +7683,84 @@ int main(int argc, char** argv) {
                                            (uintptr_t) b + strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
                 pin_blobs(std::move(spans), pin_live);
             }
-            // --pipeline-windows: atomically relative to host plan publication, mark the victims nonresident and
-            // retire only their already-published layer readers before rewriting slots.  The worker waits on HOST.
-            std::vector<int32_t> fenced_slots;
-            if (adapt_fence && !swaps.empty()) {
-                std::vector<int32_t> victims;
-                for (const Swap& s : swaps) victims.push_back((int32_t) ((int64_t) s.layer * g.n_expert + s.out));
-                if (!adapt_fence(victims, fenced_slots)) return false;
-            }
-            bool main_live = false;
-            // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
-            const int dma_mode = multi_gpu ? 0 : strata::core::dma_batch_mode();
-            std::vector<void*> cp_dst;
-            std::vector<const void*> cp_src;
-            std::vector<size_t> cp_bytes;
-            for (size_t si = 0; si < swaps.size(); ++si) {
-                const Swap& s = swaps[si];
-                const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
-                const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
-                const uint8_t* b = srcp->blob_stable(s.layer, s.in);
-                const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
-                GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
-                const strata::core::OnDevice on(gs ? gs->dev : -1);
-                if (dma_mode != 0 && slot >= 0 && b != nullptr) {
-                    cp_dst.push_back(xcache.device_slot(slot));
-                    cp_src.push_back(b);
-                    cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
-                    main_live = true;
-                    host_res[out] = strata::core::kNotResident;
-                    srcp->prefetch(s.layer, s.out);
-                    pending.emplace_back((int32_t) in, slot);
-                    continue;
+            // Host-planned pipeline layers can copy/admit independently.  Device-planned, peer and serial paths
+            // retain the original batch admission; the service thread owns all residency changes in the new path.
+            const bool layerwise = adapt_layers && !swaps.empty() && !peer.valid() && !plink.valid() && !remote_opt &&
+                std::all_of(swaps.begin(), swaps.end(), [&](const Swap& s) { return adapt_layer_enabled(s.layer); });
+            if (layerwise) {
+                if (!layer_mode_reported) {
+                    std::fprintf(stderr, "strata serve: per-layer adaptive retirement/copy/admission active (%zu swaps)\n", swaps.size());
+                    layer_mode_reported = true;
                 }
-                if (slot < 0 || b == nullptr ||
-                    adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
-                                   gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
-                                 (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
+                std::vector<LayerCopy> copies;
+                for (const Swap& s : swaps) {
+                    const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
+                    copies.push_back({s.layer, (int32_t) in, (int32_t) out, host_res[out],
+                                      srcp->blob_stable(s.layer, s.in),
+                                      (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), home_of(s.layer)});
+                }
+                if (!adapt_layers(copies)) return false;
+            } else {
+                // --pipeline-windows: atomically relative to host plan publication, mark the victims nonresident and
+                // retire only their already-published layer readers before rewriting slots.  The worker waits on HOST.
+                std::vector<int32_t> fenced_slots;
+                if (adapt_fence && !swaps.empty()) {
+                    std::vector<int32_t> victims;
+                    for (const Swap& s : swaps) victims.push_back((int32_t) ((int64_t) s.layer * g.n_expert + s.out));
+                    if (!adapt_fence(victims, fenced_slots)) return false;
+                }
+                bool main_live = false;
+                // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
+                const int dma_mode = multi_gpu ? 0 : strata::core::dma_batch_mode();
+                std::vector<void*> cp_dst;
+                std::vector<const void*> cp_src;
+                std::vector<size_t> cp_bytes;
+                for (size_t si = 0; si < swaps.size(); ++si) {
+                    const Swap& s = swaps[si];
+                    const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
+                    const int32_t slot = fenced_slots.empty() ? host_res[out] : fenced_slots[si];
+                    const uint8_t* b = srcp->blob_stable(s.layer, s.in);
+                    const int stn = multi_gpu ? stage_of(s.layer) : 0;   // the swap stays in the layer's own cache
+                    GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                    const strata::core::OnDevice on(gs ? gs->dev : -1);
+                    if (dma_mode != 0 && slot >= 0 && b != nullptr) {
+                        cp_dst.push_back(xcache.device_slot(slot));
+                        cp_src.push_back(b);
+                        cp_bytes.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer));
+                        main_live = true;
+                        host_res[out] = strata::core::kNotResident;
+                        srcp->prefetch(s.layer, s.out);
+                        pending.emplace_back((int32_t) in, slot);
+                        continue;
+                    }
+                    if (slot < 0 || b == nullptr ||
+                        adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                       (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                       gs ? gs->adapt_stream : adapt_stream) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
+                                     (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
+                        return false;
+                    }
+                    if (gs) gs->adapt_live = true;
+                    else main_live = true;
+                    if (!adapt_fence) host_res[out] = strata::core::kNotResident;   // pipeline service thread did this already
+                    srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
+                    pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                }
+                if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
+                                                                adapt_stream, dma_mode) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
+                                 cudaGetErrorString(cudaGetLastError()));
                     return false;
                 }
-                if (gs) gs->adapt_live = true;
-                else main_live = true;
-                if (!adapt_fence) host_res[out] = strata::core::kNotResident;   // pipeline service thread did this already
-                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
-                pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
+                if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+                (void) main_live;
+                for (auto& st : stages)
+                    if (st->adapt_live) {
+                        const strata::core::OnDevice on(st->dev);
+                        cudaEventRecord(st->adapt_ev, st->adapt_stream);
+                    }
             }
-            if (!cp_dst.empty() && strata::core::copy_blobs(cp_dst.data(), cp_src.data(), cp_bytes.data(), cp_dst.size(),
-                                                            adapt_stream, dma_mode) != cudaSuccess) {
-                std::fprintf(stderr, "strata serve: adaptive swap copy failed (batched): %s\n",
-                             cudaGetErrorString(cudaGetLastError()));
-                return false;
-            }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
-            (void) main_live;
-            for (auto& st : stages)
-                if (st->adapt_live) {
-                    const strata::core::OnDevice on(st->dev);
-                    cudaEventRecord(st->adapt_ev, st->adapt_stream);
-                }
             // #477: the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
             // is empty
@@ -10568,6 +10596,114 @@ int main(int argc, char** argv) {
                         retire_state.store(0, std::memory_order_release);
                     }
                 };
+                // A layer's reader barrier, copy completion and RAM retirement advance independently.  Copies stay
+                // on the adaptive worker (pageable HIP copies may block); only service-thread ticks publish plans.
+                struct LayerBatch {
+                    std::atomic<int> state{0}; // 0 unused, 2 waiting readers, 3 copy ready, 5 copied, 6 RAM wait, 7 done
+                    std::vector<LayerCopy> copies;
+                    std::vector<int32_t> incoming;
+                    Readers readers;
+                    SwapHome home{};
+                    cudaEvent_t event = nullptr;
+                    ~LayerBatch() {
+                        if (event) { const strata::core::OnDevice on(home.dev); (void) cudaEventDestroy(event); }
+                    }
+                };
+                std::unique_ptr<LayerBatch[]> layer_batches(new LayerBatch[(size_t) g.n_layers]);
+                std::atomic<int> layer_request{0}; // 1 worker request, 2 service owns active batches, 0 retired
+                std::vector<LayerCopy> layer_copies;
+                adapt_layer_enabled = [&](int64_t layer) {
+                    return PV[stage_of(layer)][0]->pl_host_planned() && PV[stage_of(layer)][1]->pl_host_planned();
+                };
+                adapt_layers = [&](const std::vector<LayerCopy>& copies) -> bool {
+                    layer_copies = copies;
+                    layer_request.store(1, std::memory_order_release);
+                    while (layer_request.load(std::memory_order_acquire) == 1 && !pl_retire_abort.load())
+                        std::this_thread::yield();
+                    while (layer_request.load(std::memory_order_acquire) != 0 && !pl_retire_abort.load()) {
+                        bool progressed = false;
+                        for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+                            LayerBatch& batch = layer_batches[(size_t) layer];
+                            if (batch.state.load(std::memory_order_acquire) != 3) continue;
+                            const strata::core::OnDevice on(batch.home.dev);
+                            for (const LayerCopy& c : batch.copies)
+                                if (c.slot < 0 || !c.source || adapt_copy_h2d(c.home.cache->device_slot(c.slot),
+                                                        c.source, c.bytes, c.home.stream) != cudaSuccess) return false;
+                            if (cudaEventRecord(batch.event, batch.home.stream) != cudaSuccess) return false;
+                            batch.state.store(5, std::memory_order_release);
+                            progressed = true;
+                        }
+                        if (!progressed) std::this_thread::yield();
+                    }
+                    return !pl_retire_abort.load();
+                };
+                auto layer_tick = [&]() -> bool {
+                    const int request = layer_request.load(std::memory_order_acquire);
+                    if (request == 0) return true;
+                    if (request == 1) {
+                        for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+                            LayerBatch& b = layer_batches[(size_t) layer];
+                            b.copies.clear(); b.incoming.clear(); b.readers.clear();
+                            b.state.store(0, std::memory_order_relaxed);
+                        }
+                        for (const LayerCopy& c : layer_copies) {
+                            LayerBatch& b = layer_batches[(size_t) c.layer];
+                            b.copies.push_back(c); b.incoming.push_back(c.in); b.home = c.home;
+                        }
+                        for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+                            LayerBatch& b = layer_batches[(size_t) layer];
+                            if (b.copies.empty()) continue;
+                            if (!b.event) {
+                                const strata::core::OnDevice on(b.home.dev);
+                                if (cudaEventCreateWithFlags(&b.event, cudaEventDisableTiming) != cudaSuccess) return false;
+                            }
+                            std::vector<int32_t> victims;
+                            for (const LayerCopy& c : b.copies) {
+                                host_res[(size_t) c.out] = strata::core::kNotResident;
+                                victims.push_back(c.out);
+                            }
+                            b.readers = snapshot_readers(victims);
+                            b.state.store(2, std::memory_order_relaxed);
+                        }
+                        layer_request.store(2, std::memory_order_release);
+                    }
+                    bool done = true;
+                    for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+                        LayerBatch& b = layer_batches[(size_t) layer];
+                        int state = b.state.load(std::memory_order_acquire);
+                        if (state == 2 && readers_passed(b.readers)) {
+                            b.readers.clear();
+                            b.state.store(3, std::memory_order_release);
+                            state = 3;
+                        }
+                        if (state == 5) {
+                            const strata::core::OnDevice on(b.home.dev);
+                            const cudaError_t q = cudaEventQuery(b.event);
+                            if (q != cudaSuccess && q != cudaErrorNotReady) return false;
+                            if (q == cudaSuccess) {
+                                for (const LayerCopy& c : b.copies) host_res[(size_t) c.in] = c.slot;
+                                b.readers = snapshot_readers(b.incoming);
+                                b.state.store(6, std::memory_order_release);
+                                state = 6;
+                            }
+                        }
+                        if (state == 6 && readers_passed(b.readers)) {
+                            src.commit_exchanges(layer);
+                            for (const LayerCopy& c : b.copies)
+                                srcp->release(layer, (int64_t) c.in % g.n_expert);
+                            b.readers.clear();
+                            b.state.store(7, std::memory_order_release);
+                            state = 7;
+                        }
+                        if (state != 0 && state != 7) done = false;
+                    }
+                    if (done) {
+                        unpin_blobs(pin_live);
+                        res_upload(); // affected stages are host-planned; one upload at batch retirement is sufficient
+                        layer_request.store(0, std::memory_order_release);
+                    }
+                    return true;
+                };
                 src.prepare_overrides();
                 // The swaps land in two steps.  Once their copies are done, the incoming experts are resident (the plans
                 // from then on use their slots).  What gives their RAM back - the resident RAM mode's exchange, the
@@ -10721,6 +10857,7 @@ int main(int argc, char** argv) {
                     }
                     // ---- retire adaptive readers between plan publications; never race a pool's residency read
                     retire_tick();
+                    if (!layer_tick()) return die("a per-layer adaptive copy failed");
                     // ---- every window in flight served
                     if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
                     if (A.s1 && !A.s1_done) {
@@ -11034,10 +11171,13 @@ int main(int argc, char** argv) {
                 strata::core::diag_pipeline_fn().store(nullptr);
                 while (pl_adapt_thr.joinable() && !pl_adapt_done.load(std::memory_order_acquire)) {
                     retire_tick();   // a worker may publish its last retirement request while pl_drain runs
+                    if (!layer_tick()) return die("a per-layer adaptive copy failed");
                     std::this_thread::yield();
                 }
                 if (pl_adapt_thr.joinable()) pl_adapt_thr.join();
                 adapt_fence = nullptr;
+                adapt_layers = nullptr;
+                adapt_layer_enabled = nullptr;
                 if (exch_wait) pl_release();   // every window has completed (drained)
                 // --adapt-async: both stages idle now: the copies still due are queued and the round in flight goes on
                 // unfenced (the INVARIANT at pl_drain: a checkpoint, a park, the serial loop and the next request find

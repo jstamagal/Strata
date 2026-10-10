@@ -244,6 +244,7 @@ public:
     /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
     int service(PoolMultiFn pool, void* user, std::string& err);
     bool in_flight() const { return fl_active_; }
+    bool pl_host_planned() const { return !ar_on() && !device_plan_; }
     /// Main-service-thread-only adaptive retirement.  Only already published plans can read the old slot/RAM
     /// image.  A next-layer doorbell proves those reads finished; device-planned/final-layer readers use ev_done_.
     struct ReaderFence { uint64_t generation = 0; uint32_t ring = 0; };

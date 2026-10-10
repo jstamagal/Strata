@@ -2767,9 +2767,14 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
     return true;
 }
 
-int64_t FileExpertSource::commit_exchanges() {
+int64_t FileExpertSource::commit_exchanges(int64_t layer) {
     int64_t n = 0;
-    for (const Exchange& x : staged_) {
+    size_t kept = 0;
+    for (const Exchange x : staged_) {
+        if (layer >= 0 && (int64_t) (x.in / (size_t) n_expert_) != layer) {
+            staged_[kept++] = x;
+            continue;
+        }
         const uint8_t* src = override_[x.out];
         if (exchange_storage_.active()) {
             if (!exchange_storage_.commit(x.in, x.out, (size_t)x.q, src, (size_t)x.bytes)) {
@@ -2789,7 +2794,7 @@ int64_t FileExpertSource::commit_exchanges() {
         }
         override_[x.out] = nullptr;
     }
-    staged_.clear();
+    staged_.resize(kept);
     exchanges_ += n;
     return n;
 }

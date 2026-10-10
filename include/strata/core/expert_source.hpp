@@ -580,8 +580,9 @@ public:
     /// --pipeline-windows: size the exchange table now, so a `stage_exchange` on the adaptive tier's thread never
     /// reallocates it under a concurrent `blob` (the pool reads it while windows are in flight).
     void prepare_overrides() { if (override_.empty()) override_.assign((size_t) blobs_, nullptr); }
-    /// After the GPU copies of every staged swap have landed.  Returns how many exchanges were applied.
-    int64_t commit_exchanges();
+    /// After copies and RAM readers retire: commit all (-1), or just one independently retired layer.
+    /// Returns how many exchanges were applied; other layers retain their staging.
+    int64_t commit_exchanges(int64_t layer = -1);
     /// `commit_exchanges` in two halves, for the asynchronous adaptive tier (--adapt-async): `commit_copies` moves
     /// every staged evicted blob into its `in`'s place in the copy (on another thread: safe once nothing computes `in`
     /// from RAM - it is resident on the GPU - while `out` is still read from its exchange buffer), then `commit_flip`
