@@ -906,6 +906,125 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
     }
 }
 
+#if defined(__HIPCC__)
+// Each query has a bounded set of producers. Their acq_rel retirement chain publishes every wave's score stores;
+// only the last CTA selects, with no spinning or residency assumptions. All scratch/counters are stream-private.
+constexpr int RS_WORKERS = 64, RS_T = 256;
+__global__ void __launch_bounds__(RS_T) score_select_rdna2_kernel(
+        const float* __restrict__ pooled, const float* __restrict__ dead, const float* __restrict__ query,
+        const int32_t* __restrict__ steps, int64_t max_blocks, int64_t cap,
+        float* __restrict__ scores, int32_t* __restrict__ ids, uint32_t* __restrict__ counters) {
+    const int qi = blockIdx.y, t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const int32_t* st = steps + qi * kStepCount;
+    const int n = st[kStepNKv], nbid = st[kStepNBid], width = st[kStepWidth];
+    if (n <= 0 || nbid < 0 || nbid >= max_blocks || width < 0 || width > cap) return;
+    int32_t* out = ids + qi * cap;
+    if (n <= width) {
+        if (blockIdx.x == 0) for (int i = t; i < n; i += RS_T) out[i] = i;
+        return; // No indexer data is relevant when all cells are selected.
+    }
+    const int nb = nbid + 1, workers = min(RS_WORKERS, (nb + 7) / 8);
+    if (blockIdx.x >= unsigned(workers)) return;
+    __shared__ __align__(16) float qs[IDX_HEADS * IDX_DIM];
+    __shared__ int hist[8][256], scan_gt[RS_T], scan_eq[RS_T];
+    __shared__ uint32_t threshold;
+    __shared__ int above_cells, last;
+    for (int i = t; i < IDX_HEADS * IDX_DIM; i += RS_T) qs[i] = query[qi * IDX_HEADS * IDX_DIM + i];
+    __syncthreads();
+    float* sc = scores + qi * max_blocks;
+    for (int b = int(blockIdx.x) * 8 + wave; b < nb; b += workers * 8) {
+        const float* key = b == nbid ? dead : pooled + int64_t(b) * IDX_DIM;
+        const float4 k4 = *reinterpret_cast<const float4*>(key + lane * 4);
+        float score = 0.0f;
+#pragma unroll
+        for (int h = 0; h < IDX_HEADS; ++h) {
+            const float4 q4 = *reinterpret_cast<const float4*>(qs + h * IDX_DIM + lane * 4);
+            float d = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+            score += d > 0.0f ? d : 0.0f;
+        }
+        if (lane == 0) {
+            if (b == nbid && n % R) score += 1e9f;
+            sc[b] = score;
+        }
+    }
+    // Every score-writing lane releases its stores before the leader joins the retirement chain.
+    __threadfence();
+    __syncthreads();
+    if (t == 0) {
+        last = __hip_atomic_fetch_add(counters + qi, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == unsigned(workers - 1);
+        if (last) __hip_atomic_store(counters + qi, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (!last) return;
+    uint32_t prefix = 0;
+    int above = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = lane; i < 256; i += 32) hist[wave][i] = 0;
+        __syncthreads();
+        const uint32_t mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (int b = t; b < nb; b += RS_T) {
+            const int w = b < nbid ? R : n % R;
+            const uint32_t k = order_key(sc[b]);
+            if (w && (k & mask) == prefix) atomicAdd(&hist[wave][(k >> shift) & 255], w);
+        }
+        __syncthreads();
+        int sum = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) sum += hist[w][t];
+        hist[0][t] = sum;
+        __syncthreads();
+        if (wave == 0) {
+            int bins[8], part = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { bins[i] = hist[0][255 - lane * 8 - i]; part += bins[i]; }
+            int incl = part;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const int excl = incl - part, need = width - above;
+            const unsigned hit = __ballot_sync(0xffffffffu, excl < need && incl >= need);
+            const int who = hit ? __ffs(hit) - 1 : 31;
+            if (lane == who) {
+                int count = excl, i = 0;
+                for (; i < 7; ++i) { if (count + bins[i] >= need) break; count += bins[i]; }
+                threshold = prefix | (uint32_t(255 - lane * 8 - i) << shift);
+                above_cells = above + count;
+            }
+        }
+        __syncthreads();
+        prefix = threshold; above = above_cells;
+    }
+    const int per = (nb + RS_T - 1) / RS_T, b0 = t * per, b1 = min(b0 + per, nb);
+    int gt = 0, eq = 0;
+    for (int b = b0; b < b1; ++b) {
+        const int w = b < nbid ? R : n % R;
+        const uint32_t k = order_key(sc[b]);
+        if (k > prefix) gt += w; else if (k == prefix) eq += w;
+    }
+    scan_gt[t] = gt; scan_eq[t] = eq;
+    __syncthreads();
+    if (t == 0) {
+        int g = 0, e = 0;
+        for (int i = 0; i < RS_T; ++i) {
+            const int gi = scan_gt[i], ei = scan_eq[i]; scan_gt[i] = g; scan_eq[i] = e; g += gi; e += ei;
+        }
+    }
+    __syncthreads();
+    const int budget = width - above, eq_before = scan_eq[t];
+    int pos = scan_gt[t] + min(eq_before, budget), eq_left = max(0, budget - eq_before);
+    for (int b = b0; b < b1; ++b) {
+        const int w = b < nbid ? R : n % R;
+        const uint32_t k = order_key(sc[b]);
+        if (k > prefix) for (int c = 0; c < w; ++c) out[pos++] = b * R + c;
+        else if (k == prefix) for (int c = 0; c < w && eq_left; ++c, --eq_left) out[pos++] = b * R + c;
+    }
+}
+#endif
+
 #if !defined(__HIPCC__)
 // ---- the decode top-k on a thread-block cluster (sm_90+; S19).  One CTA per query (block_topk_reg_kernel, or
 // block_topk_kernel above 33,792 blocks: a --max-context over ~135K) makes four radix passes and two scans over up to
@@ -1129,6 +1248,40 @@ __global__ void __launch_bounds__(CL_T) block_topk_cluster_kernel(const float* _
 }
 #endif  // !__HIPCC__
 }  // namespace
+
+bool qsa_score_select_rdna2(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                           int64_t nq, int64_t max_blocks, int64_t cap, const QsaShapes& s,
+                           float* scores, int32_t* ids, uint32_t* counters, void* stream) {
+#if defined(__HIPCC__)
+    if (nq < 1 || nq > 8 || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R ||
+        s.idx_top_k != 2048 || max_blocks < 1 || max_blocks > INT32_MAX / R || cap < 2051 ||
+        !counters) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool supported = false;
+    if (dev != cached_device) {
+        cudaDeviceProp prop{};
+        supported = cudaGetDeviceProperties(&prop, dev) == cudaSuccess && gfx_arch_is(prop.gcnArchName, "gfx1030");
+        cached_device = dev;
+    }
+    if (!supported) return false;
+    static thread_local int said_device = -1;
+    if (dev != said_device) {
+        std::fprintf(stderr, "qsa select: live-context fused wave32 score/radix producer on GPU%d\n", dev);
+        said_device = dev;
+    }
+    score_select_rdna2_kernel<<<dim3(RS_WORKERS, unsigned(nq)), RS_T, 0, (cudaStream_t) stream>>>(
+        pooled, dead, q_idx, steps, max_blocks, cap, scores, ids, counters);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) { std::fprintf(stderr, "qsa score/select: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    return true;
+#else
+    (void) pooled; (void) dead; (void) q_idx; (void) steps; (void) nq; (void) max_blocks; (void) cap;
+    (void) s; (void) scores; (void) ids; (void) counters; (void) stream;
+    return false;
+#endif
+}
 
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                       int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {

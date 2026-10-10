@@ -13,12 +13,19 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace k = strata::kernels;
 
 namespace {
+#if defined(__HIPCC__)
+constexpr auto capture_mode = hipStreamCaptureModeGlobal;
+#else
+constexpr auto capture_mode = cudaStreamCaptureModeGlobal;
+#endif
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
 }
@@ -28,9 +35,114 @@ template <typename T> T* up(const std::vector<T>& h) {
     ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
     return d;
 }
+bool fused_case(int ctx, int nq, bool bench) {
+    const auto s = k::qsa_real_shapes();
+    constexpr int capacity = 524288;
+    const int64_t blocks = capacity / 4 + 2, cap = 2060; // guard each selection's unused suffix
+    std::vector<float> pooled(size_t(blocks * 128)), dead(128), q(size_t(nq * 512));
+    std::vector<int32_t> steps(size_t(nq * k::kStepCount));
+    auto* dp = up(pooled); auto* dd = up(dead); auto* dq = up(q); auto* dt = up(steps);
+    float *so = nullptr, *sn = nullptr;
+    int32_t *io = nullptr, *in = nullptr;
+    uint32_t* counter = nullptr;
+    ck(cudaMalloc(&so, size_t(nq * blocks) * 4), "malloc");
+    ck(cudaMalloc(&sn, size_t(nq * blocks) * 4), "malloc");
+    ck(cudaMalloc(&io, size_t(nq * cap) * 4), "malloc");
+    ck(cudaMalloc(&in, size_t(nq * cap) * 4), "malloc");
+    ck(cudaMalloc(&counter, size_t(nq) * 4), "malloc");
+    ck(cudaMemset(counter, 0, size_t(nq) * 4), "zero counters");
+    cudaStream_t stream; ck(cudaStreamCreate(&stream), "stream");
+    auto staged = [&] {
+        k::qsa_block_scores(dp, dd, dq, dt, nq, blocks, s, so, stream);
+        k::qsa_block_topk(so, dt, nq, blocks, cap, s, io, stream);
+    };
+    auto fused = [&] {
+        if (!k::qsa_score_select_rdna2(dp, dd, dq, dt, nq, blocks, cap, s, sn, in, counter, stream)) {
+            std::fprintf(stderr, "fused scorer refused\n"); std::exit(2);
+        }
+    };
+    std::mt19937 rng(8179 + ctx);
+    std::uniform_real_distribution<float> rand(-1.f, 1.f);
+    cudaGraph_t graph = nullptr; cudaGraphExec_t exec = nullptr;
+    bool ok = true;
+    for (int pass = 0; pass < 4; ++pass) {
+        for (auto& x : pooled) x = pass == 1 ? 0.f : pass == 2 ? float(int(rng() % 3) - 1) : rand(rng);
+        for (auto& x : dead) x = pass == 1 ? 0.f : pass == 2 ? float(int(rng() % 3) - 1) : rand(rng);
+        for (auto& x : q) x = pass == 1 ? 0.f : pass == 2 ? 1.f : rand(rng);
+        for (int i = 0; i < nq; ++i) {
+            const int n = pass == 3 ? (nq == 1 || i % 2 ? ctx : std::min(ctx, 2051)) : std::max(1, ctx - nq + 1 + i);
+            auto* st = steps.data() + i * k::kStepCount;
+            st[k::kStepPos] = n - 1; st[k::kStepNKv] = n; st[k::kStepNBid] = n / 4;
+            st[k::kStepWidth] = int(k::qsa_selection_width(n, s));
+        }
+        ck(cudaMemcpyAsync(dp, pooled.data(), pooled.size() * 4, cudaMemcpyHostToDevice, stream), "upload");
+        ck(cudaMemcpyAsync(dd, dead.data(), dead.size() * 4, cudaMemcpyHostToDevice, stream), "upload");
+        ck(cudaMemcpyAsync(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice, stream), "upload");
+        ck(cudaMemcpyAsync(dt, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice, stream), "upload");
+        ck(cudaMemsetAsync(io, 0xa5, size_t(nq * cap) * 4, stream), "guards");
+        ck(cudaMemsetAsync(in, 0xa5, size_t(nq * cap) * 4, stream), "guards");
+        if (pass == 0) {
+            staged(); fused(); ck(cudaStreamSynchronize(stream), "warm");
+            ck(cudaStreamBeginCapture(stream, capture_mode), "capture");
+            staged(); fused();
+            ck(cudaStreamEndCapture(stream, &graph), "capture end");
+            ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
+        } else ck(cudaGraphLaunch(exec, stream), "replay");
+        ck(cudaStreamSynchronize(stream), "sync");
+        std::vector<int32_t> a(size_t(nq * cap)), b(a.size());
+        std::vector<uint32_t> count(nq);
+        std::vector<float> fa(size_t(nq * blocks)), fb(fa.size());
+        ck(cudaMemcpy(a.data(), io, a.size() * 4, cudaMemcpyDeviceToHost), "download");
+        ck(cudaMemcpy(b.data(), in, b.size() * 4, cudaMemcpyDeviceToHost), "download");
+        ck(cudaMemcpy(count.data(), counter, count.size() * 4, cudaMemcpyDeviceToHost), "download");
+        ck(cudaMemcpy(fa.data(), so, fa.size() * 4, cudaMemcpyDeviceToHost), "download");
+        ck(cudaMemcpy(fb.data(), sn, fb.size() * 4, cudaMemcpyDeviceToHost), "download");
+        for (int i = 0; i < nq; ++i) {
+            const auto* st = steps.data() + i * k::kStepCount;
+            ok = ok && std::equal(a.begin() + i * cap, a.begin() + (i + 1) * cap, b.begin() + i * cap) && count[i] == 0;
+            for (int j = st[k::kStepWidth]; j < cap; ++j) ok = ok && b[size_t(i * cap + j)] == int32_t(0xa5a5a5a5);
+            if (st[k::kStepNKv] > st[k::kStepWidth])
+                ok = ok && !std::memcmp(fa.data() + i * blocks, fb.data() + i * blocks, size_t(st[k::kStepNBid] + 1) * 4);
+        }
+        if (!ok) { std::fprintf(stderr, "FAIL fused ctx%d nq%d pass%d\n", ctx, nq, pass); break; }
+    }
+    if (bench && ok) {
+        // Last changed-input replay's mix of identity/nonidentity rows, captured controls timed separately.
+        cudaEvent_t e0, e1; ck(cudaEventCreate(&e0), "event"); ck(cudaEventCreate(&e1), "event");
+        auto time = [&](auto f) {
+            cudaGraph_t g; cudaGraphExec_t ge;
+            ck(cudaStreamBeginCapture(stream, capture_mode), "capture");
+            f(); ck(cudaStreamEndCapture(stream, &g), "capture end");
+            ck(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0), "instantiate");
+            for (int i = 0; i < 5; ++i) ck(cudaGraphLaunch(ge, stream), "warm graph");
+            ck(cudaEventRecord(e0, stream), "record");
+            for (int i = 0; i < 100; ++i) ck(cudaGraphLaunch(ge, stream), "timed graph");
+            ck(cudaEventRecord(e1, stream), "record"); ck(cudaEventSynchronize(e1), "sync");
+            float ms; ck(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+            ck(cudaGraphExecDestroy(ge), "destroy"); ck(cudaGraphDestroy(g), "destroy");
+            return ms * 10.f;
+        };
+        const float old_us = time(staged), new_us = time(fused);
+        std::printf("isolated captured ctx%d nq%d mix: staged %.2fus fused %.2fus\n", ctx, nq, old_us, new_us);
+        ck(cudaEventDestroy(e0), "destroy"); ck(cudaEventDestroy(e1), "destroy");
+    }
+    ok = ok && !k::qsa_score_select_rdna2(dp, dd, dq, dt, 9, blocks, cap, s, sn, in, counter, stream);
+    ck(cudaGraphExecDestroy(exec), "destroy"); ck(cudaGraphDestroy(graph), "destroy");
+    ck(cudaStreamDestroy(stream), "destroy");
+    cudaFree(dp); cudaFree(dd); cudaFree(dq); cudaFree(dt); cudaFree(so); cudaFree(sn);
+    cudaFree(io); cudaFree(in); cudaFree(counter);
+    std::printf("%s fused ctx%d nq%d direct/3 changed-input replays, exact scores/ids/guards/counter\n", ok ? "PASS" : "FAIL", ctx, nq);
+    return ok;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--fused-selftest") {
+        for (int ctx : {1, 2051, 2052, 6001, 32768, 131075, 524288})
+            for (int nq : {1, 4, 8}) if (!fused_case(ctx, nq, ctx == 2051 || ctx == 6001 || ctx == 32768)) return 1;
+        std::puts("PASS fused QSA producer: 21 cases x direct/3 changed-input graph replays; T9 fallback");
+        return 0;
+    }
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 131072;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 256;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 10;

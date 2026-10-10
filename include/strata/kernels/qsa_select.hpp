@@ -29,6 +29,13 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
 
+/// gfx1030 decode producer: exact wave-dot scores followed by weighted radix selection in the last retiring CTA.
+/// counters[nq] must start at zero and be private to this stream (reset by the producer). No inter-CTA waits.
+/// Identity selection does not read pooled/dead/query or scores. False without launching on unsupported devices/shapes.
+bool qsa_score_select_rdna2(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+                           int64_t nq, int64_t max_blocks, int64_t cap, const QsaShapes& s,
+                           float* scores, int32_t* ids, uint32_t* counters, void* stream);
+
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.
 /// On AMD it is the gfx12 (RDNA4) WMMA kernel (a three-way bf16 split, six products); false on any other AMD target.
