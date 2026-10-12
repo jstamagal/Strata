@@ -1,0 +1,95 @@
+K-quant MMQ on HIP: the sub-block scale times the dot sum as a float multiply
+
+From llama-navi21-furnace (github.com/sixvolts/llama-navi21-furnace, b4e2700f8), ggml/src/ggml-cuda/vecdotq.cuh:
+ggml_cuda_mmq_scale_sumi(sc, sumi) returns (float) sc * (float) sumi under GGML_USE_HIP, and (float) (sc * sumi), the
+stock form, elsewhere.  The Q4_K / Q5_K / Q6_K MMQ and MMVQ dot helpers call it.  On AMD the 32-bit integer multiply
+(v_mul_lo_u32) runs at a quarter of the rate of the float multiply.
+
+The result is the same number: both factors and the product are integers below 2^24, which FP32 holds exactly.
+  Q4_K: scale <= 63, |dot sum| <= 32 * 15 * 127 = 60960, product <= 3840480.
+  Q5_K: scale <= 63, |dot sum| <= 32 * 31 * 127 = 125984, product <= 7936992.
+  Q6_K: |scale| <= 128, |dot sum| <= 16 * 32 * 127 = 65024 per half, the two products summed <= 16646144 (2^24 = 16777216).
+tests/hip/prefill_kquant_parity.cpp runs blocks of exactly these largest values (its "raw" case).
+
+Base: llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d (third_party/ggml/VERSION.txt).
+Apply:  patch -p1 -d third_party/llama.cpp < third_party/llama.cpp-patches/0001-kquant-mmq-fp32-scale-multiply.patch
+Remove: the same with -R (after 0002 is removed, or leave 0002: the two do not overlap).
+
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -501,6 +501,17 @@
+     return d3*d8 * sumi;
+ }
+ 
++// scale * dot-sum for the K-quant MMQ and MMVQ paths. The integer product is exact in fp32 (a scale
++// of at most 8 bits times a dot sum below 2^17), and on AMD v_mul_lo_u32 is quarter rate while the
++// float multiply is full rate, so do it in float there. Same result on both paths.
++static __device__ __forceinline__ float ggml_cuda_mmq_scale_sumi(const int sc, const int sumi) {
++#ifdef GGML_USE_HIP
++    return (float) sc * (float) sumi;
++#else
++    return (float) (sc * sumi);
++#endif // GGML_USE_HIP
++}
++
+ #define VDR_Q4_K_Q8_1_MMVQ 2
+ #define VDR_Q4_K_Q8_1_MMQ  8
+ 
+@@ -520,8 +531,8 @@
+         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
+         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+ 
+-        sumf_d += d8[i] * (dot1 * sc[i]);
+-        sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
++        sumf_d += d8[i] * ggml_cuda_mmq_scale_sumi(sc[i], dot1);
++        sumf_m += d8[i] * ggml_cuda_mmq_scale_sumi(m[i], dot2);  // multiply constant part of q4_K with sum of q8_1 values
+     }
+ 
+     const float2 dm4f = __half22float2(dm4);
+@@ -548,7 +559,7 @@
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
++        sumf_d += ds8f.x * ggml_cuda_mmq_scale_sumi(sc[i], sumi_d);
+         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+     }
+ 
+@@ -582,8 +593,8 @@
+         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
+         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+ 
+-        sumf_d += d8[i] * (dot1 * sc[i]);
+-        sumf_m += d8[i] * (dot2 * m[i]);
++        sumf_d += d8[i] * ggml_cuda_mmq_scale_sumi(sc[i], dot1);
++        sumf_m += d8[i] * ggml_cuda_mmq_scale_sumi(m[i], dot2);
+ 
+     }
+ 
+@@ -611,7 +622,7 @@
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
++        sumf_d += ds8f.x * ggml_cuda_mmq_scale_sumi(sc[i], sumi_d);
+         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+     }
+ 
+@@ -640,7 +651,7 @@
+ 
+         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+ 
+-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
++        sumf += d8[i] * ggml_cuda_mmq_scale_sumi(sc, ggml_cuda_dp4a(vi, u[i], 0)); // SIMD dot product
+     }
+ 
+     return d*sumf;
+@@ -669,7 +680,7 @@
+             sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
+         }
+ 
+-        sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
++        sumf_d += d8[i0/4] * (ggml_cuda_mmq_scale_sumi(sc_reg[i0/2+0], sumi_d.x) + ggml_cuda_mmq_scale_sumi(sc_reg[i0/2+1], sumi_d.y));
+     }
+ 
+     return d6 * sumf_d;
