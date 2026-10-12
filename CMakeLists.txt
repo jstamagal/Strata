@@ -1506,6 +1506,17 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_q4_parity COMMAND hip_prefill_q4_parity)
     set_tests_properties(hip_prefill_q4_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     list(APPEND _strata_hip_tests hip_prefill_q4_parity)
+    if(STRATA_MMQ_KQUANTS)
+      # llama.cpp's Q4_K / Q5_K / Q6_K MMQ kernels through mmq::quantize / mmq::Context::run (the experts' gate+up
+      # shape, a dense projection, uneven experts) against an FP64 reference of the same arithmetic; prints a hash
+      # of every output, so two builds compare bit for bit, and times each product
+      add_executable(hip_prefill_kquant_parity tests/hip/prefill_kquant_parity.cpp)
+      target_include_directories(hip_prefill_kquant_parity PRIVATE "${_strata_gg}/include")
+      target_link_libraries(hip_prefill_kquant_parity PRIVATE strata_mmq ggml-base strata_hip_runtime)
+      add_test(NAME hip_prefill_kquant_parity COMMAND hip_prefill_kquant_parity)
+      set_tests_properties(hip_prefill_kquant_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      list(APPEND _strata_hip_tests hip_prefill_kquant_parity)
+    endif()
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
     add_executable(hip_prefill_fused_moe tests/cuda/prefill_fused_moe_test.cpp)
     target_include_directories(hip_prefill_fused_moe PRIVATE "${_strata_gg}/include")
