@@ -1459,6 +1459,7 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
+      src/prefill/moe_q4.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
     if(STRATA_MMQ_KQUANTS)
@@ -1471,7 +1472,7 @@ if(STRATA_NATIVE_EXPERTS)
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
-    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_q4.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
@@ -1487,6 +1488,14 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
+    # the RDNA2 Q4_0 / Q4_1 prompt-expert kernel (moe_q4.cu) against an FP64 reference of the same arithmetic, and
+    # its timing on the two real shapes (exit 77 off gfx103x)
+    add_executable(hip_prefill_q4_parity tests/hip/prefill_q4_parity.cpp)
+    target_include_directories(hip_prefill_q4_parity PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_q4_parity PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_q4_parity COMMAND hip_prefill_q4_parity)
+    set_tests_properties(hip_prefill_q4_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_prefill_q4_parity)
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
     add_executable(hip_prefill_fused_moe tests/cuda/prefill_fused_moe_test.cpp)
     target_include_directories(hip_prefill_fused_moe PRIVATE "${_strata_gg}/include")

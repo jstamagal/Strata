@@ -2,6 +2,9 @@
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(__HIPCC__)
+#include "strata/prefill/moe_q4.hpp"   // Q4_0 / Q4_1 experts: Strata's own RDNA2 kernel, reached through this contract
+#endif
 
 #include "common.cuh"
 #include "mmq.cuh"
@@ -119,6 +122,9 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 bool built() { return true; }
 
 bool supported(int t) {
+#if defined(__HIPCC__)
+    if (q4::covers(t)) return q4::enabled();
+#endif
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ
@@ -140,6 +146,9 @@ bool supported(int t) {
 }
 
 bool fits(int t, int64_t w_rows) {
+#if defined(__HIPCC__)
+    if (q4::covers(t)) return q4::fits(t, w_rows);   // no llama.cpp tile behind it: nothing to look up
+#endif
     if (!supported(t)) return false;
     // mul_mat_q_case's choice: the "fallback" configs when the rows are not a multiple of 128; then
     // mul_mat_q_switch_J's loop - a tile size whose config exists for this card and fits its shared memory
@@ -177,6 +186,12 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
+#if defined(__HIPCC__)
+    if (q4::covers(t)) {   // its own chunks ({float d[4]; s8 q[128]}), within q8_bytes
+        q4::quantize(x, ids, xq, cols, ld, rows, stream);
+        return;
+    }
+#endif
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -191,6 +206,12 @@ Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
+#if defined(__HIPCC__)
+    if (q4::covers(p.type)) {
+        q4::run(p, stream);
+        return;
+    }
+#endif
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
