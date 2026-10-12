@@ -420,14 +420,31 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
     }
     // --pipeline-windows 2 (the forcing graphs): the chain shares its card with stage 1's windows and the next launch
-    // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
+    // on stage 0 waits for it, so its stream gets the highest priority there (CUDA: STRATA_MTP_PRIORITY=0 turns it off;
+    // HIP: off unless STRATA_HIP_MTP_PRIORITY=1)
     bool prio = false;
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
+#if !defined(STRATA_HIP_GFX906)   // (the old gfx906 ROCm build stays out: it cannot be checked here)
+#if defined(STRATA_USE_HIP)
+    static const bool hi_prio = [] { const char* v = std::getenv("STRATA_HIP_MTP_PRIORITY"); return v != nullptr && std::strcmp(v, "1") == 0; }();
+#else
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
     int prio_lo = 0, prio_hi = 0;
     if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
+#if defined(STRATA_USE_HIP)
+    if (force_on_ && hi_prio) {   // (HIP: only when opted in, so the default path makes the same calls as before)
+        cudaGetLastError();
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata mtp: STRATA_HIP_MTP_PRIORITY=1: the draft chain's stream at the highest priority (opt-in on HIP): %s\n",
+                         prio ? "created" : "fell back to the default priority");
+        }
+    }
+#else
     cudaGetLastError();
+#endif
 #endif
     if (!prio && cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
 #if !defined(STRATA_USE_HIP)
