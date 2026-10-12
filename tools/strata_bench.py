@@ -872,6 +872,13 @@ def main(argv=None) -> int:
                   "or give --url of a running server.", file=sys.stderr)
             return 2
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        if cfg.get("env_file"):                      # the shared variables file, as serve/server.py merges it
+            shared = {}
+            for f in ([cfg["env_file"]] if isinstance(cfg["env_file"], str) else list(cfg["env_file"])):
+                fp = Path(f) if Path(f).is_absolute() else cfg_path.parent / f
+                shared.update(json.loads(fp.read_text(encoding="utf-8-sig")))
+            shared.update(cfg.get("env") or {})
+            cfg["env"] = shared
     key = a.api_key or ((cfg or {}).get("api_key") or "")
     if a.url:
         base = a.url.rstrip("/")

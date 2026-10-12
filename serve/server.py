@@ -2336,6 +2336,25 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
+def merge_env_file(cfg, folder):
+    """"env_file": "FILE" (or a list of files) in a config: engine variables kept in one shared JSON object
+    ({"NAME": "value", ...}; a path relative to the config's folder).  They go under the config's own "env",
+    whose entries win, so several configs can share one list and still differ where they say so."""
+    files = cfg.get("env_file")
+    if not files:
+        return cfg
+    env = {}
+    for f in ([files] if isinstance(files, str) else list(files)):
+        path = Path(f) if Path(f).is_absolute() else Path(folder) / f
+        shared = json.loads(path.read_text(encoding="utf-8-sig"))
+        if not isinstance(shared, dict):
+            raise ValueError(f"{path}: env_file must hold one JSON object of NAME: value")
+        env.update(shared)
+    env.update(cfg.get("env") or {})
+    cfg["env"] = env
+    return cfg
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -6185,6 +6204,7 @@ def main() -> int:
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    merge_env_file(cfg, Path(a.config).parent if a.config else Path("."))
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
