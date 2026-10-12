@@ -74,6 +74,7 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # every kernel when it starts (CUDA_MODULE_LOADING=EAGER), so these took ~5 MB of VRAM - 1-3 expert slots - from every
 # model, and the UD-Q4_K_XL prompt is SSD-bound with or without them (docs/UNSLOTH_Q4.md)
 option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K: the CUDA experts of Unsloth's UD-Q4_K_XL, and on HIP the dense GGUF projections (STRATA_DENSE_MMQ)" OFF)
+option(STRATA_MMQ_WIDE_LDS "HIP gfx103x: the Q4_K / Q5_K / Q6_K MMQ kernels read their activation window from shared memory 16 bytes at a time (same results; needs the wide-LDS path in the llama.cpp source, third_party/llama.cpp-patches)" ON)
 # CUDA: Q6_K gate/up in the grouped expert kernels (Unsloth's UD-Q6_K_XL, docs/UNSLOTH_Q6.md).  Off by default: every
 # grouped-kernel instance is loaded when the engine starts (CUDA_MODULE_LOADING=EAGER), so one more costs VRAM that
 # every other model would lose as expert slots (PR #860 review)
@@ -1481,6 +1482,23 @@ if(STRATA_NATIVE_EXPERTS)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    if(STRATA_MMQ_KQUANTS AND STRATA_MMQ_WIDE_LDS)
+      # The wide-LDS activation windows of the K-quant MMQ kernels (llama.cpp-rdna2's, third_party/llama.cpp-patches)
+      # are compiled only into a template instance whose source file carries the macro of its type; ggml's own HIP
+      # CMake sets them, Strata's build does not use that file.  Only the RDNA2 macros: mmq.cuh reads them in the
+      # gfx103x device code alone, so another architecture of the same build keeps the stock loads.
+      file(STRINGS "${_strata_mmq}/mmq.cuh" _strata_wide_lds REGEX "GGML_HIP_RDNA2_Q4_K_MMQ_WIDE_LDS")
+      if(_strata_wide_lds)
+        foreach(_t q4_k q5_k q6_k)
+          string(TOUPPER "${_t}" _tu)
+          set_source_files_properties("${_strata_mmq}/template-instances/mmq-instance-${_t}.cu"
+                                      PROPERTIES COMPILE_DEFINITIONS "GGML_HIP_RDNA2_${_tu}_MMQ_WIDE_LDS=1")
+        endforeach()
+        message(STATUS "Strata: K-quant MMQ wide-LDS activation windows on for gfx103x (STRATA_MMQ_WIDE_LDS)")
+      else()
+        message(STATUS "Strata: K-quant MMQ wide-LDS activation windows off: ${_strata_mmq}/mmq.cuh has no such path")
+      endif()
+    endif()
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_q4.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
