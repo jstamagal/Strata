@@ -743,13 +743,14 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     }
 }
 
-#if !defined(__HIPCC__)
 // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
 // kernel's threads, per-warp histograms and warp scans, with each key read from memory again on every pass.  A
 // histogram has no order, so on the four radix passes thread t reads blocks t, t + 1024, ...: a warp reads 32
 // neighbours at a time.  The cells are emitted ascending in the order (warp, row, lane): warp w holds the `per` rows
 // of 32 consecutive blocks from block w * 32 * per.  block_topk_kernel's selection rule (radix threshold, ties to the
 // lowest index): identical ids.
+// campaign3: also compiled on HIP (gfx11: plain shared/atomic code, no sm_90 features; the dispatch still needs
+// reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
 __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
                                                                const int32_t* __restrict__ steps, int64_t max_blocks,
                                                                int64_t cap, int32_t* __restrict__ ids) {
@@ -860,7 +861,6 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
 }
-#endif
 
 
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
@@ -1398,7 +1398,10 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 7168;
     }();
     const bool too_small = counted && reach < kRegMinBlocks;
-    if (old || too_small || reach > fit) {
+    // PR #1749: with STRATA_TOPK_STREAM=1 `reach > fit` no longer forces the ref radix - the wide kernel below takes
+    // it (same ids).  Opt-in on HIP in this tree (measured on gfx1151 only); without it the dispatch is as before.
+    static const bool hip_wide = [] { const char* v = std::getenv("STRATA_TOPK_STREAM"); return v != nullptr && v[0] == '1'; }();
+    if (old || too_small || (reach > fit && !hip_wide)) {
 #else
     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
     const bool too_small = reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks;
@@ -1411,18 +1414,22 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
         std::exit(1);
     }
-#if !defined(__HIPCC__)
     // Turing prefill (the `counted` bound) above ~90K cells (22,528 blocks): the wide kernel, which reads the keys
     // coalesced, instead of the register kernel's uncoalesced per-thread runs (PR #743: 131K, 1.03 -> 0.75 ms); the
     // same ids.  STRATA_TOPK_STREAM=0 restores the register kernel there.
+    // PR #1749: on HIP too with STRATA_TOPK_STREAM=1 (it was CUDA-only, and AMD fell to the ref radix past the
+    // register kernel's reach - the deep-decode top-k cost).  Same ids as the ref kernel.
+#if defined(__HIPCC__)
+    static const bool turing_wide = hip_wide;   // HIP: only with STRATA_TOPK_STREAM=1 (see above)
+#else
     static const bool turing_wide = [] {
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
+#endif
     if (reach > fit || (turing_wide && counted && reach > 22528))   // past the register kernel's reach, or Turing's band
         block_topk_wide_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else
-#endif
     if (reach <= (int64_t) TK_T * TK_PER)
         block_topk_reg_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     else
