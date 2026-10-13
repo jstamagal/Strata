@@ -2198,7 +2198,9 @@ __global__ void __launch_bounds__(256) s26_gu_l_kernel(const unsigned long long*
 
 constexpr int S26_HMAX = 640 / 32;    // q8_1 blocks of one SwiGLU row (n_ff 640)
 
-template<bool LX, int RPW, bool SL = false, bool TS = false, int BAL = 0>
+// (TD: the down format.  20, IQ4_NL, is S26's; 42, Q2_0, is STRATA_EXPERT_DOWN_L's - the same loop over Split<42>,
+// 20 items a row on lanes 0-19, as row_dot_multi places them; BAL is IQ4_NL's.)
+template<bool LX, int RPW, bool SL = false, bool TS = false, int BAL = 0, int TD = 20>
 __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                          const int32_t* __restrict__ grp_start,
                                                          const int32_t* __restrict__ n_groups,
@@ -2242,6 +2244,7 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 #pragma unroll
             for (int c = 0; c < GRP_NC; ++c) s[q][c] = 0.0f;
         if constexpr (BAL > 0) {   // S26: 5 items per lane instead of 8 / 4, in BAL groups (loads first)
+            static_assert(TD == 20, "BAL is IQ4_NL's");
             constexpr int NI = 2 * S26_HMAX, IT = RPW * NI / 32;
             static_assert(RPW * NI % 32 == 0, "whole steps");
             auto group = [&]<int G0, int... J>(std::integer_sequence<int, J...>) {
@@ -2271,16 +2274,16 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
                 (group.template operator()<Q * G>(std::make_integer_sequence<int, (IT - Q * G < G ? IT - Q * G : G)>{}), ...);
             }(std::make_integer_sequence<int, BAL>{});
         } else
-        for (int k = lane; k < nb * 2; k += 32) {
-            const int kbx = k / 2, iqs = 2 * (k % 2);
-            Split<20>::W w[RPW];
+        for (int k = lane; k < (nb * 32 / Fmt<TD>::qk) * Fmt<TD>::ipb; k += 32) {
+            const int kbx = k / Fmt<TD>::ipb, iqs = Fmt<TD>::step * (k % Fmt<TD>::ipb);
+            typename Split<TD>::W w[RPW];
 #pragma unroll
-            for (int q = 0; q < RPW; ++q) { if constexpr (SL) w[q] = S26Split<20, false>::load(wr[q], kbx, iqs); else w[q] = Split<20>::load(wr[q], kbx, iqs); }
+            for (int q = 0; q < RPW; ++q) { if constexpr (SL && TD == 20) w[q] = S26Split<20, false>::load(wr[q], kbx, iqs); else w[q] = Split<TD>::load(wr[q], kbx, iqs); }
 #pragma unroll
             for (int q = 0; q < RPW; ++q)
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
-                    if (c < n) s[q][c] += Split<20>::apply(w[q], hbase + off[c] + kbx, iqs);
+                    if (c < n) s[q][c] += Split<TD>::apply(w[q], hbase + off[c] + kbx * (Fmt<TD>::qk / 32), iqs);
         }
         if constexpr (TS) {   // S26: all RPW x GRP_NC sums in one transposed butterfly (bitwise the same sums)
             constexpr int P = s26ts::pow2_ceil(RPW * GRP_NC);
@@ -2815,11 +2818,13 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
-#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__)
+// (kernel agent G: they build for every HIP target as well now.  Off gfx906 a HIP card keeps mode 0 unless
+// STRATA_EXP_MODE names another, so the default launches are the ones before.  Measured on a PRO V620 (gfx1030) with
+// tests/hip/decode_expert_lab.cpp, a card's 24 layers at 4 tokens x 10 experts (27 groups), microseconds per layer:
+// mode 0 162-176, mode 8 139-165 (IQ4_XS gate/up, one layer of the IQ3_S pack: 188 against 186), mode 8 with
+// STRATA_EXPERT_DOWN_L=1 and STRATA_TSUM=1 128-148 (IQ4_XS: 171).  Modes 2 and 5 are slower than mode 0 there
+// (177-230, 193-217), mode 7 is mode 8 less ~4 us.  All of them bitwise mode 0's output (the lab's --hash).)
 #define STRATA_EXP_LAYOUTS 1
-#else
-#define STRATA_EXP_LAYOUTS 0
-#endif
 #if defined(STRATA_HIP_GFX906)
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
@@ -3408,7 +3413,7 @@ int exp_mode() {
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
     if (g_exp_mode >= 0) return g_exp_mode;
     if (m >= 0) return m;
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(__HIPCC__)
     return kExpModeDefault;
 #else
     // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
@@ -3580,6 +3585,25 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/swiglu");
     }
     if (g_exp_phase == 1) return;
+    // STRATA_EXPERT_DOWN_L=1 (opt-in, kernel agent G): the IQ4_NL down rows on STRATA_EXPERT_V2's down kernel (4 rows
+    // interleaved per warp, the chunk's h rows in LDS, 5 items a lane; with STRATA_TSUM its transposed butterfly) behind
+    // ANY gate/up format - V2 itself only takes the IQ3_S gate/up layers, 9 of the IQ3_S pack's 39 IQ4_NL-down layers -
+    // and the Q2_0 down rows on the same kernel (its plain loop, 4 rows a warp).
+    // The same kernel instantiations as V2's, so the same bits (tests/hip/decode_expert_lab.cpp --hash).
+    static const bool down_l = [] { const char* v = std::getenv("STRATA_EXPERT_DOWN_L"); return v && v[0] == '1'; }();
+    if (down_l && (L.d_type == 20 || L.d_type == 42) && L.n_embd == 2560 && L.n_ff == 640 &&
+        !(grid_groups > 0 && grid_groups < cap_groups)) {
+        static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+        const dim3 gdl((unsigned) (L.n_embd / (8 * 4)), (unsigned) cap_groups);
+        if (L.d_type == 42) {   // Q2_0: the same kernel over Split<42>
+            if (ts) s26_down_l_kernel<true, 4, false, true, 0, 42><<<gdl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else s26_down_l_kernel<true, 4, false, false, 0, 42><<<gdl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        } else
+        if (ts) s26_down_l_kernel<true, 4, true, true, 1><<<gdl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else s26_down_l_kernel<true, 4, true, false, 0><<<gdl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        check("native_expert_grouped/down (l)");
+        return;
+    }
     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
