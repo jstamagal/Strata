@@ -635,13 +635,11 @@ __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
     return r;
 }
 
+// The kernel's body with its shared memory handed in, so block_topk_auto_kernel can run it too.
 template <int PER>
-__global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
-                                                              const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                              int64_t cap, int32_t* __restrict__ ids) {
-    __shared__ int hist[TK_T / 32][256];
-    __shared__ int s_warp[33];
-    __shared__ int s_digit, s_above;
+__device__ __forceinline__ void block_topk_reg_body(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                                    int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                                    int (*hist)[256], int* s_warp, int& s_digit, int& s_above) {
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -743,6 +741,16 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
     }
 }
 
+template <int PER>
+__global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
+                                                              const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                              int64_t cap, int32_t* __restrict__ ids) {
+    __shared__ int hist[TK_T / 32][256];
+    __shared__ int s_warp[33];
+    __shared__ int s_digit, s_above;
+    block_topk_reg_body<PER>(scores, steps, max_blocks, cap, ids, hist, s_warp, s_digit, s_above);
+}
+
 // ---- a query with more blocks than the register kernel holds (contexts past 4 * 1024 * TK_PER cells): the register
 // kernel's threads, per-warp histograms and warp scans, with each key read from memory again on every pass.  A
 // histogram has no order, so on the four radix passes thread t reads blocks t, t + 1024, ...: a warp reads 32
@@ -751,12 +759,9 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
 // lowest index): identical ids.
 // campaign3: also compiled on HIP (gfx11: plain shared/atomic code, no sm_90 features; the dispatch still needs
 // reach > fit, i.e. the deep contexts where the ref radix was the only option on AMD).
-__global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
-                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
-                                                               int64_t cap, int32_t* __restrict__ ids) {
-    __shared__ int hist[TK_T / 32][256];
-    __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
-    __shared__ int s_digit, s_above;
+__device__ __forceinline__ void block_topk_wide_body(const float* __restrict__ scores, const int32_t* __restrict__ steps,
+                                                     int64_t max_blocks, int64_t cap, int32_t* __restrict__ ids,
+                                                     int (*hist)[256], int* s_gt, int* s_eq, int& s_digit, int& s_above) {
     const int64_t qi = blockIdx.x;
     const int32_t* st = steps + qi * kStepCount;
     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
@@ -861,6 +866,40 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
         run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
 }
+
+__global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int64_t cap, int32_t* __restrict__ ids) {
+    __shared__ int hist[TK_T / 32][256];
+    __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
+    __shared__ int s_digit, s_above;
+    block_topk_wide_body(scores, steps, max_blocks, cap, ids, hist, s_gt, s_eq, s_digit, s_above);
+}
+
+#if defined(__HIPCC__)
+// ---- HIP, opt-in (STRATA_TOPK_AUTO=1): the decode window's top-k chosen ON THE DEVICE by the query's own block
+// count.  A decode call has no active-block count (its launch is captured once, for any length), so the dispatch below
+// sizes it by the capacity: with --max-context above ~135K every decode top-k is the reference radix (or, with
+// STRATA_TOPK_STREAM=1, the wide kernel), however short the conversation is.  Here one kernel holds both bodies and a
+// query whose blocks fit the registers (n_bid + 1 <= 1024 * PER) runs the register kernel's, a longer one the wide
+// kernel's: the same ids as either (and as the reference).  2x Radeon PRO V620 (gfx1030), 2 queries under a capacity
+// of 524,288 cells, ms per call (qsa_topk_parity CTX 2 300 524288 0), reference / wide / this: 16K 0.057 / 0.049 /
+// 0.014, 64K 0.100 / 0.062 / 0.043, 128K 0.222 / 0.087 / 0.066; from 136K on it is the wide kernel (262K 0.124).
+template <int PER>
+__global__ void __launch_bounds__(TK_T) block_topk_auto_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int64_t cap, int32_t* __restrict__ ids) {
+    __shared__ int hist[TK_T / 32][256];
+    __shared__ int s_warp[33];
+    __shared__ int s_gt[TK_T / 32], s_eq[TK_T / 32];
+    __shared__ int s_digit, s_above;
+    const int64_t n_bid = steps[(int64_t) blockIdx.x * kStepCount + kStepNBid];   // CTA-uniform: one branch per block
+    if (n_bid + 1 <= (int64_t) TK_T * PER)
+        block_topk_reg_body<PER>(scores, steps, max_blocks, cap, ids, hist, s_warp, s_digit, s_above);
+    else
+        block_topk_wide_body(scores, steps, max_blocks, cap, ids, hist, s_gt, s_eq, s_digit, s_above);
+}
+#endif
 
 
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
@@ -1401,7 +1440,10 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     // PR #1749: with STRATA_TOPK_STREAM=1 `reach > fit` no longer forces the ref radix - the wide kernel below takes
     // it (same ids).  Opt-in on HIP in this tree (measured on gfx1151 only); without it the dispatch is as before.
     static const bool hip_wide = [] { const char* v = std::getenv("STRATA_TOPK_STREAM"); return v != nullptr && v[0] == '1'; }();
-    if (old || too_small || (reach > fit && !hip_wide)) {
+    // STRATA_TOPK_AUTO=1 (opt-in): a call without a block count - the decode window's - takes block_topk_auto_kernel
+    static const bool hip_auto = [] { const char* v = std::getenv("STRATA_TOPK_AUTO"); return v != nullptr && v[0] == '1'; }();
+    const bool use_auto = hip_auto && !counted && !old;
+    if (!use_auto && (old || too_small || (reach > fit && !hip_wide))) {
 #else
     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
     const bool too_small = reach > fit && active_blocks > 0 && active_blocks < kWideMinBlocks;
@@ -1426,6 +1468,11 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* v = std::getenv("STRATA_TOPK_STREAM");
         return v == nullptr || v[0] != '0';
     }();
+#endif
+#if defined(__HIPCC__)
+    if (use_auto)
+        block_topk_auto_kernel<TK_PER><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+    else
 #endif
     if (reach > fit || (turing_wide && counted && reach > 22528))   // past the register kernel's reach, or Turing's band
         block_topk_wide_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
