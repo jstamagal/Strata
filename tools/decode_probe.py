@@ -15,6 +15,9 @@ import hashlib, json, re, sys, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 argv = [a for a in sys.argv[1:] if a != "--out"]
+WARM = "--warm" in sys.argv  # one untimed 400-token answer first: the first long answer after a load runs fast or slow by up to 15%
+if WARM:
+    argv.remove("--warm")
 OUT = Path(sys.argv[sys.argv.index("--out") + 1]) if "--out" in sys.argv else ROOT / "bench" / "probe"
 if "--out" in sys.argv:
     argv.remove(str(OUT))
@@ -38,6 +41,8 @@ try:
         err = "server did not come up"
     else:
         sb.chat(base, "", [{"role": "user", "content": "Say hi."}], 16)
+        if WARM:
+            sb.chat(base, "", [{"role": "user", "content": "Explain how a hash table works, with one example."}], tokens)
         for label, temp, samp in (("T0", 0.0, {}), ("T1", 1.0, {"top_p": 0.95, "top_k": 20, "seed": 7})):
             sb.TEMPERATURE, sb.SAMPLING = temp, dict(samp)
             for qi, q in enumerate(PROMPTS):
