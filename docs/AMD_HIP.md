@@ -638,6 +638,44 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   0.3%. `STRATA_MMVF_ROWS=1` 132.6 / 80.4 / 78.1 and `STRATA_ATTN_LANECELL=1` 132.7 / 80.6 / 78.2: the same text,
   slower. `STRATA_Q8_PACKED=1 STRATA_Q6_PACKED=1`: 122.9 / 70.7 / 76.8, slower, and the answers differ from the
   default's on this card (they did not on gfx1151).
+- **Decode: the output head, the routing and the sampler as fewer, wider launches (`STRATA_HEAD_WIDE=1`,
+  `STRATA_ROUTE_PLAN=1` or `2`, `STRATA_HEAD_SAMPLE=1`; opt-in, measured on gfx1030 only).** Measured in a captured
+  graph on a Radeon PRO V620, a kernel costs about 4 us before it does anything (`router_chain_bench`: an empty kernel
+  2.6 us, a one-row BF16 projection 3.9 us), and a verify window is about 750 of them per card.
+  - `STRATA_HEAD_WIDE=1`: the head is a Q6_K matrix of 248,320 x 2,560 (497 MiB). The default launch reads it at
+    538 GB/s for one column (0.97 ms), but takes 1.17 / 1.38 / 1.63 ms for 3 / 4 / 5 columns, then 0.04-0.05 ms for the
+    greedy pick and 0.01 ms for the non-finite check. The switch runs persistent workgroups whose threads keep their
+    activation words in registers, ask for the next row's weights while the current row is computed, and keep each
+    workgroup's first logit in the pick's order; one small launch merges those. Logits, picks and flags are bitwise
+    the default's (`hip_head_parity`: 608 cases of 1-8 columns with tied maxima and non-finite scales, 0 mismatches,
+    with and without `STRATA_TSUM=1`). Head + pick + check, 1 / 2 / 3 / 4 / 5 columns, in microseconds
+    (`hip_head_lab`, synthetic weights of the real shape, the card idle, medians of 9 batches of 20):
+    1034 / 1090 / 1220 / 1432 / 1702 -> 1011 / 1016 / 1022 / 1032 / 1107.
+  - `STRATA_ROUTE_PLAN=1`: the routing top-10 and the all-resident plan in one launch instead of two (only in the
+    zero-doorbell graph, without `STRATA_ROUTE_PRIOR` / `STRATA_ROUTE_RESIDENT`). `=2` also runs the router's BF16
+    projection in that launch: 512 workgroups compute a row each and a 513th waits for them, with the stores fenced
+    and counted by an atomic add and the logits read back with device-scope atomic loads (what rocPRIM's look-back
+    scan does). Ids, weights and the plan's bytes are the separate kernels' (`hip_route_plan_parity`: 600 cases, and
+    for `=2` 150,000 launches on changing activations and weights in one reused buffer, 0 mismatches). The router
+    chain of one layer in a 48-layer graph, 1 / 3 / 5 tokens, in microseconds: 15.3 / 16.5 / 18.5 -> 13.3 / 14.6 /
+    16.6 (`=1`) -> 11.5 / 12.6 / 16.4 (`=2`).
+  - `STRATA_HEAD_SAMPLE=1`: a sampled request's draws as nodes of the window's graph. The graph is captured once, so
+    the sampler ran after it as two launches of its own and a second sync; here its parameters (the chain, the seed,
+    the window's first position) are staged in mapped memory with the window's inputs and read at run time. Requests
+    with penalties or a logit bias, and `STRATA_SPEC_PROB`'s judged windows, sample after the graph as before. The
+    token is `sample_tokens`' for the same parameters (`hip_head_parity`: 400 parameter sets, 0 mismatches).
+  - Decode on 2x V620 (IQ3_S, layer split 24, `--spec 3 --spec-min-p 0.7`, the draft layer, `--pipeline-windows 2`,
+    every expert in VRAM, with `STRATA_HC_WIDE=3 STRATA_GR_NORM_FAST=1 STRATA_TSUM=1 STRATA_DQ8=1
+    STRATA_HC_GATED16=1` and the prompt switches above on in both arms; three fixed questions of 400 new tokens,
+    greedy and sampled with temperature 1.0, top-p 0.95, top-k 20, seed 7, `STRATA_SPEC_GUMBEL=1`; one run each, the
+    off arm run twice, pooled tok/s): greedy 116.2 -> 117.3-117.4, sampled 107.2 -> 108.4 with all three (`ROUTE_PLAN=2`,
+    two runs), 117.1 / 108.2 with `ROUTE_PLAN=1`; the texts identical in every arm. Alone: `STRATA_HEAD_WIDE=1` (its
+    `STRATA_HEAD_WIDE_V=2` kernel) 116.4 / 107.4, `STRATA_ROUTE_PLAN=1` 116.7 / 107.7. An answer that copies its
+    prompt (windows of 5 tokens): 175.8 -> 180.8-181.1 (three runs; 177.5 in a fourth with the earlier
+    `STRATA_HEAD_WIDE_V=2` kernel; its drafts depend on timing, so it varies more).
+    Not measured: other models, one card, windows wider than 5 tokens, a card where some experts are not in VRAM (the
+    routing switches then do nothing), CUDA (`STRATA_HEAD_WIDE` and `STRATA_ROUTE_PLAN=2` are HIP kernels; the other
+    two compile there but were not built).
 - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
   on one card. More reports: an RX 6700 XT 12 GB run as gfx1030 on ROCm 7.2.4 (#1027: IQ2_XS, decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6
   needles), and an RX 6800M 12 GB on Windows with a self-built engine (#915, #1078: Q2_0, decode 9-27 tok/s, prompt 50-114 tok/s; the
