@@ -502,6 +502,29 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   1,861 and 1,727 -> 1,858 tok/s (+7.4%), 32K +0.8%; decode is not affected (the text changes with the scores' order,
   so its speed is not compared). Measurements:
   [bench/results/2026-10-07-rdna2-qsa-select-simt](../bench/results/2026-10-07-rdna2-qsa-select-simt/README.md).
+- **Decode: the hyper-connection read on the whole card (`STRATA_HC_WIDE=3`, opt-in).** A verify window reads the
+  hyper-connection weights twice per layer (four BF16 matrices of 6.5 MB); on a two-card split of 2x Radeon PRO V620
+  that was about a quarter of a window's GPU time (`STRATA_VERIFY_PROFILE=1`: 4.3 of 16.7 ms per window on the first
+  card, IQ3_S, windows of about 4 tokens). The default down projection is 41 blocks of one warp per row (328 wavefronts), and the up projection does
+  each row's pending write and gate on single lanes. Bit 1 runs the down projection as one block per row (2,592
+  wavefronts, the row's eight tiles side by side, their 40 chunk dots per lane added in the default order); bit 2 moves
+  the up projection's per-element epilogue onto threads that work on 32 neighbouring columns. Every output is bitwise
+  the default read's (`fused_gr_bench 300 1 8 24 3`: 32 of 32 cases of 1-8 tokens equal, the q8_1 image included).
+  One read with another layer's weights every call, in microseconds: 88.2 -> 62.8 at 4 tokens, 65.0 -> 50.2 at 2,
+  111.7 -> 82.0 at 6. Decode on 2x V620 (layer split 24, `--spec 5`, the draft layer, `--pipeline-windows 2`, every
+  expert in VRAM, greedy, three fixed questions, one run each, with `STRATA_GR_NORM_FAST=1`, the split norm kernel of
+  gfx12): IQ3_S 133.5 / 81.0 / 78.7 -> 140.7 / 85.2 / 82.6 tok/s (the answers identical, 400 / 260 / 202 tokens);
+  `STRATA_GR_NORM_FAST=1` alone 134.2 / 81.6 / 79.2. Unsloth UD-Q4_K_XL (71% of the experts in VRAM, `--adapt-every 0
+  STRATA_IQ_MT_MIN=1` so two runs give the same text): 98.2 / 50.2 / 65.0 -> 101.0 / 51.8 / 67.4, the answers
+  identical, also after 3.2K- and 12.7K-token prompts. Prompt speed is unchanged (the prompt path does not use these
+  kernels). Measured on gfx1030 only; other cards keep the default until someone measures them.
+- **Decode: the gfx1151 table's decode switches on gfx1030** (the same 2x V620, IQ3_S, the same three questions, one
+  run each, against 133.5 / 81.0 / 78.7 tok/s; none is on by default here): `STRATA_TSUM=1` 135.3 / 82.2 / 79.7, the
+  answers identical, and 142.9 / 86.6 / 83.8 together with `STRATA_HC_WIDE=3 STRATA_GR_NORM_FAST=1`.
+  `STRATA_EXPERT_V2=1`, `STRATA_LFUSE=1`, `STRATA_GDN_SPLIT=1` and `STRATA_PLE_BATCH=1`: the same text, speed within
+  0.3%. `STRATA_MMVF_ROWS=1` 132.6 / 80.4 / 78.1 and `STRATA_ATTN_LANECELL=1` 132.7 / 80.6 / 78.2: the same text,
+  slower. `STRATA_Q8_PACKED=1 STRATA_Q6_PACKED=1`: 122.9 / 70.7 / 76.8, slower, and the answers differ from the
+  default's on this card (they did not on gfx1151).
 - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
   on one card. More reports: an RX 6700 XT 12 GB run as gfx1030 on ROCm 7.2.4 (#1027: IQ2_XS, decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6
   needles), and an RX 6800M 12 GB on Windows with a self-built engine (#915, #1078: Q2_0, decode 9-27 tok/s, prompt 50-114 tok/s; the
