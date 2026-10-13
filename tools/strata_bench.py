@@ -125,10 +125,15 @@ def try_json(base, path, key="", timeout=20):
         return None
 
 
+TEMPERATURE = 0   # --temperature: every request of the suite (0: greedy, the default)
+SAMPLING = {}     # --top-p / --top-k: sent with every request when given
+
+
 def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = False, tools=None, timeout: float = 3600) -> dict:
     """One streamed chat request -> {first, total, text, usage, timings, err}.  `first` is the seconds to the first
     non-empty content or reasoning piece (keep-alives and empty deltas ignored)."""
-    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages}
+    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": TEMPERATURE, "messages": messages}
+    body.update(SAMPLING)
     if tools:
         body["tools"] = tools
     if not think:
@@ -814,7 +819,7 @@ def render_readme(res: dict) -> str:
          f"- Model and quantization: {model}",
          f"- Context: {mc.get('context') or 'not read'} tokens; parallel slots: {mc.get('parallel_slots') or 1}",
          f"- Settings: the install's own configuration, unchanged{' (' + mc['config']['backend'] + ' backend)' if mc.get('config', {}).get('backend') else ''}; thinking "
-         f"{'on' if p['think'] else 'off'} for the suite; temperature 0", ""]
+         f"{'on' if p['think'] else 'off'} for the suite; temperature {p.get('temperature', 0)}", ""]
     if mc.get("launch"):
         L += ["```text", mc["launch"], "```", ""]
     env = (mc.get("config") or {}).get("env")
@@ -907,6 +912,7 @@ def write_results(res: dict, parent: Path, red, log_lines: list[str]) -> Path:
 
 # --------------------------------------------------------------------------------------------------------- main
 def main(argv=None) -> int:
+    global TEMPERATURE, CHAT_MAX_TOKENS
     ap = argparse.ArgumentParser(description="Measure this Strata install and write a shareable report (see the top of this file).")
     ap.add_argument("--config", help="the model config to run (default: the newest strata-*.json of this folder)")
     ap.add_argument("--url", help="use the server already running at this address (http://127.0.0.1:8080) instead of starting one")
@@ -916,6 +922,10 @@ def main(argv=None) -> int:
     ap.add_argument("--runs", type=int, default=3, help="runs per test (default 3)")
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
+    ap.add_argument("--temperature", type=float, default=0, help="the sampling temperature of every request (default 0: greedy; draft sampling switches only act above 0)")
+    ap.add_argument("--top-p", type=float, help="top_p of every request (default: not sent)")
+    ap.add_argument("--top-k", type=int, help="top_k of every request (default: not sent)")
+    ap.add_argument("--chat-tokens", type=int, default=CHAT_MAX_TOKENS, help="new tokens per chat question (default 100, which is too few to time decode steadily; 400 or more gives a steadier number)")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
@@ -923,6 +933,10 @@ def main(argv=None) -> int:
     ap.add_argument("--ready-timeout", type=float, default=1800, help="seconds to wait for the model to load")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    TEMPERATURE = a.temperature if a.temperature else 0
+    CHAT_MAX_TOKENS = a.chat_tokens
+    if a.top_p is not None: SAMPLING["top_p"] = a.top_p
+    if a.top_k is not None: SAMPLING["top_k"] = a.top_k
     say = (lambda *x, **k: None) if a.quiet else (lambda *x, **k: print(*x, **k, flush=True))
 
     if a.compare_only:
@@ -993,7 +1007,7 @@ def main(argv=None) -> int:
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "started_server": started,
+               "params": {"runs": suite.runs, "think": a.think, "temperature": TEMPERATURE, "sampling": dict(SAMPLING), "chat_tokens": CHAT_MAX_TOKENS, "clients": a.clients, "long": a.long, "started_server": started,
                           "command": "python tools/strata_bench.py" + "".join(
                               f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
                                                 "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
