@@ -7,7 +7,9 @@
 //   1. the attention outputs are BITWISE equal (the streamed readers see exactly the resident values);
 //   2. the residency map is consistent after every call (slot_block and page_table invert each other);
 //   3. no call overflowed, and the hit/miss counters add up;
-//   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool.
+//   4. a ring (the MTP drafter's layout) restored from the host copy reads the same values as the resident pool;
+//   5. kv_stream_resolve_range (the prompt path's STRATA_KV_PF_RESIDENT=1) leaves a whole run of blocks resident, and
+//      the attention reads the resident pool's values from it with no resolve of its own.
 // INT8, FP16, Q4_0 (PR #21) and hybrid K8V4 pools; K8V4's appends are the engine's folded calls (layer.cpp), its host
 // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
 #include "strata/kernels/kv_q4.hpp"
@@ -154,7 +156,7 @@ bool run(int fmt) {
     std::vector<float> hk(H * D), hv(H * D), hq(NQ * NH * D), a((size_t) NQ * NH * D), b2((size_t) NQ * NH * D);
     std::vector<int32_t> pt(n_blocks), sb(n_slots);
 
-    int batches = 0, bad = 0;
+    int batches = 0, bad = 0, range_calls = 0, range_checked = 0;
     for (int64_t pos = 0; pos < N; ++pos) {
         for (auto& x : hk) x = nd(rng) * ((pos % 17 == 0) ? 30.f : 1.f);
         for (auto& x : hv) x = nd(rng);
@@ -181,6 +183,41 @@ bool run(int fmt) {
         ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
         ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
         ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
+        // 5. every third batch first makes a run of blocks resident (kv_stream_resolve_range, the prompt path's
+        //    STRATA_KV_PF_RESIDENT): the whole run is in the table afterwards, and one query whose selection is `cap`
+        //    consecutive cells of the run reads the resident pool's values from it WITHOUT a resolve of its own
+        if (batches % 3 == 2) {
+            const int64_t nbk = (pos + 4) / 4;
+            const int64_t len = std::min<int64_t>(nbk, 1 + (int64_t) (rng() % (uint64_t) n_slots));
+            const int64_t rb0 = (int64_t) (rng() % (uint64_t) (nbk - len + 1)), rb1 = rb0 + len;
+            k::kv_stream_resolve_range(m, slots.attn(m.page_table), host.p, fmt, rb0, rb1, s, nullptr);
+            ++range_calls;
+            ck(cudaDeviceSynchronize(), "range");
+            ck(cudaMemcpy(pt.data(), m.page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "pt");
+            for (int64_t bk = rb0; bk < rb1; ++bk)
+                if (pt[bk] < 0) { if (bad++ < 5) std::fprintf(stderr, "  %s: block %lld of the range [%lld, %lld) is not resident\n", name, (long long) bk, (long long) rb0, (long long) rb1); break; }
+            const int64_t c0 = rb0 * 4, c1 = std::min<int64_t>(rb1 * 4, pos + 1), rw = std::min<int64_t>(c1 - c0, cap);
+            if (rw > 0) {
+                std::vector<int32_t> rids((size_t) cap, 0);
+                for (int64_t i = 0; i < rw; ++i) rids[(size_t) i] = (int32_t) (c1 - rw + i);
+                const int32_t rst[4] = {(int32_t) pos, (int32_t) (pos + 1), (int32_t) ((pos + 1) / 4), (int32_t) rw};
+                ck(cudaMemcpy(ids, rids.data(), rids.size() * 4, cudaMemcpyHostToDevice), "rids");
+                ck(cudaMemcpy(steps, rst, sizeof(rst), cudaMemcpyHostToDevice), "rsteps");
+                ck(cudaMemcpy(q, hq.data(), (size_t) NH * D * 4, cudaMemcpyHostToDevice), "rq");
+                k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, 1, nullptr);
+                k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, 1, nullptr);
+                ck(cudaDeviceSynchronize(), "range attention");
+                ck(cudaMemcpy(a.data(), out_ref, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "ra");
+                ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "rb");
+                if (std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) != 0) {
+                    if (bad++ < 5) std::fprintf(stderr, "  %s pos %lld: the attention over the range [%lld, %lld) differs\n", name, (long long) pos, (long long) rb0, (long long) rb1);
+                }
+                ++range_checked;
+            }
+            ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
+            ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "steps");
+            ck(cudaMemcpy(q, hq.data(), hq.size() * 4, cudaMemcpyHostToDevice), "q");
+        }
         k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, n_q, nullptr);
         k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids, steps, n_q, cap, s, nullptr);
         k::qsa_decode_attn_batch(q, slots.attn(m.page_table), ids, steps, cap, s, scratch, out_str, n_q, nullptr);
@@ -209,7 +246,9 @@ bool run(int fmt) {
     std::printf("  %s: %d batches, %llu block lookups, %llu misses (%.1f%% hit), overflow %d, %d failures\n",
                 name, batches, (unsigned long long) c.lookups, (unsigned long long) c.misses,
                 c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow, bad);
-    if (c.overflow || c.calls != (uint64_t) batches || c.misses == 0 || c.misses >= c.lookups) ++bad;
+    std::printf("  %s: %d range resolves, %d of them read back through the attention\n", name, range_calls, range_checked);
+    if (c.overflow || c.calls != (uint64_t) (batches + range_calls) || c.misses == 0 || c.misses >= c.lookups) ++bad;
+    if (range_checked == 0) ++bad;
 
     // 4. a ring over the same host copy: blocks [b1 - R, b1) restored, read through `b % R`
     {

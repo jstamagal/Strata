@@ -89,6 +89,13 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
 
+/// Opt-in (the prompt path's STRATA_KV_PF_RESIDENT=1): make every block of [b0, b1) resident - the same claim, clock
+/// sweep and copy from the host copy as `kv_stream_resolve`, for a run of blocks instead of a selection's.  A block
+/// already resident only takes the call's epoch (it cannot be a victim of this call).  `b1 - b0 <= n_slots`.
+/// Capturable.  Hits are not counted as lookups; a miss counts as one lookup and one miss.
+void kv_stream_resolve_range(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                             int64_t b0, int64_t b1, const QsaShapes& s, void* stream);
+
 /// The static ring table `block -> block % n_slots`.
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);
 
