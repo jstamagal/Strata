@@ -10985,7 +10985,8 @@ int main(int argc, char** argv) {
             // verdict that held, the guess behind a lookup-made window is the lookup's continuation past that window
             // (up to --spec + 2 tokens), made at the verdict without waiting for the chain; where the lookup has no
             // continuation the chain's guess is used and its disagreement with a lookup window no longer vetoes it.
-            // N >= 2: also behind a window of the drafter's when the lookup's match is at least N tokens long.
+            // N >= 2: also behind a window of the drafter's when the lookup's match is at least N tokens long and the
+            // draft policy's rates favour the lookup window.
             static const int pl_streak = [] { const char* v = std::getenv("STRATA_PL_LOOKUP_STREAK"); return v ? std::max(0, std::atoi(v)) : 0; }();
             int pl_force_miss = [] {   // exactness test: every k-th speculative window gets a wrong first token
                 const char* v = pipe_dbg_env("STRATA_PIPELINE_FORCE_MISS");
@@ -12336,10 +12337,17 @@ int main(int argc, char** argv) {
                         for (int i = 1; i < B.T && n_ex < 16; ++i) ex[n_ex++] = B.tok[i];
                         const int k = sfx.propose_after(ex, n_ex, std::min(S, 8), pl_sbuf.data());
                         const int match = sfx.last_match();
-                        if (k >= 1 && (B.lk || (k >= 2 && match >= pl_streak))) {
-                            sk_n = k;
+                        if (k >= 1 && B.lk) {
+                            sk_n = k;   // the stretch goes on: B, a lookup window, is about to be accepted whole
+                        } else if (k >= 2 && match >= pl_streak) {
+                            // behind a window of the drafter's: where the policy's rates say a lookup window beats the
+                            // drafter's (as a fresh window's lookup is chosen; the drafter's guess is not known yet)
+                            const strata::spec::DraftPolicy::Pick pk = policy.choose(S_mtp, std::min(k - 1, S - 1), match);
+                            if (pk.lookup) sk_n = std::min(pk.t, k);
+                        }
+                        if (sk_n > 0) {
                             sk_match = match;
-                            for (int i = 0; i < k; ++i) sk_tok[i] = pl_sbuf[(size_t) i];
+                            for (int i = 0; i < sk_n; ++i) sk_tok[i] = pl_sbuf[(size_t) i];
                         }
                     }
                     static const bool pl_streak_full_chain = pipe_dbg_env("STRATA_PIPELINE_STREAK_FULL_CHAIN") != nullptr;

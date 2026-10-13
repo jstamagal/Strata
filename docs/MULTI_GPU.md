@@ -384,6 +384,38 @@ off beside `--pipeline-windows 2` only when `STRATA_PIPELINE_ADAPT_ASYNC=0` is s
 printed once at start ("is off: ..."). `--remote-expert-opt` does something only with a helper cache
 (`--expert-cache-device1..3`); on a plain layer split it is inert, and setup no longer writes it there (#1447).
 
+**Copied text stays on lookup windows (`STRATA_PL_LOOKUP_STREAK=N`, opt-in).** In the pipelined loop a lookup window
+(`--suffix-draft`) starts only at a window built after a verdict, with one lookup guess behind it; the guesses after
+that come from the draft layer again (windows of `--spec`, named about 4 ms after the verdict), and a draft layer
+that disagrees with the lookup's tokens stops the guessing although the lookup window was accepted whole. With `N`
+of 1 or more, when a guess holds and the window now on the last card is a lookup window, the next guess is the
+lookup's continuation past it (up to `--spec` + 2 tokens, or up to `--spec` with `--mtp-max-t` set), made at the
+verdict; the draft layer then only catches up on the verified window. `N` of 2 or more also starts a lookup guess
+behind a draft-layer window when the lookup's match is at least `N` tokens long and the draft policy's rates favour
+it. The windows only choose which drafts are verified: the text is the same. Measured on 2x Radeon PRO V620
+(gfx1030, layer split 24/24, IQ3_S, `--pipeline-windows 2 --spec-min-p 0.7`, one probe of three chat questions and
+one copy-heavy edit, 400 tokens each, same text hashes in every row):
+
+| setting | chat, greedy (tok/s) | chat, sampled (tok/s) | copy-heavy edit (tok/s) |
+|---|---|---|---|
+| `--spec 3` | 116.2 | 107.1 | 175.7 |
+| `--spec 3`, `STRATA_PL_LOOKUP_STREAK=1` | 116.4 | 107.1 | 267.0 |
+| `--spec 8 --mtp-max-t 3` (lookup windows up to 8 tokens) | 116.2 | 107.0 | 205.7 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=1` | 116.1 | 107.1 | 289.2 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=12` | 116.4 | 107.0 | 302.8 |
+| `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=4` | 114.4 | 107.0 | 298.5 |
+
+In the copied stretch of that edit every window is then a lookup window of 8 tokens verified 23 ms after the one
+before (both cards 91-92% busy). Not measured: other cards, three or more stages, NVIDIA.
+
+`STRATA_PL_FRESH_T` / `STRATA_PL_FRESH_MIN_P` and `STRATA_PL_GUESS_T` / `STRATA_PL_GUESS_MIN_P` (opt-in) give the
+window built after a verdict and the guessed window their own size cap and draft threshold (unset: `--spec` and
+`--spec-min-p` for both). On the same box and probe none beat `--spec 3 --spec-min-p 0.7` for both: guesses capped at
+2 tokens 112.5 / 106.3 tok/s (greedy / sampled chat), fresh windows up to 5 with `--spec 5` 111.4 / 103.8, a fresh
+threshold of 0.5 115.4 greedy, a guess threshold of 0.85 115.7 / 107.3. `STRATA_SPEC_DEPTH=1` prints the pipelined
+loop's drafts accepted by their index in the window, for both kinds, and how often the guess of a window's bonus
+token was right.
+
 Measured on 2x RTX 3090 (sm_86, 250 W limits; GPU0 PCIe 4.0 x16, GPU1 x4, no NVLink; Ryzen 7 9800X3D, 32 GB RAM),
 Qwen3.8-Flash-Next GSQ-RCO IQ3_S, `--resident-experts`, KV int8, `--spec 4 --mtp`, `"layer_split": "29"` for the
 `--pipeline-windows` rows (without `--remote-expert-opt`); the others are setup's config (`auto`). Decode is the mean of
