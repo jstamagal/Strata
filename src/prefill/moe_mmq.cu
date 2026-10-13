@@ -197,6 +197,29 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     ck(cudaGetLastError(), "quantize");
 }
 
+void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols, int64_t ld,
+                      int64_t tokens, int k_used, void* stream) {
+    if (tokens <= 0 || k_used <= 0) return;
+    // Opt-in in this tree (upstream: on, STRATA_QUANT_GATHER=1 restores the gather): STRATA_QUANT_GATHER=0 turns the
+    // scatter on; unset, quantize() over `src` as before.
+    static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e == nullptr || std::atoi(e) != 0; }();
+    if (gather) {
+        quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
+        return;
+    }
+#if defined(__HIPCC__)
+    // Q4_0 / Q4_1 on HIP: quantize() writes the RDNA2 int8 kernel's own chunks (q4::quantize), not llama.cpp's
+    // q8_1 rows, and there is no scatter for those.  The gather, or that kernel would read the wrong layout.
+    if (q4::covers(t)) {
+        quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
+        return;
+    }
+#endif
+    quantize_scatter_mmq_q8_1_cuda(x, slot, xq, (ggml_type) t, cols, ld, pad512(cols), tokens, tokens * k_used, k_used,
+                                   (cudaStream_t) stream);
+    ck(cudaGetLastError(), "quantize_scatter");
+}
+
 Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
