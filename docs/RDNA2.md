@@ -59,6 +59,7 @@ fewer models and context lengths. These are the ones to test more; say what you 
 | `STRATA_PA_DOT4=1` | A prompt attention kernel for int8 K/V on `v_dot4_i32_i8` | FP32-level error (2.8e-6 against an FP64 reference, the old kernel 2.1e-6), not bitwise. Needle recall checked to 128K. Prompts +4% |
 | `STRATA_EXPERT_DOWN_L=1` | The 4-row down kernel behind any gate/up format | Bitwise on synthetic weights; one end-to-end run |
 | `STRATA_KV_PREFETCH=1`, `STRATA_SPLIT_MTP_BATCH=1`, `STRATA_KV_PF_RESIDENT=1` | K/V staged ahead and read from VRAM slots on the prompt path; the draft layer's pass batched | Measured on IQ3_S with int8 K/V only. Prompts +7% to +9% from 16K to 128K |
+| `STRATA_MMVQ_ROW=1`, `STRATA_MMVQ_SET=1`, `STRATA_NORM_ROPE=2` | Decode dense projections one wavefront per row, a layer's projections of one input in one launch, RMSNorm + RoPE in one launch | One A/B run, IQ3_S: decode 119.2 -> 122.1 greedy, 108.7 -> 111.2 sampled, copy-heavy 322 -> 336 tok/s, the same text |
 | `STRATA_TOPK_STREAM=1`, `STRATA_TOPK_AUTO=1` | Wider top-k kernels for deep contexts | Same ids in the parity test; end-to-end gain only at depth |
 
 ## Settings that are not defaults

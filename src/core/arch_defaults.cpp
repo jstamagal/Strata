@@ -80,6 +80,9 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
             {"STRATA_TOPK_STREAM", "1"},           // the wide top-k kernel on HIP: same ids in the parity test
             {"STRATA_TOPK_AUTO", "1"},             // decode top-k picks its kernel by the real depth: same ids in the parity test
             {"STRATA_KV_PF_RESIDENT", "1"},        // the prompt path reads streamed K/V from the VRAM slots: bit-exact on six requests
+            {"STRATA_MMVQ_ROW", "1"},              // decode dense projections one wavefront per row: same text, one A/B run
+            {"STRATA_MMVQ_SET", "1"},              // a layer's projections of one input in one launch
+            {"STRATA_NORM_ROPE", "2"},             // RMSNorm + RoPE in one launch
         };
         for (const auto& kv : exp) t.emplace_back(kv.first, kv.second);
         return t;
@@ -133,7 +136,7 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch) {
             std::fprintf(stderr, "strata: gfx103x (RDNA2): %zu speed switches on by default, proven and experimental "
                                  "(STRATA_GFX103X_DEFAULTS=0 turns all off, STRATA_GFX103X_EXPERIMENTAL=0 the experimental "
                                  "ones: PROMPT_F16 PA_DOT4 EXPERT_DOWN_L KV_PREFETCH SPLIT_MTP_BATCH TOPK_STREAM TOPK_AUTO "
-                                 "KV_PF_RESIDENT; a switch you set is kept): ", set.size());
+                                 "KV_PF_RESIDENT MMVQ_ROW MMVQ_SET NORM_ROPE; a switch you set is kept): ", set.size());
         else
         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
                              "them off; a switch you set is kept): ",
