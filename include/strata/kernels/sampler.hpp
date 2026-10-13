@@ -44,6 +44,19 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// ---- THE WINDOW'S SAMPLING AS NODES OF ITS GRAPH (STRATA_HEAD_SAMPLE=1).  sample_tokens for a verify window, with
+// the request's parameters read at RUN time from `mapped_params` (one SamplerParams in mapped host memory, staged
+// with the window's inputs: the chain, the seed, `counter` = the window's first position): capturable, nothing baked.
+// When the staged `greedy` is true or the temperature is not positive both launches return at once and `out` keeps
+// what the greedy pick before them wrote.  No penalties and no logit bias: the caller stages `greedy` for a request
+// that has them and samples it with sample_tokens.  Otherwise out[t] is sample_tokens' token for the same parameters.
+// The scratch for `n_tokens` rows (device memory); 0 where the staged path cannot run (a vocabulary wider than the
+// split merge holds, STRATA_OLD_SAMPLER / STRATA_SAMPLER_ONE_BLOCK).
+size_t sample_tokens_staged_scratch_bytes(int n_tokens, int n_vocab);
+// False (nothing launched) where it cannot run.
+bool sample_tokens_staged(const float* logits, int n_tokens, int n_vocab, const SamplerParams* mapped_params,
+                          void* scratch, int* out, void* stream);
+
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
 // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it
 // cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.

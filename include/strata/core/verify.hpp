@@ -552,6 +552,17 @@ private:
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
+    // STRATA_HEAD_WIDE=1 (kernels/head_wide.hpp): the head, the greedy pick and the non-finite flag in two launches
+    void* head_wide_scratch_ = nullptr;        ///< the workgroups' picks (its own allocation; null: off)
+    uint32_t* route_done_ = nullptr;           ///< STRATA_ROUTE_PLAN=2: the fused router launch's row counter (device)
+    // STRATA_HEAD_SAMPLE=1 (sample_tokens_staged): a sampled request's draws as nodes of the window's graph
+    void* sp_scratch_ = nullptr;               ///< the split sampler's block lists (its own allocation; null: off)
+    int32_t* sp_dev_ = nullptr;                ///< the device copy of the staged SamplerParams
+    int32_t* h_sp_ = nullptr; int32_t* m_sp_ = nullptr;   ///< one SamplerParams, staged with the window's inputs
+    bool sp_in_graph_ = false;                 ///< the window staged last samples in its graph (no host-side sampling)
+public:
+    long long sp_graph_windows = 0;            ///< windows staged for the graph's sampler (STRATA_HEAD_SAMPLE)
+private:
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

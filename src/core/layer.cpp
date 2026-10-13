@@ -174,6 +174,7 @@ if (w.has_offset || p.offset != nullptr) {            err = name + ": an S2 form
 if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);        return true;    }    s_gemv_q8k_split(xq8k, p.codes, p.scales, p.offset, y, n_in, n_out, f, stream);    return true;}}
 // namespace
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
+bool layer_native_bf16() { return native_bf16_projections; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
 namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false; }
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }

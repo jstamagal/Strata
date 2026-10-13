@@ -358,6 +358,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
+                          src/kernels/cuda/head_wide.cu
+                          src/kernels/cuda/route_plan.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -656,6 +658,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_hc_read_parity COMMAND hip_hc_read_parity)
     set_tests_properties(hip_hc_read_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     list(APPEND _strata_hip_tests hip_hc_read_parity)
+    # the output head in isolation: the Q6_K vocabulary projection, the pick and the sampled chain, timed per window size;
+    # hip_head_parity checks STRATA_HEAD_* kernels bit for bit against native_mmvq and the sampler
+    add_executable(hip_head_lab tests/hip/head_lab.cpp)
+    target_link_libraries(hip_head_lab PRIVATE strata_kernels strata_hip_runtime)
+    add_executable(hip_head_parity tests/hip/head_parity.cpp)
+    target_link_libraries(hip_head_parity PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME hip_head_parity COMMAND hip_head_parity)
+    add_test(NAME hip_head_parity_tsum COMMAND hip_head_parity)
+    set_tests_properties(hip_head_parity_tsum PROPERTIES ENVIRONMENT "STRATA_TSUM=1")
+    set_tests_properties(hip_head_parity hip_head_parity_tsum PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    list(APPEND _strata_hip_tests hip_head_parity)
+    # STRATA_ROUTE_PLAN: the routing top-10 and the all-resident plan in one launch against the two kernels, bit for
+    # bit (ids, weights, the plan's bytes); --bench times 48 layers of the router chain in a captured graph
+    add_executable(hip_route_plan_parity tests/hip/route_plan_parity.cpp)
+    target_link_libraries(hip_route_plan_parity PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME hip_route_plan_parity COMMAND hip_route_plan_parity)
+    list(APPEND _strata_hip_tests hip_route_plan_parity)
     add_executable(hip_q2_zero tests/hip/q2_zero.cpp)
     target_link_libraries(hip_q2_zero PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_q2_zero COMMAND hip_q2_zero)

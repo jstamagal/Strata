@@ -795,6 +795,97 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
+// ---- THE WINDOW'S SAMPLING INSIDE ITS GRAPH (STRATA_HEAD_SAMPLE=1, sample_tokens_staged).  The verify window's
+// graph is captured once and replayed for every request, so the sampler the engine runs after it takes the request's
+// parameters by value in two launches of its own and a second sync.  Here the two launches are nodes of the graph and
+// read the parameters from MAPPED HOST MEMORY the engine stages with the window's inputs (the request's chain, the
+// seed, the window's first position as the counter): nothing is baked.  A greedy request - `greedy`, or a
+// temperature that is not positive - returns at once from both and leaves `out` to the greedy pick before them.
+// No penalties and no logit bias (the engine stages `greedy` for those requests and samples them as before).  The
+// kernels are copies of `sampler_split_part_kernel` / `sampler_split_merge_kernel` with that one change, so the
+// sampler's own kernels keep their code; the lists, the merge and the tail are the same, and so is the token.
+__device__ __forceinline__ SamplerParams staged_params(const SamplerParams* mp) {
+    SamplerParams p;
+    const volatile int* s = (const volatile int*) mp;
+    int* d = (int*) &p;
+#pragma unroll
+    for (int i = 0; i < (int) (sizeof(SamplerParams) / sizeof(int)); ++i) d[i] = s[i];
+    p.logit_bias = nullptr;
+    p.penalty_last_n = 0;
+    return p;
+}
+
+__global__ void __launch_bounds__(kSplitWarps * 32)
+staged_split_part_kernel(const float* __restrict__ logits, int n_vocab, const SamplerParams* mp, int n_blocks,
+                         int2* __restrict__ cand) {
+    const SamplerParams p = staged_params(mp);
+    if (p.greedy || !(p.temperature > 0.0f)) return;
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int t = blockIdx.y;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    const int blo = (int) blockIdx.x * kSplitBlockSpan;
+    const int lo = blo + warp * kSplitWarpSpan;
+    float s[kSplitPerLane];
+#pragma unroll
+    for (int j = 0; j < kSplitPerLane; ++j) {
+        const int v = lo + 32 * j + lane;
+        s[j] = v < n_vocab ? l[v] : __int_as_float(0xff800000);
+    }
+    __shared__ int2 wl[kSplitWarps][kSelMax];
+    float prev_v = __int_as_float(0x7f800000);
+    int prev_i = -1;
+    int i = 0;
+    for (; i < k; ++i) {
+        float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
+        int i0 = n_vocab, i1 = n_vocab;
+#pragma unroll
+        for (int j = 0; j < kSplitPerLane; j += 2) {
+            const int v0 = lo + 32 * j + lane, v1 = v0 + 32;
+            const float x0 = s[j], x1 = s[j + 1];
+            if ((x0 < prev_v || (x0 == prev_v && v0 > prev_i)) && x0 > b0) { b0 = x0; i0 = v0; }
+            if ((x1 < prev_v || (x1 == prev_v && v1 > prev_i)) && x1 > b1) { b1 = x1; i1 = v1; }
+        }
+        take_first(b0, i0, b1, i1);
+        warp_first(b0, i0);
+        if (i0 >= n_vocab) break;
+        if (lane == 0) wl[warp][i] = make_int2(i0, __float_as_int(b0));
+        prev_v = b0;
+        prev_i = i0;
+    }
+    for (int r = i + lane; r < k; r += 32) wl[warp][r] = make_int2(n_vocab, (int) 0xff800000u);
+    __syncthreads();
+    if (warp == 0) {
+        int2* dst = cand + ((size_t) t * n_blocks + blockIdx.x) * k;
+        warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, k, n_vocab, [&](int r, float v, int id) {
+            if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
+        });
+    }
+}
+
+__global__ void __launch_bounds__(32)
+staged_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams* mp, int gumbel,
+                          int* __restrict__ out) {
+    SamplerParams p = staged_params(mp);
+    if (p.greedy || !(p.temperature > 0.0f)) return;
+    p.gumbel = p.gumbel || gumbel != 0;
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int t = blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    const int2* src = cand + (size_t) t * n_blocks * k;
+    for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
+    __syncwarp();
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
+    });
+    __syncwarp();
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+}
+
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
 // target's chain and the target's Philox draw.  Everything that varies per request or per round - the chain's
 // parameters, the seed, the counter (from the cell's step record), the penalty history - is read from DEVICE memory:
@@ -1308,6 +1399,31 @@ void coupled_check(const char* what) {
     }
 }
 }  // namespace
+
+size_t sample_tokens_staged_scratch_bytes(int n_tokens, int n_vocab) {
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    if (n_tokens <= 0 || n_vocab <= 0 || n_blocks > kSplitMaxBlocks || n_tokens > kSplitMaxRows ||
+        sampled_path() != SampledPath::Split)
+        return 0;
+    return (size_t) n_tokens * (size_t) n_blocks * kSelMax * sizeof(int2);
+}
+
+bool sample_tokens_staged(const float* logits, int n_tokens, int n_vocab, const SamplerParams* mapped_params,
+                          void* scratch, int* out, void* stream) {
+    if (sample_tokens_staged_scratch_bytes(n_tokens, n_vocab) == 0 || !logits || !mapped_params || !scratch || !out)
+        return false;
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    staged_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0,
+                               (cudaStream_t) stream>>>(logits, n_vocab, mapped_params, n_blocks, (int2*) scratch);
+    staged_split_merge_kernel<<<(unsigned) n_tokens, 32, 0, (cudaStream_t) stream>>>(
+        (const int2*) scratch, n_blocks, n_vocab, mapped_params, gumbel_env() ? 1 : 0, out);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "sample_tokens_staged launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
 
 size_t coupled_draft_scratch_bytes(int nv) {
     if (nv <= 0 || coupled_blocks(nv) > kSplitMaxBlocks) return 0;
