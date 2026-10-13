@@ -697,7 +697,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
-    if (strata::kernels::route_plan_mode() == 2) {   // STRATA_ROUTE_PLAN=2: the fused launch's row counter
+    if (strata::kernels::route_plan_mode() == 2) {   // STRATA_ROUTE_PLAN=2: the fused launch's row counter, one per token group
         if (cudaMalloc((void**) &route_done_, 256) != cudaSuccess) { (void) cudaGetLastError(); route_done_ = nullptr; }
         else cudaMemset(route_done_, 0, 256);
     }
@@ -1497,7 +1497,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (route_fused && (n == 1 || dec_batch)) {
             try {
                 planned = strata::kernels::native_route_fused(mixed_ + tb * N, (long long) N, (const uint16_t*) w_router->data,
-                                                              logits_ + tb * NE, route_done_, ids_ + tb * K, w_ + tb * K, n,
+                                                              logits_ + tb * NE, route_done_ + grp * 16, ids_ + tb * K, w_ + tb * K, n,
                                                               hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base,
                                                               slot_off_d_, (long long) hits_.blob,
                                                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
