@@ -86,15 +86,16 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
-// RANGE (kv_stream_resolve_range): the blocks are [n_q, cap) instead of a selection's (ids and steps unused); only
-// the misses count as lookups, so the hit rate the engine prints stays the selections' (plus these reads from RAM).
+// RANGE (kv_stream_resolve_range): the blocks are [n_q, cap) instead of a selection's (ids and steps unused) and
+// `page_size` carries copy_end: a missing block at or past it gets a slot but is not read from RAM.  Only the misses
+// that are read count (as a lookup and a miss), so the hit rate the engine prints stays the selections' plus these.
 template <bool RANGE>
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
                                                      const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
-    __shared__ int s_nmiss, s_lookups, s_cut;
+    __shared__ int s_nmiss, s_lookups, s_cut, s_read;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
-    if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; }
+    if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; s_read = 0; }
     __syncthreads();
     // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
     int lookups = 0;
@@ -106,7 +107,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
                 m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
-                ++lookups;
+                if (b < page_size) ++lookups;   // copy_end: the blocks before it are read from RAM
             }
         }
     } else
@@ -127,6 +128,7 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         }
     }
     if (lookups > 0) atomicAdd(&s_lookups, lookups);   // (#783, stuchapin909) most threads see none: skip the shared atomic
+    if (RANGE && lookups > 0) atomicAdd(&s_read, lookups);
     __syncthreads();
     // 2. one victim per miss: a clock sweep from the hand. A slot this call uses (stamp == epoch) is never taken;
     //    a referenced one loses its bit as the hand passes it and is taken on the next pass.
@@ -173,17 +175,20 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
         m.ctl[2] = placed;
         if (placed < need) m.ctl[3] = 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
-        c[0] += (unsigned long long) placed;
+        c[0] += (unsigned long long) (RANGE ? s_read : placed);
         c[1] += (unsigned long long) s_lookups;
         c[2] += 1ull;
     }
 }
 
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+// RANGE: a block at or past `copy_end` holds no cell yet (the append that follows writes it): its slot is not filled.
+template <bool RANGE>
+__global__ void copy_kernel(KvStreamMap m, Runs r, int copy_end) {
     const int need = m.ctl[2];
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        if (RANGE && b >= copy_end) continue;
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
             uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
@@ -244,22 +249,23 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     }
     resolve_kernel<false><<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    copy_kernel<false><<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s), 0);
     check("copy");
 }
 
 void kv_stream_resolve_range(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
-                             int64_t b0, int64_t b1, const QsaShapes& s, void* stream) {
+                             int64_t b0, int64_t b1, int64_t copy_end, const QsaShapes& s, void* stream) {
     if (b1 <= b0) return;
+    copy_end = std::min(std::max(copy_end, b0), b1);
     if (b0 < 0 || b1 > m.n_blocks || b1 - b0 > m.n_slots || m.n_slots < RT ||
         s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
         std::fprintf(stderr, "kv_stream: resolve range [%lld, %lld) does not fit %lld slots of %lld blocks\n",
                      (long long) b0, (long long) b1, (long long) m.n_slots, (long long) m.n_blocks);
         std::exit(1);
     }
-    resolve_kernel<true><<<1, RT, 0, (cudaStream_t) stream>>>(m, nullptr, nullptr, (int) b0, (int) b1, (int) s.page_size);
+    resolve_kernel<true><<<1, RT, 0, (cudaStream_t) stream>>>(m, nullptr, nullptr, (int) b0, (int) b1, (int) copy_end);
     check("resolve range");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    copy_kernel<true><<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s), (int) copy_end);
     check("copy");
 }
 
