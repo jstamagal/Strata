@@ -196,7 +196,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
         return (double) (code - 8) * h2f(sc);
     };
-    pl.page_table = up(table);
+    // QA_MASK=n: every n-th page reads as not resident (-1, what KV streaming leaves when a block cannot be made
+    // resident): both kernels must drop its cells, and the FP64 reference below drops them too
+    std::vector<int32_t> utable(table);
+    if (const char* mk = std::getenv("QA_MASK")) {
+        const int64_t every = std::max(2, std::atoi(mk));
+        int64_t masked = 0;
+        for (int64_t pg = every - 1; pg < pages; pg += every) { utable[(size_t) pg] = -1; ++masked; }
+        std::printf("QA_MASK: %lld of %lld pages not resident\n", (long long) masked, (long long) pages);
+    }
+    pl.page_table = up(utable);
     const int32_t* d_ids = up(ids);
     const int32_t* d_steps = up(steps);
     const float* d_q = up(q);
@@ -238,6 +247,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
             double mx = -1e300;
             for (int64_t c = 0; c < w; ++c) {
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
+                if (utable[(size_t) (cell / PS)] < 0) { sco[c] = -1e300; continue; }   // QA_MASK: not resident
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
                     const double kv = fmt == 2 ? q4v(k4, row, d)
@@ -248,7 +258,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 mx = std::max(mx, sco[c]);
             }
             double l = 0;
-            for (auto& x : sco) { x = std::exp(x - mx); l += x; }
+            for (auto& x : sco) { x = x <= -1e299 ? 0.0 : std::exp(x - mx); l += x; }
             for (int64_t d = 0; d < HD; ++d) {
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {

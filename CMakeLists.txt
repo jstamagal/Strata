@@ -750,6 +750,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_prompt_attn_wmma COMMAND hip_prompt_attn_wmma 32768 2048 3)
     set_tests_properties(hip_prompt_attn_wmma PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
     list(APPEND _strata_hip_tests hip_prompt_attn_wmma)
+    # the same with every 7th page not resident (-1 in the page table, KV streaming's masked block)
+    add_test(NAME hip_prompt_attn_masked COMMAND hip_prompt_attn_wmma 32768 2048 3)
+    set_tests_properties(hip_prompt_attn_masked PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77 ENVIRONMENT "QA_MASK=7")
+    list(APPEND _strata_hip_tests hip_prompt_attn_masked)
     if(STRATA_HIPBLASLT_AVAILABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/prefill_hipblaslt_gemm.cpp")
       add_executable(hip_prefill_hipblaslt_gemm tests/hip/prefill_hipblaslt_gemm.cpp)
       target_include_directories(hip_prefill_hipblaslt_gemm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
@@ -1058,6 +1062,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the register kernel from the smallest prompt batch (the line gfx1151 moves to 4096 blocks): same ids at every case
   add_test(NAME qsa_topk_parity_reg_always COMMAND qsa_topk_parity --selftest)
   set_tests_properties(qsa_topk_parity_reg_always PROPERTIES ENVIRONMENT "STRATA_TOPK_REG_MIN_BLOCKS=0")
+  # HIP: the decode call's top-k chosen on the device by the query's block count (opt-in; a no-op on CUDA)
+  add_test(NAME qsa_topk_parity_auto COMMAND qsa_topk_parity --selftest)
+  set_tests_properties(qsa_topk_parity_auto PROPERTIES ENVIRONMENT "STRATA_TOPK_AUTO=1")
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
