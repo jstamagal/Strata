@@ -10969,6 +10969,24 @@ int main(int argc, char** argv) {
                 const char* v = pipe_dbg_env("STRATA_PIPELINE_THETA");
                 return v ? (float) std::atof(v) : 0.2f;
             }();
+            // STRATA_PL_FRESH_T / STRATA_PL_FRESH_MIN_P and STRATA_PL_GUESS_T / STRATA_PL_GUESS_MIN_P (opt-in; unset:
+            // --spec and --spec-min-p for both, as before): the size rule of the two kinds of pipelined window apart.
+            // A FRESH window follows a verdict (its drafts are a new chain's first outputs); a GUESS is staged behind
+            // a window still unverified (its row 0 and drafts are the chain's later outputs).  Sizes are clamped to
+            // the MTP's window; the windows still only decide which drafts are verified, never the text.
+            static const int pl_fresh_t = [] { const char* v = std::getenv("STRATA_PL_FRESH_T"); return v ? std::atoi(v) : 0; }();
+            static const int pl_guess_t = [] { const char* v = std::getenv("STRATA_PL_GUESS_T"); return v ? std::atoi(v) : 0; }();
+            static const double pl_fresh_min_p = [] { const char* v = std::getenv("STRATA_PL_FRESH_MIN_P"); return v ? std::atof(v) : -1.0; }();
+            static const double pl_guess_min_p = [] { const char* v = std::getenv("STRATA_PL_GUESS_MIN_P"); return v ? std::atof(v) : -1.0; }();
+            // STRATA_PL_LOOKUP_STREAK=N (opt-in, default 0 = off): a copied stretch stays on lookup windows.  Today a
+            // lookup starts only at a fresh window (with one lookup guess behind it); the guesses after that come from
+            // the drafter's chain again (windows of --spec, named ~4 ms after the verdict), and a chain that disagrees
+            // with the lookup's tokens stops guessing although the lookup window was accepted whole.  With N >= 1, at a
+            // verdict that held, the guess behind a lookup-made window is the lookup's continuation past that window
+            // (up to --spec + 2 tokens), made at the verdict without waiting for the chain; where the lookup has no
+            // continuation the chain's guess is used and its disagreement with a lookup window no longer vetoes it.
+            // N >= 2: also behind a window of the drafter's when the lookup's match is at least N tokens long.
+            static const int pl_streak = [] { const char* v = std::getenv("STRATA_PL_LOOKUP_STREAK"); return v ? std::max(0, std::atoi(v)) : 0; }();
             int pl_force_miss = [] {   // exactness test: every k-th speculative window gets a wrong first token
                 const char* v = pipe_dbg_env("STRATA_PIPELINE_FORCE_MISS");
                 return v ? std::max(0, std::atoi(v)) : 0;
@@ -11725,6 +11743,8 @@ int main(int argc, char** argv) {
                     bool made = false;     // made from a chain (its outcome can be scored even when the gate held it)
                     bool sfx = false;      // a lookup window (the suffix drafter's drafts)
                     int sfx_match = 0;
+                    bool lk = false;       // a guess made from the lookup (a lookup window's continuation), not the chain
+                    int lk_match = 0;
                 };
                 // front stage `st`'s verifier of w's parity, and the last stage's
                 auto VF = [&](int st, const PW& w) -> strata::core::Verifier& { return stage_ver_p(st, w.seq & 1); };
@@ -11880,11 +11900,17 @@ int main(int argc, char** argv) {
                     return err.empty();
                 };
                 // the serial loop's window size over the chain's outputs from index `from` (`avail` of them)
-                auto t_rule = [&](const float* pr, int from, int avail) {
-                    int T = S_mtp;
-                    if (req_spec_min_p > 0.0) {
+                // (a fresh window's and a guess's cap and threshold: --spec / --spec-min-p unless STRATA_PL_FRESH_* /
+                // STRATA_PL_GUESS_* say otherwise)
+                const int capA = pl_fresh_t > 0 ? std::min(pl_fresh_t, S_mtp) : S_mtp;
+                const int capB = pl_guess_t > 0 ? std::min(pl_guess_t, S_mtp) : S_mtp;
+                const double minpA = pl_fresh_min_p >= 0.0 ? pl_fresh_min_p : req_spec_min_p;
+                const double minpB = pl_guess_min_p >= 0.0 ? pl_guess_min_p : req_spec_min_p;
+                auto t_rule = [&](const float* pr, int from, int avail, int cap, double minp) {
+                    int T = cap;
+                    if (minp > 0.0) {
                         T = 1;
-                        while (T < S_mtp && from + T - 1 < avail && pr[from + T - 1] >= (float) req_spec_min_p) ++T;
+                        while (T < cap && from + T - 1 < avail && pr[from + T - 1] >= (float) minp) ++T;
                     }
                     return std::max(1, std::min(T, 1 + avail - from));
                 };
@@ -11895,7 +11921,7 @@ int main(int argc, char** argv) {
                     B.seq = A.seq + 1;
                     B.p = A.p + A.T;
                     B.tok[0] = oc[base];
-                    B.T = t_rule(op, base + 1, avail);
+                    B.T = t_rule(op, base + 1, avail, capB, minpB);
                     for (int i = 1; i < B.T; ++i) {
                         B.tok[i] = oc[base + i];
                         B.prob[i - 1] = op[base + i];
@@ -12018,6 +12044,8 @@ int main(int argc, char** argv) {
                         B.p_on = pl_lookup_pon;
                         B.ready = true;
                         B.made = true;
+                        B.lk = true;
+                        B.lk_match = match;
                         b_done = true;   // the chain in flight makes no B for this A
                         tre("CD", A.seq + 1, 3, (int) (1000.0f * B.p_on));
                     }
@@ -12050,9 +12078,13 @@ int main(int argc, char** argv) {
                 // per window class (0: fresh, 1: run speculatively ahead of its predecessor's verdict): the time from
                 // the previous verdict, the tokens it emitted, how many
                 double cls_ms[2] = {0, 0}, cls_tok[2] = {0, 0}, cls_n[2] = {0, 0};
+                // STRATA_SPEC_DEPTH=1: per class, the MTP drafts tested / accepted by their index in the window, and the
+                // guess of a window's bonus token (the next window's row 0) tested / right where that window held whole
+                static const bool pl_depth = std::getenv("STRATA_SPEC_DEPTH") != nullptr;
+                int64_t pd_t[2][8] = {}, pd_ok[2][8] = {}, pg_t[2] = {}, pg_ok[2] = {};
                 int64_t cal_n[10] = {}, cal_on[10] = {};   // per p_on decile: windows scored, on the path
                 double last_verdict = 0.0;
-                int64_t pl_disagree = 0, pl_late = 0;
+                int64_t pl_disagree = 0, pl_late = 0, pl_streak_n = 0;
                 static const bool pl_prestage = [] {   // STRATA_PIPELINE_PRESTAGE=0: B staged at its launch
                     const char* v = pipe_dbg_env("STRATA_PIPELINE_PRESTAGE");
                     return v == nullptr || std::atoi(v) != 0;
@@ -12129,12 +12161,12 @@ int main(int argc, char** argv) {
                             // A's size is decided by its first outputs: a draft below spec_min_p ends it (the serial
                             // loop's rule), so A goes to stage 0 as soon as that is known, not after all S_mtp - 1
                             const int k = k_ready;
-                            bool decided = k >= S_mtp - 1;
-                            if (!decided && req_spec_min_p > 0.0)
+                            bool decided = k >= capA - 1;
+                            if (!decided && minpA > 0.0)
                                 for (int j = 0; j < k; ++j)
-                                    if (mtp.chain_prob()[j] < (float) req_spec_min_p) { decided = true; break; }
+                                    if (mtp.chain_prob()[j] < (float) minpA) { decided = true; break; }
                             if (decided) {
-                                A.T = t_rule(mtp.chain_prob(), 0, std::min(k, S_mtp - 1));
+                                A.T = t_rule(mtp.chain_prob(), 0, std::min(k, capA - 1), capA, minpA);
                                 for (int i = 1; i < A.T; ++i) {
                                     A.tok[i] = mtp.chain_tok()[i - 1];
                                     A.prob[i - 1] = mtp.chain_prob()[i - 1];
@@ -12152,7 +12184,7 @@ int main(int argc, char** argv) {
                         const int32_t* oc = mtp.chain_tok();
                         const float* op = mtp.chain_prob();
                         if (r == 1 && chain_kind == 2 && !early_used) {
-                            A.T = t_rule(op, 0, std::min(chain_n, S_mtp - 1));
+                            A.T = t_rule(op, 0, std::min(chain_n, capA - 1), capA, minpA);
                             for (int i = 1; i < A.T; ++i) {
                                 A.tok[i] = oc[i - 1];
                                 A.prob[i - 1] = op[i - 1];
@@ -12163,10 +12195,10 @@ int main(int argc, char** argv) {
                         }
                         if (!b_done && (chain_kind == 1 || early_used)) {
                             const int base = A.T - 1;                    // B's row 0: the guess of A's bonus
-                            bool decided = r == 1 || k >= base + S_mtp;
-                            if (!decided && k > base + 1 && req_spec_min_p > 0.0)
+                            bool decided = r == 1 || k >= base + capB;
+                            if (!decided && k > base + 1 && minpB > 0.0)
                                 for (int j = base + 1; j < k; ++j)
-                                    if (op[j] < (float) req_spec_min_p) { decided = true; break; }
+                                    if (op[j] < (float) minpB) { decided = true; break; }
                             if (decided) {
                                 float pa = 1.0f;
                                 if (chain_kind == 1) {
@@ -12178,7 +12210,8 @@ int main(int argc, char** argv) {
                                         if (oc[i] != A.tok[i + 1]) agree = false;
                                         pa *= pl_agree ? op[i] : A.prob[i];
                                     }
-                                    if (pl_agree && !agree) { pa = 0.0f; ++pl_disagree; }
+                                    if (pl_streak > 0 && A.lk) pa = pl_lookup_pon;   // the lookup's tokens, not the drafter's
+                                    else if (pl_agree && !agree) { pa = 0.0f; ++pl_disagree; }
                                 } else {
                                     for (int i = 0; i + 1 < A.T; ++i) pa *= A.prob[i];
                                 }
@@ -12289,6 +12322,28 @@ int main(int argc, char** argv) {
                     const bool on_v = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     bool e_last = false, e_stop = false, e_launched = false;
                     double e_now = 0.0;
+                    // STRATA_PL_LOOKUP_STREAK: the guess behind B from the lookup - the history as it will be once
+                    // this verdict's tokens are appended (outp[0..a]; outp[a] is B's row 0 on the path), then B's
+                    // drafts, in flight.  Made before the chain's launch: with a lookup guess the chain only catches
+                    // the drafter up on A's cells (one output, nothing forced), its guess is not waited for.
+                    int sk_n = 0, sk_match = 0;
+                    int32_t sk_tok[8] = {};
+                    if (on_v && pl_streak > 0 && o.suffix_draft > 0 && pl_lookup_pon > 0.0f && (B.lk || pl_streak >= 2) &&
+                        B.p + B.T < o.max_context) {
+                        int32_t ex[16];
+                        int n_ex = 0;
+                        for (int i = 0; i <= a && n_ex < 16; ++i) ex[n_ex++] = outp[(size_t) i];
+                        for (int i = 1; i < B.T && n_ex < 16; ++i) ex[n_ex++] = B.tok[i];
+                        const int k = sfx.propose_after(ex, n_ex, std::min(S, 8), pl_sbuf.data());
+                        const int match = sfx.last_match();
+                        if (k >= 1 && (B.lk || (k >= 2 && match >= pl_streak))) {
+                            sk_n = k;
+                            sk_match = match;
+                            for (int i = 0; i < k; ++i) sk_tok[i] = pl_sbuf[(size_t) i];
+                        }
+                    }
+                    static const bool pl_streak_full_chain = pipe_dbg_env("STRATA_PIPELINE_STREAK_FULL_CHAIN") != nullptr;
+                    const bool sk_short = sk_n > 0 && !pl_streak_full_chain;
                     if (pl_early_chain) {
                         bool e_eos = false;
                         int n_emit = 0;
@@ -12303,8 +12358,9 @@ int main(int argc, char** argv) {
                         if (!e_last) {
                             mtp.set_source_R(V1(A).final_R(0));
                             if (on_v) {   // the chain over A, forced through B's drafts (as below)
-                                chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
-                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+                                chain_n = sk_short ? 1 : std::min(strata::kernels::kVerifyMaxT - 1, B.T + capB - 1);
+                                if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, sk_short ? 0 : B.T - 1, chain_n,
+                                                      chain_n, err))
                                     return die(err);
                                 tre("CL", A.seq, 1);
                             } else {      // fresh (as below)
@@ -12342,6 +12398,11 @@ int main(int argc, char** argv) {
                     // the request at the next verdict)
                     const bool last = pl_early_chain ? e_last : (nf || eos || produced_n >= max_new || stop_req.load());
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    if (pl_depth && !A.sfx && !A.lk) {
+                        const int c = A.spec ? 1 : 0;
+                        for (int d = 0; d < A.T - 1 && d < 8 && d <= a; ++d) { ++pd_t[c][d]; pd_ok[c][d] += d < a; }
+                        if (B.made && !B.sfx && a == A.T - 1) { ++pg_t[c]; pg_ok[c] += B.tok[0] == outp[(size_t) A.T - 1]; }
+                    }
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
@@ -12352,8 +12413,10 @@ int main(int argc, char** argv) {
                     {
                         const double now = pl_early_chain ? e_now : ms_now();
                         const int c = A.spec ? 1 : 0;
-                        if (A.sfx) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
-                        if (A.seq > 0 && !last) policy.observe(A.sfx, A.T, a, A.sfx_match, now - last_verdict);
+                        const bool a_lk = pl_streak > 0 && A.lk;
+                        if (A.sfx || a_lk) { ++sfx_windows; sfx_drafts += A.T - 1; sfx_ok += a; }
+                        if (A.seq > 0 && !last)
+                            policy.observe(A.sfx || a_lk, A.T, a, a_lk ? A.lk_match : A.sfx_match, now - last_verdict);
                         cls_ms[c] += now - last_verdict;
                         cls_tok[c] += a + 1;
                         cls_n[c] += 1;
@@ -12375,8 +12438,9 @@ int main(int argc, char** argv) {
                         if (!e_launched) {
                             // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
-                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
+                            chain_n = sk_short ? 1 : std::min(strata::kernels::kVerifyMaxT - 1, B.T + capB - 1);
+                            if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, sk_short ? 0 : B.T - 1, chain_n,
+                                                  chain_n, err))
                                 return die(err);
                             tre("CL", A.seq, 1);
                         }
@@ -12390,6 +12454,28 @@ int main(int argc, char** argv) {
                             if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(A.T, err)) return die(err);
                         A = B;
                         B = PW{};
+                        // STRATA_PL_LOOKUP_STREAK: the next guess is the lookup's (made above, before the chain)
+                        if (sk_n > 0) {
+                            B.seq = A.seq + 1;
+                            B.p = A.p + A.T;
+                            B.T = sk_n;
+                            for (int i = 0; i < B.T; ++i) B.tok[i] = sk_tok[i];
+                            for (int i = 1; i < B.T; ++i) B.prob[i - 1] = 1.0f;
+                            B.p_on = pl_lookup_pon;
+                            B.ready = true;
+                            B.made = true;
+                            B.lk = true;
+                            B.lk_match = sk_match;
+                            b_done = true;   // the chain in flight makes no B for this A
+                            ++pl_streak_n;
+                            tre("CD", B.seq, 3, (int) (1000.0f * B.p_on));
+                            if (pf_table != nullptr) {   // STRATA_PL_PLE_PREFETCH: its rows (A is on its way)
+                                pf_def_prev[0] = A.T >= 2 ? A.tok[A.T - 2] : (consumed.empty() ? -1 : consumed.back());
+                                pf_def_prev[1] = A.tok[A.T - 1];
+                                pf_def_n = std::min(B.T, 8);
+                                for (int i = 0; i < pf_def_n; ++i) pf_def_tok[i] = B.tok[i];
+                            }
+                        }
                     } else {
                         // the front stages B never ran on take A's real commit now; those it did run on are undone
                         // (snapshot restored, the commit replayed) once it has stopped
@@ -12466,6 +12552,9 @@ int main(int argc, char** argv) {
                                  cls_n[0], avg(cls_ms[0], cls_n[0]), avg(cls_tok[0], cls_n[0]), cls_n[1],
                                  avg(cls_ms[1], cls_n[1]), avg(cls_tok[1], cls_n[1]), (long long) pl_disagree,
                                  (long long) pl_late);
+                    if (pl_streak > 0)
+                        std::fprintf(stderr, "strata pipeline lookup streak: %lld guesses made from the lookup at a verdict "
+                                             "(STRATA_PL_LOOKUP_STREAK=%d)\n", (long long) pl_streak_n, pl_streak);
                     std::string cal;
                     char b[48];
                     for (int i = 0; i < 10; ++i)
@@ -12474,6 +12563,21 @@ int main(int argc, char** argv) {
                             cal += b;
                         }
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
+                }
+                if (pl_depth) {
+                    std::string ln;
+                    char b[64];
+                    for (int c = 0; c < 2; ++c) {
+                        ln += c == 0 ? " fresh" : " | guessed";
+                        for (int d = 0; d < 8; ++d)
+                            if (pd_t[c][d] > 0) {
+                                std::snprintf(b, sizeof b, " %lld/%lld", (long long) pd_ok[c][d], (long long) pd_t[c][d]);
+                                ln += b;
+                            }
+                        std::snprintf(b, sizeof b, ", bonus guess behind it %lld/%lld", (long long) pg_ok[c], (long long) pg_t[c]);
+                        ln += b;
+                    }
+                    std::fprintf(stderr, "strata pipeline depth (drafts accepted/tested by index):%s\n", ln.c_str());
                 }
                 // what STRATA_PL_PLE_PREFETCH / _PLE_LATE / _EARLY_CHAIN did this request.  "window rows": the rows the
                 // stage-0 windows asked the reader for (with the read-ahead on, most should come from the row cache or
