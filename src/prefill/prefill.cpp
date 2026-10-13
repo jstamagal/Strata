@@ -2546,13 +2546,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // below) and the same ring, group gather and release events carry them: the same bytes into the same
             // products, so the same output.  What it gives up is the copies' run through the attention half of a
             // layer; they overlap the layer's resident experts instead (see where plan_layer is called).  Only where
-            // every streamed blob is DMA'd from page-locked memory (no stager jobs), no peer and no fused kernels take
-            // part; any other chunk keeps the fixed list.
+            // every streamed blob is DMA'd from page-locked memory (no stager jobs), no helper card and no fused kernels
+            // take part; any other chunk keeps the fixed list.
             static const int routed_env = [] {
                 const char* v = std::getenv("STRATA_PF_STREAM_ROUTED");
                 return v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
             }();
             routed_last = routed_env == 1;
+            // (Not with a helper card, m.pp: a one-chunk prompt on two cards, where the idle stage computes and streams a
+            // share of the experts over its own link - measured here: such a 1,825-token prompt keeps the fixed list.)
             routed_stream = routed_env != 0 && js.empty() && !ps_on && m.pp == nullptr && !fused_ring() && !m.fused_bufs;
             if (routed_stream) {
                 seq.clear();   // keeps its capacity (every non-resident expert): plan_layer never reallocates it
