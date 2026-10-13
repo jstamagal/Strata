@@ -55,6 +55,13 @@ public:
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
+    /// STRATA_DENSE_TIMING=1 (debug): an event on the stream; the GPU time since the previous mark is charged to
+    /// `what` (with the product's shape when given).  The GEMM entry points mark their own steps (the weight's
+    /// conversion, the product, the widening); the prompt path marks the kernels between them.  tdump() prints the
+    /// table (count, ms, and for a product its GFLOP/s) and clears it.  Off: both return at once.
+    void tmark(const char* what, int64_t T = 0, int64_t N = 0, int64_t K = 0);
+    void tdump(const char* tag);
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
@@ -68,6 +75,7 @@ private:
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
+    void* dense_timer_ = nullptr;     // STRATA_DENSE_TIMING
     bool f16_io_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed

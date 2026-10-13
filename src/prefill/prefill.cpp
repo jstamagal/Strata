@@ -2716,12 +2716,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
+                m.gemm.tmark("other");
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx);
                 normed = false;
+                m.gemm.tmark("hc norm");
                 bool moe_wrote = false;   // the MoE half's combine also did the write below (moe_combine_write_norm_rs)
                 bool hcd = false;
                 bool hdown = false;
@@ -2740,6 +2742,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                m.gemm.tmark("hc silu");
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= pf_switch_min_t() && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
@@ -2776,6 +2779,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
                 }
+                m.gemm.tmark("hc mix");
 
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
@@ -4335,6 +4339,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                      (long long) kv_prefetches);
     }
     stats_.ms_total += ms_since(t_start);
+    m.gemm.tdump("prompt");
     if (pt.on) {
         pt.fold();
         double total = 0.0;

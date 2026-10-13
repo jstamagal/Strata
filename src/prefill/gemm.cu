@@ -29,6 +29,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -499,7 +503,80 @@ bool try_rocblas_f16o(void* opaque_state, const uint16_t* X, const uint16_t* W, 
 }
 #endif
 
+// STRATA_DENSE_TIMING (debug): Gemm::tmark / tdump.  Events on the stream, folded (after a synchronize) when 4096
+// are waiting and at tdump.
+struct DenseTimer {
+    struct Key {
+        std::string what; int64_t t, n, k;
+        bool operator<(const Key& o) const { return std::tie(what, t, n, k) < std::tie(o.what, o.t, o.n, o.k); }
+    };
+    struct Sum { uint64_t count = 0; double ms = 0; };
+    std::vector<cudaEvent_t> ev;
+    std::vector<Key> key;
+    size_t used = 0;
+    std::map<Key, Sum> sums;
+    void fold(cudaStream_t s) {
+        if (used < 2) return;
+        cudaStreamSynchronize(s);
+        for (size_t i = 0; i + 1 < used; ++i) {
+            float t = 0.0f;
+            if (cudaEventElapsedTime(&t, ev[i], ev[i + 1]) == cudaSuccess) {
+                Sum& a = sums[key[i + 1]];
+                ++a.count;
+                a.ms += t;
+            }
+        }
+        std::swap(ev[0], ev[used - 1]);
+        used = 1;
+    }
+    ~DenseTimer() { for (cudaEvent_t e : ev) cudaEventDestroy(e); }
+};
+bool dense_timing_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DENSE_TIMING"); return e && e[0] == '1'; }();
+    return on;
+}
+
 }  // namespace
+
+void Gemm::tmark(const char* what, int64_t T, int64_t N, int64_t K) {
+    if (!dense_timing_on()) return;
+    if (!dense_timer_) dense_timer_ = new DenseTimer();
+    auto* d = static_cast<DenseTimer*>(dense_timer_);
+    if (d->used >= 4096) d->fold((cudaStream_t) stream_);
+    if (d->used == d->ev.size()) {
+        cudaEvent_t e = nullptr;
+        cudaEventCreate(&e);
+        d->ev.push_back(e);
+        d->key.emplace_back();
+    }
+    d->key[d->used] = DenseTimer::Key{what, T, N, K};
+    cudaEventRecord(d->ev[d->used], (cudaStream_t) stream_);
+    ++d->used;
+}
+
+void Gemm::tdump(const char* tag) {
+    if (!dense_timing_on() || !dense_timer_) return;
+    auto* d = static_cast<DenseTimer*>(dense_timer_);
+    d->fold((cudaStream_t) stream_);
+    int dev = -1;
+    cudaGetDevice(&dev);
+    double total = 0;
+    for (const auto& [k, v] : d->sums) total += v.ms;
+    std::vector<std::pair<DenseTimer::Key, DenseTimer::Sum>> rows(d->sums.begin(), d->sums.end());
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    std::fprintf(stderr, "strata dense timing (%s, device %d): %.1f ms marked\n", tag, dev, total);
+    for (const auto& [k, v] : rows) {
+        if (k.n > 0 && k.t > 0)
+            std::fprintf(stderr, "strata dense timing:   %-14s T=%-6lld N=%-6lld K=%-6lld x%-5llu %9.2f ms (%4.1f%%) %7.3f ms each, %7.1f GFLOP/s\n",
+                         k.what.c_str(), (long long) k.t, (long long) k.n, (long long) k.k, (unsigned long long) v.count,
+                         v.ms, 100.0 * v.ms / total, v.ms / v.count,
+                         v.ms > 0 ? 2.0 * k.t * k.n * k.k * v.count / (v.ms * 1e6) : 0.0);
+        else
+            std::fprintf(stderr, "strata dense timing:   %-14s %-27s x%-5llu %9.2f ms (%4.1f%%) %7.3f ms each\n", k.what.c_str(),
+                         "", (unsigned long long) v.count, v.ms, 100.0 * v.ms / total, v.ms / v.count);
+    }
+    d->sums.clear();
+}
 
 bool prompt_f16() {
 #if defined(__HIPCC__)
@@ -539,6 +616,7 @@ Gemm::~Gemm() {
 #if defined(__HIPCC__) && defined(STRATA_ROCBLAS_AVAILABLE)
     delete static_cast<RocBlasState*>(rocblas_state_);
 #endif
+    delete static_cast<DenseTimer*>(dense_timer_);
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
@@ -754,7 +832,9 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
+            tmark("other");
             bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
+            tmark("w bf16->f16", T, n, K);
             f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
         }
         return;
@@ -961,6 +1041,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
     const float one = 1.0f, zero = 0.0f;
     bool done = false;
 #if defined(STRATA_ROCBLAS_AVAILABLE)
+    tmark("other");
     done = try_rocblas_f16o(rocblas_state_, X, W, Y, T, N, K, ldy);   // the table's kernel for this shape, if any
 #endif
     if (!done) {
@@ -969,8 +1050,10 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
            "cublasGemmEx f16 out");
     }
+    if (dense_timing_on()) tmark(done ? "gemm tuned" : "gemm default", T, N, K);
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
+    tmark("widen", T, N, K);
     if (dbg_nan) {   // debug only: a sync per GEMM
         unsigned long long bad = 0, zero_count = 0;
         (void) hipStreamSynchronize((hipStream_t) stream_);
@@ -1030,12 +1113,16 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+            tmark("other");
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            tmark("dequant", T, n, K);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
+    tmark("other");
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    tmark("dequant", T, N, K);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 
