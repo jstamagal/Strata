@@ -4,6 +4,7 @@
 // So the tolerance is tight (FP32 accumulation only): a wrong nibble order, block stride, row bound or scale shows.
 // Then one timing of the two real shapes.  Exit 77 when the kernel is not enabled on this card.
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_q4.hpp"
 #include "ggml.h"
 #include <hip/hip_runtime.h>
 
@@ -74,7 +75,10 @@ double ref_dot(ggml_type type, const uint8_t* wrow, const float* x, int64_t cols
     return acc;
 }
 
-bool check(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<int>& counts, unsigned seed) {
+// `variant`: q4::set_variant's (0 the 64 x 32 tile, 1 the 256 x 32 ones); `keep`: the output, for a bitwise compare
+bool check(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<int>& counts, unsigned seed, int variant = 0,
+           std::vector<float>* keep = nullptr) {
+    q4::set_variant(variant);
     std::mt19937 rng(seed);
     const int n = (int) counts.size();
     int total = 0, max_rows = 0;
@@ -127,8 +131,9 @@ bool check(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<int>&
             }
     const double rel = ref2 > 0 ? std::sqrt(err2 / ref2) : 0;
     const bool pass = bad == 0 && rel < 2e-5 && zero_row == 0.0;
-    std::printf("%s %-4s W[%lld x %lld] experts %d rows %d (max %d): rel L2 %.2e, worst |diff| %.2e, zero row max %.1e, "
-                "unwritten %ld\n", pass ? "PASS" : "FAIL", ggml_type_name(type), (long long) w_rows, (long long) cols, n,
+    if (keep) *keep = y;
+    std::printf("%s v%d %-4s W[%lld x %lld] experts %d rows %d (max %d): rel L2 %.2e, worst |diff| %.2e, zero row max %.1e, "
+                "unwritten %ld\n", pass ? "PASS" : "FAIL", variant, ggml_type_name(type), (long long) w_rows, (long long) cols, n,
                 total, max_rows, rel, worst, zero_row, bad);
     return pass;
 }
@@ -185,15 +190,37 @@ int main() {
             return 77;
         }
         bool all = true;
-        all &= check(GGML_TYPE_Q4_0, 128, 256, {33, 0, 1, 70}, 1);       // small, every output row checked
-        all &= check(GGML_TYPE_Q4_1, 128, 256, {5, 64, 31}, 2);
-        all &= check(GGML_TYPE_Q4_0, 100, 384, {40}, 3);                  // rows not a multiple of 64
-        all &= check(GGML_TYPE_Q4_0, 1280, 2560, {37, 0, 70, 32}, 4);     // gate + up
-        all &= check(GGML_TYPE_Q4_0, 2560, 640, {37, 0, 70, 32}, 5);      // down
-        all &= check(GGML_TYPE_Q4_1, 2560, 640, {19, 65, 3}, 6);          // down on the six Q4_1 layers
-        time_shape(GGML_TYPE_Q4_0, 1280, 2560, 16, 320);
-        time_shape(GGML_TYPE_Q4_0, 2560, 640, 16, 320);
-        time_shape(GGML_TYPE_Q4_1, 2560, 640, 16, 320);
+        struct C { ggml_type type; int64_t w_rows, cols; std::vector<int> counts; };
+        const std::vector<C> cases = {
+            {GGML_TYPE_Q4_0, 128, 256, {33, 0, 1, 70}},       // small, every output row checked
+            {GGML_TYPE_Q4_1, 128, 256, {5, 64, 31}},
+            {GGML_TYPE_Q4_0, 100, 384, {40}},                 // rows not a multiple of 64
+            {GGML_TYPE_Q4_0, 300, 384, {40, 7}},              // rows not a multiple of 256
+            {GGML_TYPE_Q4_0, 1280, 2560, {37, 0, 70, 32}},    // gate + up
+            {GGML_TYPE_Q4_0, 2560, 640, {37, 0, 70, 32}},     // down
+            {GGML_TYPE_Q4_1, 2560, 640, {19, 65, 3}},         // down on the six Q4_1 layers
+        };
+        unsigned seed = 1;
+        for (const C& c : cases) {
+            // each tile against FP64, and the 256 x 32 tiles (STRATA_PF_Q4_WIDE=1) against the 64 x 32 one bit for bit
+            std::vector<float> y0, yv;
+            all &= check(c.type, c.w_rows, c.cols, c.counts, seed, 0, &y0);
+            for (int v = 1; v <= 1; ++v) {
+                all &= check(c.type, c.w_rows, c.cols, c.counts, seed, v, &yv);
+                const bool same = y0.size() == yv.size() && std::memcmp(y0.data(), yv.data(), y0.size() * 4) == 0;
+                std::printf("%s v%d against v0: %s\n", same ? "PASS" : "FAIL", v, same ? "the same bits" : "outputs differ");
+                all &= same;
+            }
+            ++seed;
+        }
+        for (int v = 0; v <= 1; ++v) {
+            q4::set_variant(v);
+            std::printf("variant %d\n", v);
+            time_shape(GGML_TYPE_Q4_0, 1280, 2560, 16, 320);
+            time_shape(GGML_TYPE_Q4_0, 2560, 640, 16, 320);
+            time_shape(GGML_TYPE_Q4_1, 2560, 640, 16, 320);
+        }
+        q4::set_variant(-1);
         std::printf(all ? "ALL PASS\n" : "FAILED\n");
         return all ? 0 : 1;
     } catch (const std::exception& e) {

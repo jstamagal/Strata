@@ -28,4 +28,9 @@ void quantize(const float* x, const int32_t* ids, void* xq, int64_t cols, int64_
 /// mmq::Product for type Q4_0 or Q4_1, activations from `quantize` above.  w_cols a multiple of 128.
 void run(const mmq::Product& p, void* stream);
 
+/// Which product kernel `run` launches: 0 the 64 x 32 tile (the default), 1 the 256 x 32 tiles (what
+/// STRATA_PF_Q4_WIDE=1 selects: the same output bits, see moe_q4.cu), -1 back to the environment's choice.  For tests
+/// and benches: an A/B in one process.
+void set_variant(int v);
+
 }  // namespace strata::prefill::q4
