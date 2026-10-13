@@ -40,6 +40,8 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/head_wide.hpp"
+#include "strata/kernels/route_plan.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -512,8 +514,12 @@ Verifier::~Verifier() {
     for (cudaEvent_t e : df_join_)
         if (e) cudaEventDestroy(e);
     if (arena_) cudaFree(arena_);
+    if (route_done_) cudaFree(route_done_);
+    if (head_wide_scratch_) cudaFree(head_wide_scratch_);
+    if (sp_scratch_) cudaFree(sp_scratch_);
+    if (sp_dev_) cudaFree(sp_dev_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
-                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_};
+                     h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, h_sp_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
@@ -691,6 +697,46 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     cudaMemset(arena_, 0, count.used);
+    if (strata::kernels::route_plan_mode() == 2) {   // STRATA_ROUTE_PLAN=2: the fused launch's row counter
+        if (cudaMalloc((void**) &route_done_, 256) != cudaSuccess) { (void) cudaGetLastError(); route_done_ = nullptr; }
+        else cudaMemset(route_done_, 0, 256);
+    }
+    // STRATA_HEAD_WIDE=1 / STRATA_HEAD_SAMPLE=1 (opt-in, the last stage only): their own small allocations, so the
+    // arena above is the same bytes with them off.  A failed allocation leaves the switch off for this verifier.
+    if (le_ == g.n_layers && head_ != nullptr && head_->loaded()) {
+        if (strata::kernels::head_wide_enabled() &&
+            strata::kernels::head_wide_supported(head_->type(), (int) N, (int) n_vocab_, 1)) {
+            if (cudaMalloc(&head_wide_scratch_, strata::kernels::head_wide_scratch_bytes()) != cudaSuccess) {
+                (void) cudaGetLastError();
+                head_wide_scratch_ = nullptr;
+            } else {
+                std::fprintf(stderr, "strata verify: STRATA_HEAD_WIDE=1: the output head keeps its activations in "
+                                     "registers, the greedy pick and the finite check ride in its launch\n");
+            }
+        }
+        static const bool head_sample_env = [] {
+            const char* e = std::getenv("STRATA_HEAD_SAMPLE");
+            return e != nullptr && e[0] == '1' && e[1] == '\0';
+        }();
+        const size_t sb = head_sample_env ? strata::kernels::sample_tokens_staged_scratch_bytes((int) T, (int) n_vocab_) : 0;
+        if (sb > 0) {
+            const size_t words = (sizeof(strata::kernels::SamplerParams) + 3) / 4;
+            if (cudaMalloc(&sp_scratch_, sb) != cudaSuccess || cudaMalloc((void**) &sp_dev_, words * 4 + 64) != cudaSuccess ||
+                !mapped(words * 4 + 64, (void**) &h_sp_, (void**) &m_sp_)) {
+                (void) cudaGetLastError();
+                if (sp_scratch_) cudaFree(sp_scratch_);
+                if (sp_dev_) cudaFree(sp_dev_);
+                sp_scratch_ = nullptr; sp_dev_ = nullptr; h_sp_ = m_sp_ = nullptr;
+            } else {
+                strata::kernels::SamplerParams off;
+                off.greedy = true;
+                off.temperature = 0.0f;
+                std::memcpy(h_sp_, &off, sizeof off);
+                std::fprintf(stderr, "strata verify: STRATA_HEAD_SAMPLE=1: a sampled request's draws are nodes of the "
+                                     "window's graph (no penalties, no logit bias; those sample after it as before)\n");
+            }
+        }
+    }
     if (g_trace && trace_h_ == nullptr) {   // #649: the breadcrumbs, mapped so they read while the GPU hangs
         trace_n_ = (size_t) (g.n_layers + 1) * kProfPer * 2;
         if (!mapped(trace_n_ * 8, (void**) &trace_h_, (void**) &trace_m_)) {
@@ -1436,6 +1482,38 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        // STRATA_ROUTE_PLAN=1: the top-10 and the all-resident plan in one launch (kernels/route_plan.hpp: the two
+        // kernels' ids, weights and plan).  Only where nothing sits between them: the zero-doorbell graph, no
+        // STRATA_ROUTE_PRIOR, no STRATA_ROUTE_RESIDENT.
+        static const float route_prior_env = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+        const bool route_plan = strata::kernels::route_plan_enabled() && ar_on() && w_router != nullptr &&
+                                native_router_enabled() && NE == 512 && K == 10 && n <= 8 && hits_.d_res != nullptr &&
+                                !(route_prior_env > 0.0f) && !(route_resident_cfg().margin > 0.0f);
+        bool planned = false;   // the plan was written with the routing
+        // STRATA_ROUTE_PLAN=2 (HIP): the router's projection in that launch too (not with STRATA_LFUSE's gate row,
+        // which rides in the projection's own launch)
+        const bool route_fused = route_plan && strata::kernels::route_plan_mode() == 2 && route_done_ != nullptr &&
+                                 w_sgi == nullptr && N == 2560 && strata::core::layer_native_bf16();
+        if (route_fused && (n == 1 || dec_batch)) {
+            try {
+                planned = strata::kernels::native_route_fused(mixed_ + tb * N, (long long) N, (const uint16_t*) w_router->data,
+                                                              logits_ + tb * NE, route_done_, ids_ + tb * K, w_ + tb * K, n,
+                                                              hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base,
+                                                              slot_off_d_, (long long) hits_.blob,
+                                                              plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
+                                                              (long long) max_t_ * K, m_plan_err_, cs);
+            } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+        }
+        auto route_plan_launch = [&] {
+            strata::kernels::native_route_plan(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n,
+                                               hits_.d_res + l * g.n_expert, (int) g.n_expert, hits_.cache_base, slot_off_d_,
+                                               (long long) hits_.blob, plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
+                                               (long long) max_t_ * K, m_plan_err_, cs);
+            planned = true;
+        };
+        if (planned) {
+            // (STRATA_ROUTE_PLAN=2: routed and planned above)
+        } else
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1445,7 +1523,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                if (route_plan) route_plan_launch();
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
+            } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+        } else if (route_plan && n == 1 && strata::core::layer_native_bf16()) {
+            // a one-token group: moe_route's projection (project_bf16's native call), then the one launch
+            try {
+                bf16_gemv_fp32_mmvf(mixed_ + tb * N, (const uint16_t*) w_router->data, logits_ + tb * NE, N, NE, cs);
+                route_plan_launch();
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
         } else if (dec_batch) {
@@ -1476,6 +1562,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
+            if (!planned)
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
@@ -1767,6 +1854,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
         }
+        // STRATA_HEAD_WIDE=1: the head's logits (native_mmvq's bits), the greedy pick and the non-finite flags in two
+        // launches (kernels/head_wide.hpp); not for a recorded batch window wider than the kernel's columns
+        const bool head_wide_on = head_wide_scratch_ != nullptr && head_ != nullptr && head_->loaded() &&
+                                  strata::kernels::head_wide_supported(head_->type(), (int) N, (int) n_vocab_, T);
+        if (head_wide_on) {
+            try {
+                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                strata::kernels::head_wide(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T,
+                                           head_wide_scratch_, m_out_, nan_guard_on() ? m_nf_ : nullptr, cs);
+            } catch (const std::exception& e) {
+                err = std::string("verify head: ") + e.what();
+                return false;
+            }
+        } else
         if (head_ != nullptr && head_->loaded()) {
             try {
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
@@ -1784,6 +1885,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        if (head_wide_on) {
+            // (the pick and the flags were written by head_wide)
+        } else {
         if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
         } else {
@@ -1794,6 +1898,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
         if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        }
+        // STRATA_HEAD_SAMPLE=1: a sampled request's draws, after the greedy pick (whose tokens a greedy request
+        // keeps): the staged parameters copied from the mapped words, then the split sampler reading them.  Not in a
+        // recorded batch window, whose rows are different requests (sample_rows).
+        if (sp_scratch_ != nullptr && !batch_rec_) {
+            copy_i32_from_mapped(sp_dev_, m_sp_, (int64_t) ((sizeof(SamplerParams) + 3) / 4), cs);
+            strata::kernels::sample_tokens_staged(head_logits_, T, (int) n_vocab_, (const SamplerParams*) sp_dev_,
+                                                  sp_scratch_, m_out_, cs);
+        }
     }
     stamp(g.n_layers, 1, 0);
     return true;
@@ -2057,6 +2170,20 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
     }
+    if (h_sp_ != nullptr) {
+        // STRATA_HEAD_SAMPLE=1: this window's sampling parameters for the graph's sampler nodes; `greedy` for a
+        // request the graph does not sample (greedy, penalties, a logit bias, STRATA_SPEC_PROB's judged windows)
+        strata::kernels::SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        sp_in_graph_ = head_sampling_ && !sp.greedy && sp.temperature > 0.0f && hist_d_ == nullptr &&
+                       sp.logit_bias == nullptr && !(spec_q_ != nullptr && spec_nq_ > 0 && T > 1);
+        if (!sp_in_graph_) { sp.greedy = true; sp.temperature = 0.0f; }
+        sp.logit_bias = nullptr;
+        std::memcpy(h_sp_, &sp, sizeof sp);
+        if (sp_in_graph_ && sp_graph_windows++ == 0)
+            std::fprintf(stderr, "strata verify: STRATA_HEAD_SAMPLE: the first window sampled in its graph (position %lld, "
+                                 "%d tokens)\n", (long long) pos0, T);
+    }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
     *(volatile uint32_t*) h_flagA_ = 0;
@@ -2309,6 +2436,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (sp_in_graph_) {   // STRATA_HEAD_SAMPLE=1: the graph sampled this window (stage_inputs), h_out_ holds the draws
+        spec_q_ = nullptr;
+        spec_nq_ = 0;
+    } else
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
@@ -3484,6 +3615,9 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
     const int T = fl_T_;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (sp_in_graph_) {
+        // STRATA_HEAD_SAMPLE=1: the graph sampled this window (stage_inputs): h_out_ holds the draws
+    } else
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
