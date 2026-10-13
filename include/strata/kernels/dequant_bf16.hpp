@@ -26,6 +26,11 @@ void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
 bool dequant_f16_ld(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, int64_t ld,
                     uint16_t* out, void* stream);
 
+/// STRATA_DQ8=1 (opt-in, the same bits): Q4_0, Q5_0, Q4_K, Q5_K, Q6_K and IQ4_XS with four threads per 32-value group
+/// and one 16-byte store per thread, as Q8_0 already runs.  `mode` 0 / 1 forces it off / on (the parity test),
+/// -1 gives it back to the variable.
+void dequant_set_piece8(int mode);
+
 /// The same into FP32 (tests and small tensors).
 void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, float* out, void* stream);
 

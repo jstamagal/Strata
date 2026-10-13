@@ -8,6 +8,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -199,6 +200,125 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
     for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
 }
 
+// STRATA_DQ8=1 (opt-in, the same bits): the Q8_0 kernel's layout for Q4_0, Q5_0, Q4_K, Q5_K, Q6_K and IQ4_XS - four
+// threads per 32-value group, 8 values each, so a wave writes 512 consecutive bytes of FP16 with one 16-byte store
+// per thread (a thread per group writes 2-byte values 64 bytes apart: a Q5_K / Q6_K 10240 x 2560 projection takes
+// 2.0 ms on a Radeon PRO V620, the GEMM it feeds 3.0 ms at 2048 tokens).  Every value is group32's expression.
+template <int TYPE> constexpr bool kPiece8 = TYPE == 2 || TYPE == 6 || TYPE == 12 || TYPE == 13 || TYPE == 14 || TYPE == 23;
+__device__ __forceinline__ uint64_t ld8(const uint8_t* p) {
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+}
+template <int TYPE, typename T>
+__device__ __forceinline__ void piece8(const uint8_t* row_blocks, int gi_in_row, int piece, T* v) {
+    const int l0 = 8 * piece;
+    if constexpr (TYPE == 2) {                                     // Q4_0
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 18;
+        const float d = h2f(b);
+        const uint64_t q = ld8(b + 2 + (l0 & 15));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int byte = (int) ((q >> (8 * k)) & 0xFF);
+            put(v, k, (float) ((piece < 2 ? (byte & 0x0F) : (byte >> 4)) - 8) * d);
+        }
+    } else if constexpr (TYPE == 6) {                              // Q5_0
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
+        const float d = h2f(b);
+        const uint32_t qh = (uint32_t) b[2] | ((uint32_t) b[3] << 8) | ((uint32_t) b[4] << 16) | ((uint32_t) b[5] << 24);
+        const uint64_t q = ld8(b + 6 + (l0 & 15));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int j = (l0 & 15) + k;
+            const int byte = (int) ((q >> (8 * k)) & 0xFF);
+            if (piece < 2) {
+                const int xh0 = ((qh >> j) << 4) & 0x10;
+                put(v, k, (float) (((byte & 0x0F) | xh0) - 16) * d);
+            } else {
+                const int xh1 = (qh >> (j + 12)) & 0x10;
+                put(v, k, (float) (((byte >> 4) | xh1) - 16) * d);
+            }
+        }
+    } else if constexpr (TYPE == 12) {                             // Q4_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 144;
+        const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+        const float d = h2f(b), dmin = h2f(b + 2);
+        int sc, m;
+        scale_min_k4(gi, b + 4, sc, m);
+        const float d1 = d * (float) sc, m1 = dmin * (float) m;
+        const uint64_t q = ld8(b + 16 + 32 * j64 + l0);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int byte = (int) ((q >> (8 * k)) & 0xFF);
+            put(v, k, d1 * (float) (hi ? (byte >> 4) : (byte & 0xF)) - m1);
+        }
+    } else if constexpr (TYPE == 13) {                             // Q5_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 176;
+        const int gi = gi_in_row % 8, j64 = gi / 2, hi = gi % 2;
+        const float d = h2f(b), dmin = h2f(b + 2);
+        int sc, m;
+        scale_min_k4(gi, b + 4, sc, m);
+        const float d1 = d * (float) sc, m1 = dmin * (float) m;
+        const uint64_t qh = ld8(b + 16 + l0);
+        const uint64_t ql = ld8(b + 48 + 32 * j64 + l0);
+        const int u = 1 << (2 * j64 + hi);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int lo = (int) ((ql >> (8 * k)) & 0xFF), h = (int) ((qh >> (8 * k)) & 0xFF);
+            const int nib = hi ? (lo >> 4) : (lo & 0xF);
+            put(v, k, d1 * (float) (nib + ((h & u) ? 16 : 0)) - m1);
+        }
+    } else if constexpr (TYPE == 14) {                             // Q6_K
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 210;
+        const int gi = gi_in_row % 8, n = gi / 4, qu = gi % 4;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + 8 * n;
+        const float d = h2f(b + 208);
+        const uint64_t ql = ld8(b + 64 * n + l0 + ((qu & 1) ? 32 : 0));
+        const uint64_t qh = ld8(b + 128 + 32 * n + l0);
+        const int is = piece / 2;
+        const float s = (float) sc[is + 2 * qu];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int lo = (int) ((ql >> (8 * k)) & 0xFF), h = (int) ((qh >> (8 * k)) & 0xFF);
+            const int q = (qu < 2 ? (lo & 0xF) : (lo >> 4)) | (((h >> (2 * qu)) & 3) << 4);
+            put(v, k, d * s * (float) (q - 32));
+        }
+    } else if constexpr (TYPE == 23) {                             // IQ4_XS
+        const uint8_t* b = row_blocks + (size_t) (gi_in_row / 8) * 136;
+        const int ib = gi_in_row % 8;
+        const float d = h2f(b);
+        const uint16_t scales_h = (uint16_t) (b[2] | (b[3] << 8));
+        const int ls = ((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+        const float dl = d * (float) (ls - 32);
+        const uint64_t q = ld8(b + 8 + 16 * ib + (l0 & 15));
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int byte = (int) ((q >> (8 * k)) & 0xFF);
+            put(v, k, dl * (float) kv_iq4nl[piece < 2 ? (byte & 0xf) : (byte >> 4)]);
+        }
+    }
+}
+template <int TYPE, typename T>
+__global__ void dequant_piece8_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
+                                      int64_t groups_per_row, int64_t ld, T* __restrict__ out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * groups_per_row * 4) return;
+    const int64_t g = i >> 2, r = g / groups_per_row, gi = g % groups_per_row;
+    const int piece = (int) (i & 3);
+    __align__(16) T v[8];
+    piece8<TYPE, T>(blocks + (row0 + r) * row_bytes, (int) gi, piece, v);
+    uint4* o = (uint4*) (out + r * ld + gi * 32 + 8 * piece);
+#pragma unroll
+    for (int k = 0; k < (int) (8 * sizeof(T) / 16); ++k) o[k] = ((const uint4*) v)[k];
+}
+std::atomic<int> g_dq8{-1};   // -1: STRATA_DQ8 decides; 0 / 1: forced (dequant_set_piece8, the parity test)
+bool dq8_on() {
+    const int f = g_dq8.load(std::memory_order_relaxed);
+    if (f >= 0) return f != 0;
+    static const bool env = [] { const char* e = std::getenv("STRATA_DQ8"); return e && e[0] == '1'; }();
+    return env;
+}
+
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
@@ -237,6 +357,26 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
+    if (dq8_on() && (reinterpret_cast<uintptr_t>(out) & 15) == 0 && (ld * (int64_t) sizeof(T)) % 16 == 0) {
+        const unsigned grid4 = (unsigned) ((4 * total + 255) / 256);
+        bool done = true;
+#define STRATA_DQ8(TY) dequant_piece8_kernel<TY, T><<<grid4, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
+        switch (type) {
+        case 2: STRATA_DQ8(2);
+        case 6: STRATA_DQ8(6);
+        case 12: STRATA_DQ8(12);
+        case 13: STRATA_DQ8(13);
+        case 14: STRATA_DQ8(14);
+        case 23: STRATA_DQ8(23);
+        default: done = false;
+        }
+#undef STRATA_DQ8
+        if (done) {
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+            return;
+        }
+    }
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
     switch (type) {
     case 2: STRATA_DQ(2);
@@ -257,6 +397,8 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 }
 
 }  // namespace
+
+void dequant_set_piece8(int mode) { g_dq8.store(mode < 0 ? -1 : (mode != 0 ? 1 : 0), std::memory_order_relaxed); }
 
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;
