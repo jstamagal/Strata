@@ -676,6 +676,71 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
     Not measured: other models, one card, windows wider than 5 tokens, a card where some experts are not in VRAM (the
     routing switches then do nothing), CUDA (`STRATA_HEAD_WIDE` and `STRATA_ROUTE_PLAN=2` are HIP kernels; the other
     two compile there but were not built).
+- **Decode: the dense projections one wavefront per row, and fewer launches per window (gfx1030, all opt-in).**
+  A verify window's dense projections (GDN qkv / gate / out, QSA q / k / v / out, the head) run on `native_mmvq`'s
+  kernels: a block of four wavefronts per two rows, partial sums through shared memory, a barrier. With
+  `STRATA_MMVQ_ROW=1` one wavefront does a row: each lane plays the default layout's four threads in turn and adds
+  their sums in the default order, so every output is bitwise the default kernel's (`hip_mmvq_row_parity`: 10 GGUF
+  types, 1-8 columns, 12 layouts, with and without `STRATA_TSUM`, 3,840 runs each way equal). One call on a V620, a
+  different one of 1.2 GB of weight copies every call so that the card's 128 MB third-level cache does not hold them
+  (six copies in rotation are read from that cache and flatter every kernel), microseconds, default -> row:
+
+  | matrix | 1 column | 2 | 3 | 4 | 6 |
+  |---|---|---|---|---|---|
+  | Q6_K 2560 -> 10240 | 48.8 -> 49.5 | 50.8 -> 50.2 | 53.0 -> 51.1 | 58.7 -> 55.1 | 88.7 -> 66.0 |
+  | Q5_K 2560 -> 10240 | 43.8 -> 42.1 | 48.8 -> 42.7 | 65.5 -> 46.0 | 86.1 -> 51.9 | 109.5 -> 66.1 |
+  | Q4_K 2560 -> 6144 | 26.8 -> 25.1 | 30.6 -> 25.7 | 37.8 -> 28.0 | 48.6 -> 30.4 | 63.6 -> 39.5 |
+  | IQ4_XS 2560 -> 6144 | 28.2 -> 27.0 | 29.9 -> 28.3 | 32.8 -> 29.4 | 35.3 -> 30.0 | 42.0 -> 33.1 |
+  | Q4_0 2560 -> 10240 | 37.5 -> 35.6 | 37.4 -> 35.9 | | 40.3 -> 36.8 | |
+  | Q6_K 2560 -> 248320 (head) | 978 -> 978 | 988 -> 988 | 1041 -> 1032 | 1206 -> 1092 | 2011 -> 1423 |
+
+  Not faster and left on the default kernels by the switch's table: Q8_0 6144 -> 2560 (40.2 -> 40.4 at 4 columns; it
+  reads at about 415 GB/s, the head at 430-530), Q4_0 6144 -> 2560, and matrices of a few hundred rows (Q6_K
+  2560 -> 512: 6.6 -> 7.4). At 1-3 columns the Q6_K matrices are at the card's memory speed either way; the gain is
+  where the default kernel is short of arithmetic (Q4_K / Q5_K, and everything from 4 columns up).
+  `STRATA_MMVQ_ROW=2` takes the kernel for every type and shape (not timed: Q3_K, Q5_0, IQ4_NL, Q2_0).
+
+  A dependent kernel costs about 2.4 us in a window graph whatever it does, so the other switches remove launches
+  from the chain, each bitwise: `STRATA_MMVQ_SET=1` runs the projections that read the same input as one launch (a GDN
+  layer's qkv and gate, a QSA layer's k, v and q; `hip_mmvq_row_parity` checks sets of 2 and 3 of six types);
+  `STRATA_NORM_ROPE=2` the fused RMSNorm + RoPE launch with the rotation written as the
+  unfused kernel writes it (`hip_norm_rope_parity`: bitwise on gfx1030; `=1`, the CUDA form, differs in the rotated
+  high half and changes the text). Existing switches measured in the same series: `STRATA_FUSE_CONVAB=1`,
+  `STRATA_DF_PLE=1`, `STRATA_HEAD_MIX_MULTI=1`, and `STRATA_ROUTE_PLAN=1` (above).
+
+  The series below was run on a tree without the head, routing and sampling switches above and before gfx103x had
+  its switches on by default; its `STRATA_ROUTE_PLAN=1` arm ran an earlier one-launch kernel of the same ids, weights
+  and plan words, not the one in this tree. Not measured again on this tree, and not with `STRATA_HEAD_WIDE=1`, which
+  takes the head away from the kernels `STRATA_MMVQ_ROW` replaces.
+
+  Decode on 2x Radeon PRO V620 (layer split 24, IQ3_S, every expert in VRAM, `iq3_s-stage13-q` with `--spec 3
+  --spec-min-p 0.7` and `STRATA_HC_WIDE=3 STRATA_GR_NORM_FAST=1 STRATA_TSUM=1` on in every arm; three fixed questions
+  of 400 new tokens greedy, the same three sampled with seed 7, one copy-heavy answer; pooled tok/s, one run an arm,
+  two runs of the first arm gave 116.2 and 116.3; the greedy and sampled texts are the same hashes in every arm):
+
+  | arm (each adds to the one above) | greedy | sampled | copy-heavy |
+  |---|---|---|---|
+  | without | 116.3 | 107.2 | 175.8 |
+  | `STRATA_MMVQ_ROW=1` | 117.6 | 108.4 | 185.2 |
+  | `STRATA_ROUTE_PLAN=1` | 118.1 | 108.8 | 186.0 |
+  | `STRATA_MMVQ_SET=1` | 119.5 | 110.1 | 187.4 |
+  | `STRATA_FUSE_CONVAB=1` | 120.1 | 110.6 | 188.1 |
+  | `STRATA_NORM_ROPE=2` | 121.0 | 111.2 | 189.2 |
+  | `STRATA_DF_PLE=1 STRATA_HEAD_MIX_MULTI=1` | 121.9 | 112.2 | 191.3 |
+
+  In place of the SET and CONVAB arms, `STRATA_DF_BRANCH=1` (the same projections on side streams) gave 120.0 /
+  110.3 / 189.0, and 120.3 with `STRATA_NORM_ROPE=2`: the two are alternatives, not a sum. `STRATA_LFUSE=1` on top of
+  the second arm: 118.2 (its launches are on the shared expert's own stream here). Tried and removed: the router's
+  BF16 projection one wavefront per row, bitwise equal but 8.6 -> 24.6 us a call and 118.1 -> 111.5 tok/s (a 2.6 MB
+  matrix wants more wavefronts in flight, not fewer). Swift Q4_0 (`q4_0-stage13-q`, the same
+  changes; its text and speed move from run to run with the adaptive tier, about 2 tok/s): one run each,
+  106.5 / 106.4 / 155.5 without, 104.6 / 106.0 / 159.3 with the first five switches, 109.5 / 109.5 / 159.3 with
+  `STRATA_FUSE_WAIT=1 STRATA_FUSE_HITS=1` as well: nothing that these runs resolve. With `--adapt-every 0 STRATA_IQ_MT_MIN=1`, so that two runs give
+  the same text: 96.9 / 93.4 / 145.1 -> 99.7 / 95.9 / 148.5 with the five switches, the greedy and sampled hashes
+  equal. Not measured: one card,
+  `--spec 5`, UD-Q4_K_XL and IQ3_XXS, long contexts, any card other than gfx1030 (the row kernel and the sets are
+  compiled for every wave32 AMD card but nothing here says they are faster elsewhere; `STRATA_NORM_ROPE=2` must pass
+  `hip_norm_rope_parity` on a card before it is used there).
 - **gfx1031** (RX 6700 XT, #524): setup knows it (the `gfx103X-all` wheels, unvalidated); its reporter runs it daily
   on one card. More reports: an RX 6700 XT 12 GB run as gfx1030 on ROCm 7.2.4 (#1027: IQ2_XS, decode 30-32 tok/s, prompt about 300 tok/s, 6 of 6
   needles), and an RX 6800M 12 GB on Windows with a self-built engine (#915, #1078: Q2_0, decode 9-27 tok/s, prompt 50-114 tok/s; the
