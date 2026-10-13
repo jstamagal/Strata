@@ -1,9 +1,11 @@
 // src/kernels/fused_gr_bench.cpp - fused_gr_read_multi: the AMD fast kernels (STRATA_GR_FAST) against the old
 // ones, bit for bit on every output (lo, rs, inject, mixed, the in-place R), and each one's time.
 //
-//     build/fused_gr_bench [iters] [T min] [T max] [cold sets]
+//     build/fused_gr_bench [iters] [T min] [T max] [cold sets] [wide mask]
 // With "cold sets" > 1 it also times the read with the weights rotating over that many copies (a layer's weights are
 // cold in the engine) and prints the per-stage split (norm / down / up) from the GPU stamps.
+// With a "wide mask" (1 = down, 2 = up, 3 = both) the "fast" column is STRATA_HC_WIDE's kernels instead, and both
+// columns also write the q8_1 image of `mixed` (STRATA_QFUSE), which is compared too.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -31,6 +33,7 @@ int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int cold_sets = argc > 4 ? std::atoi(argv[4]) : 0;
+    const int wide = argc > 5 ? std::atoi(argv[5]) & 3 : 0;
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -44,6 +47,16 @@ int main(int argc, char** argv) {
     for (auto& x : wi) x = bf16(0.02f * nd(rng));
     float *dR, *dbo, *dinj, *dwn, *dxn, *dlo, *drs, *dio, *dmix;
     uint16_t *dwd, *dwu, *dwi;
+    const size_t q8_row = (size_t) (N / 32) * 36;   // a token's q8_1 image of `mixed`
+    uint8_t* dq8 = nullptr;
+    unsigned* dq8c = nullptr;
+    cudaMalloc((void**) &dq8, (size_t) TM * q8_row);
+    cudaMalloc((void**) &dq8c, (size_t) (N / 32) * sizeof(unsigned));
+    cudaMemset(dq8c, 0, (size_t) (N / 32) * sizeof(unsigned));
+    auto set_variant = [&](int f) {
+        K::fused_gr_set_fast(f);
+        if (wide) K::fused_gr_set_wide(f ? wide : 0);
+    };
     cudaMalloc((void**) &dR, R.size() * 4);
     cudaMalloc((void**) &dbo, bo.size() * 4);
     cudaMalloc((void**) &dinj, inj.size() * 4);
@@ -78,6 +91,7 @@ int main(int argc, char** argv) {
                     a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = inject ? dwi : nullptr;
                     a[t].lo = dlo + (size_t) t * LR; a[t].rs = drs + (size_t) t * HC;
                     a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
+                    if (wide) { a[t].q8_mixed = dq8 + (size_t) t * q8_row; a[t].q8_cnt = dq8c; }
                 }
                 std::vector<float> out[2];
                 for (int f = 0; f < 2; ++f) {
@@ -86,23 +100,25 @@ int main(int argc, char** argv) {
                     cudaMemset(drs, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
-                    K::fused_gr_set_fast(f);
+                    cudaMemset(dq8, 0xff, (size_t) TM * q8_row);
+                    set_variant(f);
                     K::fused_gr_read_multi(a, T, dxn, s);
                     cudaStreamSynchronize(s);
                     auto& o = out[f];
-                    o.resize((size_t) TM * (D + LR + HC + HC + N));
+                    o.resize((size_t) TM * (D + LR + HC + HC + N) + (size_t) TM * q8_row / 4);
                     float* p = o.data();
                     cudaMemcpy(p, dR, (size_t) TM * D * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * D;
                     cudaMemcpy(p, dlo, (size_t) TM * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * LR;
                     cudaMemcpy(p, drs, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
                     cudaMemcpy(p, dio, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
-                    cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * N;
+                    cudaMemcpy(p, dq8, (size_t) TM * q8_row, cudaMemcpyDeviceToHost);
                 }
                 const bool same = std::memcmp(out[0].data(), out[1].data(), out[0].size() * 4) == 0;
                 double us[2] = {1e30, 1e30};
                 for (int round = 0; round < 3; ++round)
                     for (int f = 0; f < 2; ++f) {
-                        K::fused_gr_set_fast(f);
+                        set_variant(f);
                         for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
                         cudaEventRecord(e0, s);
                         for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
@@ -133,7 +149,7 @@ int main(int argc, char** argv) {
         std::vector<unsigned long long> hst((size_t) iters * 4);
         std::vector<K::FusedGrArgs> as((size_t) cold_sets * 8);
         for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 2; ++f) {
-            K::fused_gr_set_fast(f);
+            set_variant(f);
             for (int c = 0; c < cold_sets; ++c)
                 for (int t = 0; t < T; ++t) {
                     K::FusedGrArgs& a = as[(size_t) c * 8 + t];
@@ -143,6 +159,7 @@ int main(int argc, char** argv) {
                     a.w_norm = cwn[c]; a.w_down = cwd[c]; a.w_up = cwu[c]; a.w_inject = cwi[c];
                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
+                    if (wide) { a.q8_mixed = dq8 + (size_t) t * q8_row; a.q8_cnt = dq8c; }
                 }
             for (int rep = 0; rep < 2; ++rep) {
                 for (int i = 0; i < iters; ++i) {
