@@ -24,5 +24,6 @@ the pull request as posted.
 | [#1455](https://github.com/Niko1221/Strata/pull/1455) | @W1nge | serve reuses the encoding of an unchanged prompt prefix (`STRATA_PROMPT_REUSE=1`) | `d30706d5` | none |
 | [#1536](https://github.com/Niko1221/Strata/pull/1536) | @zsariboga | serve reuses a reply's own token ids on the next turn | `7a5d70c7` | the drained-tokens part is also behind `STRATA_PROMPT_REUSE=1` |
 | [#1525](https://github.com/Niko1221/Strata/pull/1525) | @sergqwer | Prefill: swiglu + q8_1 in one kernel, MoE combine + hyper-connection write fused | `7150d25e` | ported to HIP; both opt-in; the dequant part is left out |
+| [#2253](https://github.com/Niko1221/Strata/pull/2253) | @alanthinker | serve: the conversation cache's RAM gate releases the heap after each eviction and stops evicting when it cannot help | `d9465021` | as written; not measured here |
 
 Commit ids are those of the branch at the time this file was written; `git log --grep 'PR #'` finds them after a rebase.
