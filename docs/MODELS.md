@@ -145,6 +145,34 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 **Unsloth's 6-bit UD-Q6_K_XL** (experimental, not in setup's menu) trades more bytes per expert for less precision
 loss against the same files: 169.2 GB together, its PLE table Q8_0 (read by the engine since 0.1.38). High RAM
 machines run it without a RAM budget. Manual workflow: [UD-Q6_K_XL](UNSLOTH_Q6.md).
+
+### Community builds
+
+Three more entries in setup's menu are files other people made from the same models. Each has one size. They have run
+on one PC so far (2x Radeon PRO V620, Ryzen 9 9950X, 92 GB of RAM, the AMD engine); their speed and quality are not
+measured against the files above, and they are never the recommendation.
+
+| Build | `--family` / `--model` | Download | Experts | Notes |
+| --- | --- | --- | --- | --- |
+| bartowski's Swift 1.5 Q4_0 ([files](https://huggingface.co/bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF)) | `--family bartowski-swift --model Q4_0` | 100.6 GB, three files | 68.3 GB | llama.cpp's plain 4-bit; the pack is made with `--compat-bf16` (194 small tensors rounded to BF16, as for Unsloth's files); Swift Open License 1.0 |
+| SC117's abliterated IQ3_S ([files](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) | `--family sc117-abl --model IQ3_S` | 83.9 GB, two files | 50.3 GB | the original model with its refusals removed by SC117; file 2 is the original's (the same SHA-256), so it is not downloaded twice |
+| SC117's abliterated Swift 1.5 IQ3_XXS ([files](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) | `--family sc117-swift-abl --model IQ3_XXS` | 75.8 GB, two files | 42.9 GB | Swift 1.5 with its refusals removed by SC117; Swift Open License 1.0 |
+
+Download sizes are the Hub's and the experts' sizes the pack tool's totals. Setup checks every file against its
+SHA-256 at the pinned revision. "Abliterated" is the author's word for a model changed to decline far fewer requests;
+what else that changes in its answers is not measured here. SC117's image encoder has the original's file name but is
+another file, so setup keeps it in a `sc117` folder of its own; both SC117 builds share it.
+
+Q4_0 keeps all 68.3 GB of its experts in RAM. Setup asks for 80 GB of RAM: an estimate (the experts plus the room
+IQ3_S has beside its own), not a measurement. With less, setup picks the low-RAM mode as for any size; that mode, and
+NVIDIA cards, are untested with this file.
+
+```
+START-HERE.bat --setup --family bartowski-swift --model Q4_0
+START-HERE.bat --setup --family sc117-abl --model IQ3_S
+START-HERE.bat --setup --family sc117-swift-abl --model IQ3_XXS
+```
+
 ### OrcaRouter Uncensored IQ3_XXS
 
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](ORCA.md). It needs an

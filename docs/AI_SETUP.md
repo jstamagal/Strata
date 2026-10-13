@@ -78,6 +78,21 @@ By the PC's RAM (ask the user whether they mainly want it for code - then the Co
 `--family swift` (Swift 1.5, a fine-tune that thinks shorter; sizes Q2_0, IQ2_XS, IQ3_XXS) is the alternative to
 `qwen`. With `--yes` and no `--model`, setup picks the recommended size for the RAM itself. More: [MODELS.md](MODELS.md).
 
+Community builds (files other people made from the same models; never the recommendation, each has one size). They
+have run on one PC so far (2x Radeon PRO V620, Ryzen 9 9950X, 92 GB of RAM, the AMD engine) and their speed and
+quality are not measured against the files above. Offer one only when the user asks for it by name; "abliterated"
+means the model declines far fewer requests, so say that before installing one:
+
+| Build | `--family` / `--model` | Download | Experts | Notes |
+| --- | --- | --- | --- | --- |
+| bartowski's Swift 1.5 Q4_0 ([files](https://huggingface.co/bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF)) | `--family bartowski-swift --model Q4_0` | 100.6 GB, three files | 68.3 GB | llama.cpp's plain 4-bit; the pack is made with `--compat-bf16` (194 small tensors rounded to BF16, as for Unsloth's files); Swift Open License 1.0 |
+| SC117's abliterated IQ3_S ([files](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) | `--family sc117-abl --model IQ3_S` | 83.9 GB, two files | 50.3 GB | the original model with its refusals removed by SC117; file 2 is the original's (the same SHA-256), so it is not downloaded twice |
+| SC117's abliterated Swift 1.5 IQ3_XXS ([files](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)) | `--family sc117-swift-abl --model IQ3_XXS` | 75.8 GB, two files | 42.9 GB | Swift 1.5 with its refusals removed by SC117; Swift Open License 1.0 |
+
+The sizes are the Hub's, the experts' the pack tool's totals. Q4_0's 80 GB of RAM is an estimate (its experts plus
+the room IQ3_S has beside its own), not a measurement: with less, setup picks the low-RAM mode, which is untested
+with this file, as are NVIDIA cards. More: [MODELS.md](MODELS.md#community-builds).
+
 ## 4. Run setup without questions
 
 From the Strata folder (Windows: in `cmd`, or `cmd /c START-HERE.bat ...` from PowerShell):
@@ -92,8 +107,8 @@ The flags (all of them: `START-HERE.bat --help`):
 | Flag | Meaning |
 | --- | --- |
 | `--yes` | take the recommended answer to every question (no prompts) |
-| `--family qwen\|swift\|coder\|unsloth` | the model version |
-| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
+| `--family qwen\|swift\|coder\|unsloth\|bartowski-swift\|sc117-abl\|sc117-swift-abl` | the model version (the last three: community builds, section 3) |
+| `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL\|Q4_0` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL, bartowski's Swift 1.5 Q4_0) |
 | `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
 | `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |

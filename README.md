@@ -149,6 +149,11 @@ sizes are faster. Larger sizes are a bit smarter.
   model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
   not in the installer's menu.
+- **[Community builds](docs/MODELS.md#community-builds):** files other people made from the same models, each run
+  on one PC so far (2x Radeon PRO V620, 92 GB of RAM) and not measured against the others:
+  - **bartowski's Swift 1.5 Q4_0** (`--family bartowski-swift`): llama.cpp's plain 4-bit, a 101 GB download.
+  - **SC117's abliterated IQ3_S** (`--family sc117-abl`): the original model with its refusals removed, 84 GB.
+  - **SC117's abliterated Swift 1.5 IQ3_XXS** (`--family sc117-swift-abl`): the same for Swift 1.5, 76 GB.
 
 Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
 `SETUP.bat` (Linux: `./setup.sh --setup`).
