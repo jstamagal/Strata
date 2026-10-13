@@ -33,6 +33,31 @@ int main() {
     CHECK(arch_default_env("gfx11510").empty());   // not a prefix match
     CHECK(arch_default_env("").empty());
     CHECK(arch_default_env(nullptr).empty());
+    // gfx103x (RDNA2): the proven half and the experimental half, each with its own off switch
+    unset("STRATA_GFX103X_DEFAULTS");
+    unset("STRATA_GFX103X_EXPERIMENTAL");
+    for (const char* a : {"gfx1030", "gfx1031", "gfx1032", "gfx1030:sramecc-:xnack-"}) {
+        const auto t = arch_default_env(a);
+        CHECK(t.size() >= 25);
+        bool f16 = false, routed = false;
+        for (const auto& kv : t) {
+            CHECK(kv.first.rfind("STRATA_", 0) == 0);
+            f16 = f16 || kv.first == "STRATA_HIP_PROMPT_F16";
+            routed = routed || kv.first == "STRATA_PF_STREAM_ROUTED";
+        }
+        CHECK(f16 && routed);
+    }
+    CHECK(arch_default_env("gfx10300").empty());   // not a prefix match
+    put("STRATA_GFX103X_EXPERIMENTAL", "0");
+    {
+        const auto t = arch_default_env("gfx1030");
+        CHECK(t.size() >= 15);
+        for (const auto& kv : t) CHECK(kv.first != "STRATA_HIP_PROMPT_F16" && kv.first != "STRATA_PA_DOT4");
+    }
+    unset("STRATA_GFX103X_EXPERIMENTAL");
+    put("STRATA_GFX103X_DEFAULTS", "0");
+    CHECK(arch_default_env("gfx1030").empty());
+    unset("STRATA_GFX103X_DEFAULTS");
     // gfx1151, plain and with its feature suffix: the table, and no bit-changing switch in it
     for (const char* a : {"gfx1151", "gfx1151:sramecc-:xnack-"}) {
         const auto t = arch_default_env(a);

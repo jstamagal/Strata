@@ -2,6 +2,20 @@
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) for AMD's RDNA2 cards** (Radeon RX 6000 series,
+> Radeon PRO V620: gfx1030 / gfx1031 / gfx1032). RDNA2 has no matrix cores, so upstream's fast paths for NVIDIA and for
+> newer AMD cards do not reach it. Here the hot kernels are rewritten for what the chip has, and the engine turns them
+> on by itself when it finds a gfx103x card: proven ones and, labelled as such, experimental ones.
+>
+> Measured on 2x Radeon PRO V620 (32 GB each), Ryzen 9 9950X, 92 GB RAM, Linux, against upstream with its two known
+> RDNA2 switches set: prompts **1.7x to 2.2x** as fast (IQ3_S 16K-token prompt 1,472 -> 2,487 tokens/s; Q4_0 1,150 ->
+> about 2,440), answers **about 1.5x** (IQ3_S 78 -> 121 tokens/s), copy-heavy answers such as file edits **2.6x**
+> (123 -> 323 tokens/s).
+>
+> What is on by default, what is experimental, the settings and every number with how it was measured:
+> **[docs/RDNA2.md](docs/RDNA2.md)**. Upstream pull requests carried here: [docs/UPSTREAM_PRS.md](docs/UPSTREAM_PRS.md).
+> Everything below this note is upstream's README.
+
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 

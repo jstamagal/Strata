@@ -9,6 +9,13 @@
 
 namespace strata::core {
 
+namespace {
+bool arch_is_gfx103x(const char* gcn) {
+    return strata::kernels::gfx_arch_is(gcn, "gfx1030") || strata::kernels::gfx_arch_is(gcn, "gfx1031") ||
+           strata::kernels::gfx_arch_is(gcn, "gfx1032");
+}
+}  // namespace
+
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch) {
     std::vector<std::pair<std::string, std::string>> t;
     if (strata::kernels::gfx_arch_is_gfx12(gcn_arch)) {
@@ -27,6 +34,54 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
             {"STRATA_GDN_NOY", "1"},
             {"STRATA_CVEC_FUSE", "1"},
         };
+        return t;
+    }
+    if (arch_is_gfx103x(gcn_arch)) {
+        // gfx1030 / gfx1031 / gfx1032 (RDNA2), measured on 2x Radeon PRO V620 (docs/AMD_HIP.md, docs/RDNA2.md).
+        // STRATA_GFX103X_DEFAULTS=0 turns the whole table off; STRATA_GFX103X_EXPERIMENTAL=0 only its second half.
+        const char* off103 = std::getenv("STRATA_GFX103X_DEFAULTS");
+        if (off103 != nullptr && off103[0] == '0') return t;
+        // PROVEN: bitwise equal to the default kernels (parity tests) or the same residuals / the same answers end to end.
+        t = {
+            // prompt
+            {"STRATA_GDN_HEAD", "1"},              // the barrier-free GDN recurrence: bitwise; recurrence 1.76x
+            {"STRATA_GDN_PP", "2"},
+            {"STRATA_GDN_NOY", "1"},
+            {"STRATA_PF_Q4_WIDE", "1"},            // Q4_0 / Q4_1 prompt experts on tiles without LDS reads: bitwise; Q4_0 prompts +15-18%
+            {"STRATA_DQ8", "1"},                   // dense dequant with 16-byte stores: bitwise; with HC_GATED16 prompts +6%
+            {"STRATA_HC_GATED16", "1"},            // the hyper-connection mix reads the up projection's halves: bitwise
+            {"STRATA_PF_STREAM_ROUTED", "1"},      // only the routed streamed experts are copied: same residuals; Q4_0 prompts +40%
+            {"STRATA_PF_DIRECT", "1"},             // experts read where they lie (llama.cpp patch 0003): same residuals
+            {"STRATA_PF_NL", "1"},                 // IQ4_NL down products on the no-LDS tile: MMQ's bits
+            {"STRATA_PF_Q51", "1"},                // Q5_1 down products on the same tile: MMQ's bits
+            {"STRATA_MMQ_RESIDENT_SORT_NE", "1"},  // same bits
+            // decode
+            {"STRATA_SH_STREAM", "1"},             // the shared expert on its own stream
+            {"STRATA_QFUSE", "1"},                 // activation q8_1 images written by their producers
+            {"STRATA_HC_WIDE", "3"},               // hyper-connection reads one block per row: bitwise; with the next two decode +7%
+            {"STRATA_GR_NORM_FAST", "1"},          // same answers
+            {"STRATA_TSUM", "1"},                  // several warp sums as one transposed butterfly: same answers
+            {"STRATA_EXP_MODE", "8"},              // routed experts on the LDS layouts: bitwise; decode +3-4%
+            {"STRATA_HEAD_WIDE", "1"},             // head + greedy pick + non-finite check in one launch: bitwise
+            {"STRATA_ROUTE_PLAN", "1"},            // router top-10 and the all-resident plan in one launch: bitwise
+            {"STRATA_HEAD_SAMPLE", "1"},           // sampled draws as nodes of the window graph: bitwise
+            {"STRATA_PL_LOOKUP_STREAK", "12"},     // a copied stretch stays on lookup windows: same answers; copy-heavy text +70%
+        };
+        const char* exp103 = std::getenv("STRATA_GFX103X_EXPERIMENTAL");
+        if (exp103 != nullptr && exp103[0] == '0') return t;
+        // EXPERIMENTAL: on, and measured faster on that box, but either rounding-level (not bitwise) or checked on fewer
+        // models and contexts.  More testing is wanted on each (docs/RDNA2.md says what).
+        const std::pair<const char*, const char*> exp[] = {
+            {"STRATA_HIP_PROMPT_F16", "1"},        // the prompt's 16-bit GEMMs FP16 in and out: not bit-identical; prompts +73-112%
+            {"STRATA_PA_DOT4", "1"},               // int8-KV prompt attention on v_dot4_i32_i8: FP32-level error, not bitwise; prompts +4%
+            {"STRATA_EXPERT_DOWN_L", "1"},         // the 4-row down kernel behind any gate/up format: bitwise in the lab, one end-to-end run
+            {"STRATA_KV_PREFETCH", "1"},           // the next streamed layer's K/V staged ahead: prompts +5% at depth
+            {"STRATA_SPLIT_MTP_BATCH", "1"},       // the draft layer's pass after a prompt chunk batched (layer split)
+            {"STRATA_TOPK_STREAM", "1"},           // the wide top-k kernel on HIP: same ids in the parity test
+            {"STRATA_TOPK_AUTO", "1"},             // decode top-k picks its kernel by the real depth: same ids in the parity test
+            {"STRATA_KV_PF_RESIDENT", "1"},        // the prompt path reads streamed K/V from the VRAM slots: bit-exact on six requests
+        };
+        for (const auto& kv : exp) t.emplace_back(kv.first, kv.second);
         return t;
     }
     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;
@@ -73,6 +128,13 @@ std::vector<std::string> apply_arch_defaults(const char* gcn_arch) {
     }
     if (!set.empty()) {
         const bool g12 = strata::kernels::gfx_arch_is_gfx12(gcn_arch);
+        const bool g103 = arch_is_gfx103x(gcn_arch);
+        if (g103)
+            std::fprintf(stderr, "strata: gfx103x (RDNA2): %zu speed switches on by default, proven and experimental "
+                                 "(STRATA_GFX103X_DEFAULTS=0 turns all off, STRATA_GFX103X_EXPERIMENTAL=0 the experimental "
+                                 "ones: PROMPT_F16 PA_DOT4 EXPERT_DOWN_L KV_PREFETCH SPLIT_MTP_BATCH TOPK_STREAM TOPK_AUTO "
+                                 "KV_PF_RESIDENT; a switch you set is kept): ", set.size());
+        else
         std::fprintf(stderr, "strata: %s: %zu exact speed switches on by default (%s=0 turns "
                              "them off; a switch you set is kept): ",
                      g12 ? "gfx12 (RDNA4)" : "gfx1151 (Strix Halo)", set.size(),
