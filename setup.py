@@ -3876,7 +3876,16 @@ def write_config(path: Path, cfg: dict):
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
-SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP"})   # the "env" entries setup writes
+# RDNA2 (gfx103x): the engine's opt-in kernels and switches as measured on 2x Radeon PRO V620 (docs/AMD_HIP.md).  Each is
+# off in the engine by default; setup turns them on for these cards.  All were checked against the default kernels (bitwise,
+# or FP16 rounding level for the prompt's FP16 route); none was measured on one card alone.
+GFX103X_ENV = {"STRATA_HIP_PROMPT_F16": "1", "STRATA_SH_STREAM": "1", "STRATA_QFUSE": "1",
+               "STRATA_PF_Q4_WIDE": "1", "STRATA_PA_DOT4": "1", "STRATA_GDN_HEAD": "1", "STRATA_GDN_PP": "2", "STRATA_GDN_NOY": "1",
+               "STRATA_HC_WIDE": "3", "STRATA_GR_NORM_FAST": "1", "STRATA_TSUM": "1", "STRATA_DQ8": "1", "STRATA_HC_GATED16": "1",
+               "STRATA_PF_STREAM_ROUTED": "1", "STRATA_PF_DIRECT": "1", "STRATA_PF_NL": "1", "STRATA_PF_Q51": "1",
+               "STRATA_MMQ_RESIDENT_SORT_NE": "1", "STRATA_HEAD_WIDE": "1", "STRATA_ROUTE_PLAN": "1", "STRATA_HEAD_SAMPLE": "1",
+               "STRATA_PL_LOOKUP_STREAK": "12"}
+SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP"} | set(GFX103X_ENV))   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
@@ -5755,6 +5764,9 @@ def main() -> int:
         if rocblas_tables:
             cfg.setdefault("env", {})["STRATA_ROCBLAS_TUNING"] = str(ROOT / "tools" / "hip")
             ok(f"rocBLAS tuning tables for {gpu['arch']}: {', '.join(rocblas_tables)} (the engine takes the one of its rocBLAS build)")
+        if str(gpu["arch"]).startswith("gfx103"):
+            cfg.setdefault("env", {}).update(GFX103X_ENV)
+            ok(f"{gpu['arch']}: {len(GFX103X_ENV)} RDNA2 engine switches written to the config's \"env\" (docs/AMD_HIP.md)")
         if resident:   # ROCm: large page-locked host allocations can fail or be slow for the CPU; keep the copy pageable
             cfg.setdefault("env", {})["STRATA_RESIDENT_PIN"] = "0"
     if gpu["count"] > 1 or a.gpu is not None:
