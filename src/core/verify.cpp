@@ -155,6 +155,8 @@ inline bool g_qfuse_hc() {
     return false;
 #endif
 }
+// STRATA_ROUTE_PLAN=1 (opt-in): the router's top-10 and the all-resident plan as one graph node (route_plan)
+inline bool g_route_plan() { static const bool on = [] { const char* v = std::getenv("STRATA_ROUTE_PLAN"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 // STRATA_MMVQ_SET=1 (opt-in): a layer's projections of one input in one launch (native_mmvq_set)
 inline bool g_mmvq_set() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_SET"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
@@ -1467,6 +1469,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
+        bool route_planned = false;
+        static const bool route_prior_off = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v == nullptr || std::atof(v) <= 0.0; }();
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
@@ -1476,6 +1480,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!sg_ready)
                 bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
                                           NE, n, cs);
+                // STRATA_ROUTE_PLAN=1 (opt-in): the top-10 and the all-resident plan in one launch (the same words)
+                route_planned = g_route_plan() && ar_on() && route_prior_off && route_resident_cfg().margin <= 0.0f &&
+                                route_plan_supported(n, (int) NE, (int) K);
+                if (route_planned)
+                    route_plan(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, hits_.d_res + l * g.n_expert,
+                               (int) g.n_expert, hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, cs, m_plan_err_);
+                else
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
 #if defined(STRATA_HIP_GFX906)
@@ -1507,6 +1519,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (ar_on()) {
+            if (!route_planned)
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
