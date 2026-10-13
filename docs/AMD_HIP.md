@@ -491,6 +491,37 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   kernel and is unchanged (IQ3_S: 1,400 / 1,830 tok/s without, 1,406 / 1,833 with). Not measured: one card, a
   gfx1031 / gfx1032 card, Windows.
 
+- **The dense projections around the rocBLAS GEMMs (`STRATA_DQ8=1`, `STRATA_HC_GATED16=1`, `STRATA_HC_DOWNINJ=1`,
+  opt-in):** `STRATA_DENSE_TIMING=1` (debug) prints, per prompt, the GPU time of every dense projection by step and
+  shape. On 2x Radeon PRO V620 with the IQ3_S pack at 2048-token chunks the large products already run at rocBLAS's
+  best (N 10240 K 2560 at 35 TFLOP/s, N 2560 K 6144 at 31, N 6144 K 2560 at 34, N 10240 K 320 at 32), so a kernel of
+  our own for them had nothing to win; the time was around them. (1) `STRATA_DQ8=1`: the dequantization of Q4_0, Q5_0,
+  Q4_K, Q5_K, Q6_K and IQ4_XS weights with four threads per 32-value group and one 16-byte store each, as Q8_0
+  already ran. The same bits (`hip_dq8_parity`: every type into FP16, BF16, FP32 and padded FP16). A 10240 x 2560
+  Q6_K weight: 1.42 -> 0.08 ms, which was 2.0 ms in front of a 3.0 ms GEMM in every GDN layer of every chunk; the
+  other types 0.11 -> 0.06-0.07 ms. (2) `STRATA_HC_GATED16=1`: the hyper-connection up projection's T x 10240 FP16
+  output is not widened in place; the mix widens each value as it reads it. The same bits. (3)
+  `STRATA_HC_DOWNINJ=1`: the down (N 320) and inject (N 4) projections, which read the same T x 10240 image, as one
+  N 324 product; it takes what N 320 takes, and the N 4 product cost 0.19 ms on its own. Another rocBLAS kernel may
+  run, so the sums can round differently: against an FP64 reference of the same FP16 operands both sequences are at
+  rel L2 3.1e-4 for silu(down) and 2.0e-4 for inject (`hip_hc_read_parity`, which also checks (2) bit for bit). The
+  table gained rows for N 324 K 10240, and for the GDN alpha / beta projections as the engine calls them (N 48 into
+  rows of 96: `ldy` 96 had no row, so they ran the default kernel, 0.123 -> 0.056 ms at 2048 tokens). End to end, a
+  3K-word prompt's final residuals (`STRATA_PREFILL_DUMP_R`, the CPU share off) are the same file with (1) + (2);
+  with (3) and the new rows they differ by rel L2 3.5e-2, where the new rows alone give 4.2e-2 and running without
+  the table 3.3e-2 (any change of a GEMM's summation order moves them that far), and the answer's text is the same.
+  Measured on 2x Radeon PRO V620 (gfx1030, 32 GB each, Ryzen 9 9950X, 92 GB, Linux, ROCm in `/opt/rocm`, rocBLAS
+  5.8.0), this branch, `--layer-split 24`, the `iq3_s-stage13-q.json` settings plus `STRATA_PA_DOT4=1
+  STRATA_GDN_HEAD=1 STRATA_GDN_PP=2 STRATA_GDN_NOY=1` in both arms, `tools/strata_bench.py --temperature 1.0 --top-p
+  0.95 --top-k 20 --runs 1`, the same night, two runs each: a 4K prompt 1,497-1,499 -> 1,600-1,602 tok/s, a 16K
+  prompt 1,963-1,964 -> 2,094-2,099 tok/s; with (1) + (2) only, one run: 1,588 / 2,082. Of the first stage's
+  8.62 s of marked GPU time on the 16K prompt (8.04 s with all three), dequantization fell 386 -> 53 ms, the hyper-connection GEMMs + widening
+  + mix 812 -> 660 ms. bartowski's Swift Q4_0 (its dense weights are Q4_0 and Q8_0, which were not slow), one run
+  each: 1,136 -> 1,157 and 1,468 -> 1,489 tok/s. Decode does not use these paths. Not measured: one card, another
+  gfx103x card, Windows, K-quant expert packs; tried and dropped as measured no gain: one GEMM for the GDN qkv + gate
+  projections (both already at 34-35 TFLOP/s), a retune of N 640 / N 512 at 2048 tokens (best 0.283 against the
+  default's 0.285 ms; 0.201 against 0.218).
+
 - **QSA block scores on the FP32 tiled scorer (`STRATA_SELECT_SIMT=1`, opt-in, as on CUDA below sm_80):** without
   matrix cores the prompt path's QSA selection scores every (query, KV block) pair on the warp kernel, the one prompt
   term that grows with the context. The switch runs the FP32 tiled scorer instead (FP32 in another summation order:
