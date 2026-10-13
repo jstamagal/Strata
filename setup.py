@@ -1712,10 +1712,39 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
+def patch_llama_cpp(llama: Path) -> None:
+    """Apply third_party/llama.cpp-patches/*.patch to the unpacked llama.cpp, each once.  The engine's HIP kernels build
+    against the patched source (0003: STRATA_PF_DIRECT=1 reads i-quant and K-quant experts in place only with it).  A patch
+    that is already in the tree is left alone, so a tree patched by hand is fine."""
+    patches = sorted((ROOT / "third_party" / "llama.cpp-patches").glob("*.patch"))
+    mark = llama / ".strata-patches"
+    done = set(mark.read_text().split()) if mark.exists() else set()
+    for p in patches:
+        if p.name in done:
+            continue
+        git = shutil.which("git")
+        tool = [git, "apply"] if git else ([shutil.which("patch"), "-p1", "-i"] if shutil.which("patch") else None)
+        if tool is None:
+            warn(f"neither git nor patch found: {p.name} is NOT applied to third_party/llama.cpp (apply it by hand)")
+            continue
+        if git and subprocess.run([git, "apply", "--reverse", "--check", str(p)], cwd=llama, capture_output=True).returncode == 0:
+            done.add(p.name)                       # already in the tree
+            continue
+        r = subprocess.run(tool + [str(p)], cwd=llama, capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"{p.name} does not apply to third_party/llama.cpp: {(r.stderr or r.stdout).strip()[:300]}")
+            continue
+        ok(f"llama.cpp: applied {p.name}")
+        done.add(p.name)
+    if patches:
+        mark.write_text("\n".join(sorted(done)) + "\n")
+
+
 def get_llama_cpp():
     """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+        patch_llama_cpp(llama)
         return llama
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
@@ -1750,6 +1779,7 @@ def get_llama_cpp():
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
+    patch_llama_cpp(llama)
     return llama
 
 
@@ -3884,7 +3914,8 @@ GFX103X_ENV = {"STRATA_HIP_PROMPT_F16": "1", "STRATA_SH_STREAM": "1", "STRATA_QF
                "STRATA_HC_WIDE": "3", "STRATA_GR_NORM_FAST": "1", "STRATA_TSUM": "1", "STRATA_DQ8": "1", "STRATA_HC_GATED16": "1",
                "STRATA_PF_STREAM_ROUTED": "1", "STRATA_PF_DIRECT": "1", "STRATA_PF_NL": "1", "STRATA_PF_Q51": "1",
                "STRATA_MMQ_RESIDENT_SORT_NE": "1", "STRATA_HEAD_WIDE": "1", "STRATA_ROUTE_PLAN": "1", "STRATA_HEAD_SAMPLE": "1",
-               "STRATA_PL_LOOKUP_STREAK": "12"}
+               "STRATA_PL_LOOKUP_STREAK": "12", "STRATA_EXP_MODE": "8", "STRATA_KV_PREFETCH": "1", "STRATA_SPLIT_MTP_BATCH": "1",
+               "STRATA_TOPK_STREAM": "1", "STRATA_TOPK_AUTO": "1", "STRATA_KV_PF_RESIDENT": "1"}
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP"} | set(GFX103X_ENV))   # the "env" entries setup writes
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
