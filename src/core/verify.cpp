@@ -6,6 +6,8 @@
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
 #if defined(_WIN32)
+#include <initializer_list>
+#include <utility>
 #include <intrin.h>
 #endif
 
@@ -153,6 +155,8 @@ inline bool g_qfuse_hc() {
     return false;
 #endif
 }
+// STRATA_MMVQ_SET=1 (opt-in): a layer's projections of one input in one launch (native_mmvq_set)
+inline bool g_mmvq_set() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_SET"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -1095,6 +1099,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
         };
+        // STRATA_MMVQ_SET=1 (opt-in, wave32 HIP): the projections that read the layer's input together in one launch
+        // (GDN: qkv and gate; QSA: k, v and q); not under the stage profiler, whose stamps sit between them, and not
+        // the ones STRATA_DF_BRANCH has put on a side stream
+        bool set_done = false;
+        auto mm_set = [&](std::initializer_list<std::pair<const WeightRef*, std::pair<float*, int>>> ms) {
+            if (!g_mmvq_set() || prof_on_) return false;
+            strata::kernels::NativeMmvqItem it[3];
+            int k = 0;
+            for (const auto& m : ms) {
+                if (k == 3 || (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(m.first->native_type, n, m.second.second)))
+                    return false;
+                it[k++] = {m.first->native_type, m.first->native_data, m.second.first, m.second.second};
+            }
+            return strata::kernels::native_mmvq_set(it, k, xq_, (int) N, n, cs);
+        };
         try {
             if (!is_qsa_layer(g, l)) {
                 // ======================= GDN =======================
@@ -1125,6 +1144,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_;
+                set_done = !br && mm_set({{wqkv, {qkv + (size_t) tb * C, (int) C}}, {wg, {z_ + (size_t) tb * ZV, (int) ZV}}});
+                if (!set_done)
                 mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
@@ -1157,6 +1178,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
+                if (!set_done)
                 mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 }
@@ -1243,8 +1265,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
                 stamp(l, 7, grp);
+                // (with STRATA_DF_BRANCH's query branch the q projection is already on its side stream: k and v only)
+                const bool set_kv = qbr && mm_set({{wk, {kcur_ + tb * NKV * HD, (int) (NKV * HD)}},
+                                                   {wv, {vcur_ + tb * NKV * HD, (int) (NKV * HD)}}});
+                set_done = !qbr && mm_set({{wk, {kcur_ + tb * NKV * HD, (int) (NKV * HD)}},
+                                           {wv, {vcur_ + tb * NKV * HD, (int) (NKV * HD)}},
+                                           {wq, {qfull_ + tb * NH * 2 * HD, (int) (NH * 2 * HD)}}});
+                if (!set_done && !set_kv) {
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1326,6 +1356,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
                 } else {
+                if (!set_done)
                 mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
                 if (qb) {
                     if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
