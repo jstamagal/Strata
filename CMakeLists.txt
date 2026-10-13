@@ -1547,6 +1547,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_q4_parity COMMAND hip_prefill_q4_parity)
     set_tests_properties(hip_prefill_q4_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     list(APPEND _strata_hip_tests hip_prefill_q4_parity)
+    # the experts' two products for every weight type of the gfx103x packs: an FP64 check, an output hash and a
+    # timing in G MAC/s (a tool for an A/B of an expert kernel; not a ctest)
+    add_executable(hip_prefill_expert_bench tests/hip/prefill_expert_bench.cpp)
+    target_include_directories(hip_prefill_expert_bench PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_expert_bench PRIVATE strata_mmq ggml-base strata_hip_runtime)
     if(STRATA_MMQ_KQUANTS)
       # llama.cpp's Q4_K / Q5_K / Q6_K MMQ kernels through mmq::quantize / mmq::Context::run (the experts' gate+up
       # shape, a dense projection, uneven experts) against an FP64 reference of the same arithmetic; prints a hash

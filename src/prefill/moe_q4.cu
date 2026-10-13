@@ -204,6 +204,266 @@ __global__ void __launch_bounds__(THREADS) q4_product_kernel(Args a) {
     }
 }
 
+// ---- the wide tiles (STRATA_PF_Q4_WIDE=1, opt-in) ------------------------------------------------------------------
+// The same arithmetic, the same output bits, about 3.5x (Q4_0) and 2x (Q4_1) the 64 x 32 tile's speed on a V620
+// (hip_prefill_q4_parity prints both).  What the 64 x 32 tile spends its time on is LDS: every 4 dots wait for a
+// 16-byte ds_read of activations, and a compute unit serves those far slower than its lanes issue dots (measured: 9
+// reads per 32 dots run at 9.6 T MAC/s, 9 per 64 at 18.0, none at 22-23).  So:
+//
+//   Q4_0 (q4_sload_kernel): no LDS and no barrier at all.  One workgroup is 256 weight rows x 32 token rows; thread t
+//   owns weight row t and all 32 token rows.  The tile's token rows are the same for every thread, so their address
+//   is uniform and the compiler reads a row's chunk with three scalar loads (s_load_dwordx16 x 2 + x4, 144 bytes into
+//   SGPRs); the dots take the activation word straight from a scalar register.  The zero point goes into the
+//   weights' bytes, q - 8 as a signed byte (-8..7), once per chunk and thread, so the int8 dot is sum (q - 8) a
+//   itself - the same integer as sum q a - 8 sum a, with no per-row sums to keep.  A weight block is read by one
+//   thread (the 64 x 32 tile reads it four times) and serves 32 token rows instead of 8.
+//
+//   Q4_1 (q4_blk_kernel): its m_w * sum a term needs each (token row, block)'s integer sum once per workgroup, which
+//   is what LDS is for; so it keeps the staged activations and halves the reads per dot instead: 128 threads, each
+//   with two weight rows in registers against every activation word it reads.
+//
+// A token row past the expert's last one is skipped (a uniform branch), so a tile with 3 rows does 3 rows of work.
+constexpr int WI = 256;                // weight rows a workgroup
+
+// R weight rows a thread (256 / R threads a workgroup), TJ token rows a workgroup, KS 32-value blocks a step.
+// IDENT: the 64 x 32 tile's float order (a chunk's 4 blocks summed first; needs KS == 4).
+template <bool Q41, int R, int KS, int TJ, bool IDENT>
+__global__ void __launch_bounds__(WI / R) q4_blk_kernel(Args a) {
+    static_assert(!IDENT || KS == 4, "the chunk's partial sum needs the whole chunk in one step");
+    constexpr int NT = WI / R;
+    __shared__ __align__(16) uint32_t act[TJ * CHUNK_WORDS];
+    __shared__ int asum[TJ * 4];                               // Q4_1 only
+    constexpr int BLOCK_BYTES = Q41 ? 20 : 18;
+    constexpr int QS_OFF = Q41 ? 4 : 2;
+    constexpr int ROW16 = CHUNK_WORDS / 4;                     // a row's chunk in 16-byte pieces: 9
+    const int t = threadIdx.x;
+    const int e = blockIdx.z;
+    const int r0 = a.bounds[e], r1 = a.bounds[e + 1];
+    const int j0 = r0 + (int) blockIdx.y * TJ;
+    if (j0 >= r1) return;                                      // the same for the whole workgroup
+    const int nj = min(TJ, r1 - j0);
+    const int i0 = (int) blockIdx.x * WI + t;                  // this thread's rows: i0 + r * NT
+    const int chunks = a.w_cols / CHUNK;
+    const size_t x_row = (size_t) chunks * CHUNK_BYTES;
+    const size_t w_row = (size_t) (a.w_cols / 32) * BLOCK_BYTES;
+    const uint8_t* we = a.w + (size_t) e * a.expert_bytes;
+    const uint8_t* xt = a.xq + (size_t) j0 * x_row;
+
+    float acc[R * TJ];
+#pragma unroll
+    for (int q = 0; q < R * TJ; ++q) acc[q] = 0.0f;
+
+    for (int c = 0; c < chunks; ++c) {
+        for (int n = t; n < nj * ROW16; n += NT) {
+            const int j = n / ROW16, k = n - j * ROW16;
+            uint4 v;
+            __builtin_memcpy(&v, xt + (size_t) j * x_row + (size_t) c * CHUNK_BYTES + (size_t) k * 16, 16);
+            *(uint4*) (act + n * 4) = v;
+        }
+        __syncthreads();
+        if constexpr (Q41) {
+            for (int n = t; n < TJ * 4; n += NT) {
+                const uint32_t* q = act + (n >> 2) * CHUNK_WORDS + 4 + (n & 3) * 8;
+                int s = 0;
+                if ((n >> 2) < nj) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) s = __dp4a((int) q[k], 0x01010101, s);
+                }
+                asum[n] = s;
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int ks = 0; ks < 4; ks += KS) {
+            uint32_t w[R][KS * 8];
+            float dw[R][KS], mw[R][KS];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int i = i0 + r * NT;
+                const uint8_t* wr = we + (size_t) (i < a.w_rows ? i : 0) * w_row;
+#pragma unroll
+                for (int b = 0; b < KS; ++b) {
+                    const uint8_t* blk = wr + (size_t) (c * 4 + ks + b) * BLOCK_BYTES;
+                    dw[r][b] = load_f16(blk);
+                    mw[r][b] = Q41 ? load_f16(blk + 2) : 0.0f;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t x = load32(blk + QS_OFF + 4 * k);
+                        uint32_t lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
+                        if constexpr (!Q41) {                  // q - 8 in each byte, as a signed byte (no borrow crosses)
+                            lo = ((lo | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+                            hi = ((hi | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+                        }
+                        w[r][b * 8 + k] = lo;                  // weights 4k .. 4k+3
+                        w[r][b * 8 + 4 + k] = hi;              // weights 16+4k .. 16+4k+3
+                    }
+                }
+            }
+#pragma unroll
+            for (int jj = 0; jj < TJ; ++jj) {
+                if (jj < nj) {
+                    const uint32_t* aj = act + jj * CHUNK_WORDS;
+                    float part[R];
+#pragma unroll
+                    for (int r = 0; r < R; ++r) part[r] = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < KS; ++b) {
+                        uint32_t av[8];
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) av[k] = aj[4 + (ks + b) * 8 + k];
+                        const float dx = bits_float(aj[ks + b]);
+                        const float sa = Q41 ? (float) asum[jj * 4 + ks + b] : 0.0f;
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            int s = 0;
+#pragma unroll
+                            for (int k = 0; k < 8; ++k) s = __dp4a((int) w[r][b * 8 + k], (int) av[k], s);
+                            float v;
+                            if constexpr (Q41) v = dx * (dw[r][b] * (float) s + mw[r][b] * sa);
+                            else v = (dw[r][b] * dx) * (float) s;
+                            if constexpr (IDENT) part[r] += v;
+                            else acc[r * TJ + jj] += v;
+                        }
+                    }
+                    if constexpr (IDENT) {
+#pragma unroll
+                        for (int r = 0; r < R; ++r) acc[r * TJ + jj] += part[r];
+                    }
+                }
+            }
+        }
+        __syncthreads();                                       // every read of this chunk is done before the next is staged
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int i = i0 + r * NT;
+        if (i < a.w_rows) {
+#pragma unroll
+            for (int jj = 0; jj < TJ; ++jj) {
+                if (jj < nj) {
+                    const int64_t row = a.ids != nullptr ? (int64_t) a.ids[j0 + jj] : (int64_t) (j0 + jj);
+                    a.dst[row * a.ld_dst + i] = acc[r * TJ + jj];
+                }
+            }
+        }
+    }
+}
+
+// R weight rows a thread (256 / R threads a workgroup), TJ token rows a workgroup; the activations by scalar loads
+// (`xq` 4-byte aligned)
+template <bool Q41, int R, int TJ>
+__global__ void __launch_bounds__(WI / R) q4_sload_kernel(Args a) {
+    constexpr int NT = WI / R;
+    constexpr int BLOCK_BYTES = Q41 ? 20 : 18;
+    constexpr int QS_OFF = Q41 ? 4 : 2;
+    const int t = threadIdx.x;
+    const int e = blockIdx.z;
+    const int r0 = a.bounds[e], r1 = a.bounds[e + 1];
+    const int j0 = r0 + (int) blockIdx.y * TJ;
+    if (j0 >= r1) return;
+    const int nj = min(TJ, r1 - j0);
+    const int i0 = (int) blockIdx.x * WI + t;                  // this thread's rows: i0 + r * NT
+    const int chunks = a.w_cols / CHUNK;
+    const int x_row_w = chunks * CHUNK_WORDS;                  // a token row in words
+    const size_t w_row = (size_t) (a.w_cols / 32) * BLOCK_BYTES;
+    const uint8_t* we = a.w + (size_t) e * a.expert_bytes;
+    const uint32_t* xc = (const uint32_t*) a.xq + (size_t) j0 * (size_t) x_row_w;   // the tile's first row, chunk c
+    float acc[R * TJ];
+#pragma unroll
+    for (int q = 0; q < R * TJ; ++q) acc[q] = 0.0f;
+    for (int c = 0; c < chunks; ++c, xc += CHUNK_WORDS) {
+        uint32_t w[R][32];
+        float dw[R][4], mw[R][4];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int i = i0 + r * NT;
+            const uint8_t* wr = we + (size_t) (i < a.w_rows ? i : 0) * w_row;
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const uint8_t* blk = wr + (size_t) (c * 4 + b) * BLOCK_BYTES;
+                dw[r][b] = load_f16(blk);
+                mw[r][b] = Q41 ? load_f16(blk + 2) : 0.0f;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t x = load32(blk + QS_OFF + 4 * k);
+                    uint32_t lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
+                    if constexpr (!Q41) {                      // q - 8 in each byte, as a signed byte (no borrow crosses)
+                        lo = ((lo | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+                        hi = ((hi | 0x80808080u) - 0x08080808u) ^ 0x80808080u;
+                    }
+                    w[r][b * 8 + k] = lo;                      // weights 4k .. 4k+3
+                    w[r][b * 8 + 4 + k] = hi;                  // weights 16+4k .. 16+4k+3
+                }
+            }
+        }
+        const uint32_t* aj = xc;
+#pragma unroll
+        for (int jj = 0; jj < TJ; ++jj, aj += x_row_w) {
+            if (jj < nj) {
+                float part[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) part[r] = 0.0f;
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const float dx = bits_float(aj[b]);
+                    float sa = 0.0f;
+                    if constexpr (Q41) {                       // the row's integer sum over the block
+                        int si = 0;
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) si = __dp4a(0x01010101, (int) aj[4 + b * 8 + k], si);
+                        sa = (float) si;
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        int s = 0;
+#pragma unroll
+                        for (int k = 0; k < 8; ++k) s = __dp4a((int) w[r][b * 8 + k], (int) aj[4 + b * 8 + k], s);
+                        if constexpr (Q41) part[r] += dx * (dw[r][b] * (float) s + mw[r][b] * sa);
+                        else part[r] += (dw[r][b] * dx) * (float) s;
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < R; ++r) acc[r * TJ + jj] += part[r];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int i = i0 + r * NT;
+        if (i < a.w_rows) {
+#pragma unroll
+            for (int jj = 0; jj < TJ; ++jj) {
+                if (jj < nj) {
+                    const int64_t row = a.ids != nullptr ? (int64_t) a.ids[j0 + jj] : (int64_t) (j0 + jj);
+                    a.dst[row * a.ld_dst + i] = acc[r * TJ + jj];
+                }
+            }
+        }
+    }
+}
+
+template <bool Q41, int R, int TJ>
+void launch_sload(const Args& a, const mmq::Product& p, cudaStream_t s) {
+    const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
+    q4_sload_kernel<Q41, R, TJ><<<g, WI / R, 0, s>>>(a);
+}
+
+template <bool Q41, int R, int KS, int TJ, bool IDENT>
+void launch_blk(const Args& a, const mmq::Product& p, cudaStream_t s) {
+    const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
+    q4_blk_kernel<Q41, R, KS, TJ, IDENT><<<g, WI / R, 0, s>>>(a);
+}
+
+int g_variant = -1;                    // set_variant's (tests); -1: the environment decides
+
+int variant() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_PF_Q4_WIDE");
+        return v != nullptr && v[0] == '1' ? 1 : 0;
+    }();
+    return g_variant >= 0 ? g_variant : env;
+}
+
 bool device_is_gfx103x() {
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
@@ -219,6 +479,8 @@ bool device_is_gfx103x() {
 }  // namespace
 
 bool covers(int t) { return t == kTypeQ4_0 || t == kTypeQ4_1; }
+
+void set_variant(int v) { g_variant = v; }
 
 bool enabled() {
     // STRATA_PF_Q4=0 turns it off (those experts take the FP16 path again); unset or anything else: on, on gfx103x
@@ -265,8 +527,21 @@ void run(const mmq::Product& p, void* stream) {
     a.expert_bytes = (uint64_t) p.expert_bytes;
     a.w_rows = (int) p.w_rows;
     a.w_cols = (int) p.w_cols;
-    const dim3 grid((unsigned) ((p.w_rows + TI - 1) / TI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
     const cudaStream_t s = (cudaStream_t) stream;
+    // STRATA_PF_Q4_WIDE=1 (the scalar loads need the activations word-aligned: they are, the quantizer writes words)
+    if (variant() == 1 && ((uintptr_t) p.xq & 3) == 0) {
+        static bool said = false;
+        if (!said && g_variant < 0) {
+            said = true;
+            std::fprintf(stderr, "strata: prompt kernels: Q4_0 / Q4_1 experts on the 256 x 32 tiles (STRATA_PF_Q4_WIDE=1: "
+                                 "the same output bits)\n");
+        }
+        if (p.type == kTypeQ4_1) launch_blk<true, 2, 4, 32, true>(a, p, s);
+        else launch_sload<false, 1, 32>(a, p, s);
+        ck(cudaGetLastError(), "product (wide)");
+        return;
+    }
+    const dim3 grid((unsigned) ((p.w_rows + TI - 1) / TI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
     if (p.type == kTypeQ4_1) q4_product_kernel<true><<<grid, THREADS, 0, s>>>(a);
     else q4_product_kernel<false><<<grid, THREADS, 0, s>>>(a);
     ck(cudaGetLastError(), "product");
