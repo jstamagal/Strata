@@ -68,6 +68,10 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    # the community builds (FAMILIES below): bartowski's Swift 1.5 quantizations, SC117's abliterated GSQ-RCO files
+    "bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF": "0a1c38334d2482040df430d35f9c22e4c898b492",    # 2026-10-13
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "eec4e10a2c29b440a2ae85591fa11569ce752963",  # 2026-10-13
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "2b89cf3f7f2d9cb84275439e2c0cda83db15d32f",  # 2026-10-13
 }
 
 
@@ -204,11 +208,14 @@ MODELS = {
     "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0, "families": ("qwen",)},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
                "arena_gb": 35.5},
+    # (also SC117's abliterated Swift 1.5 build: 75.8 GB of files and 42.9 GB of experts too, FAMILIES below)
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "sc117-swift-abl")},
     # matches the full BF16 model on the published benchmarks; Swift 1.5 got an IQ3_S tier of its own (#1651)
+    # (also SC117's abliterated build: 50.3 GB of experts too; its two files are 83.9 GB, 0.3 GB more than these)
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117-abl")},
     # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
@@ -230,6 +237,14 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
+    # A community build: bartowski's Q4_0 of Swift 1.5 (llama.cpp's plain 4-bit; Q4_0 gate/up experts, Q4_1 downs in
+    # six layers), three shards.  download_gb: the Hub's sizes (100,599,253,536 bytes); arena_gb: the pack tool's
+    # total (68,262,297,600 bytes of experts).  ram_gb is an ESTIMATE: IQ3_S's room beside its experts (11.7 GB),
+    # not measured - it has run on one PC only (2x Radeon PRO V620, 92 GB of RAM, AMD/HIP), with all of its experts
+    # in RAM; the low-RAM mode and NVIDIA cards are untested with this file
+    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
+                      "RAM so far", "download_gb": 100.6,
+             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -251,6 +266,24 @@ UNSLOTH_IQ4_XS_SHARDS = {
         (49835229856, "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"),
     "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
         (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
+}
+# The community builds' shards at their pinned revisions (sizes and SHA-256: the Hub's LFS pointers, read 2026-10-13)
+COMMUNITY_SHARDS = {
+    "ukisai_Swift-Qwen3.8-Flash-Next-Q4_0-00001-of-00003.gguf":
+        (39853468416, "339ed32c3a0262af32a57aa8ba126aa443d17a311facfe9ae7508dc622930286"),
+    "ukisai_Swift-Qwen3.8-Flash-Next-Q4_0-00002-of-00003.gguf":
+        (39647284192, "d93055caa27e6e4d4c49b67ae7e9e4f40fc76455331651aaaee741ba3cf6e209"),
+    "ukisai_Swift-Qwen3.8-Flash-Next-Q4_0-00003-of-00003.gguf":
+        (21098500928, "ed9edb8b637e956b6327538d2ef1df654a75499d928485effcf84104cd5efa5e"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf":
+        (55063448064, "40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296c"),
+    # the same bytes as ISTA-DASLab's shard 2 (the PLE table: the same size and SHA-256 on the Hub)
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf":
+        (39771812960, "83f75959e296a6380c98d5b6e906a0cde175077ffac2419fd56e7e15969d55dd"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf":
+        (36056143040, "aa59f45eaa3c02069016903862a5f8d73adfdb7ca97f9cab25f7494e9ac4b1a3"),
 }
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
@@ -297,6 +330,46 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+    # Community builds, last in the menu: files other people made from the same models, each run on one PC so far
+    # (2x Radeon PRO V620, Ryzen 9 9950X, 92 GB of RAM, the AMD engine) and not measured against the files above.
+    # Repositories, file names, sizes and SHA-256 read from the Hub on 2026-10-13.  Not checked: whether ModelScope
+    # hosts them (--source modelscope).
+    # bartowski's Q4_0 of Swift 1.5: three shards in a folder per size; its small projections are Q4_0 where the
+    # engine reads BF16, so the pack takes --compat-bf16 like Unsloth's (the pack on that PC was made this way)
+    "bartowski-swift": {"title": "Swift 1.5 (bartowski)", "by": "a community build: bartowski's llama.cpp "
+                                                                "quantization of Swift 1.5",
+                        "about": "Q4_0: a 101 GB download with 68 GB of experts; run with 92 GB of RAM so far",
+                        "hf": hf("bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF") + "ukisai_Swift-Qwen3.8-Flash-Next-{q}/",
+                        "file": "ukisai_Swift-Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "shards": 3,
+                        "tag": "bartowski-swift-",
+                        "mmproj_hf": hf("bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF"),
+                        "mmproj": "mmproj-ukisai_Swift-Qwen3.8-Flash-Next-f16.gguf", "name": "swift-qwen3.8-bartowski",
+                        "license": "Swift Open License 1.0: https://huggingface.co/bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF",
+                        "pack_args": ["--compat-bf16"], "sha256": COMMUNITY_SHARDS},
+    # SC117's abliterated (refusal direction removed, by its author) GSQ-RCO files of the original model: IQ3_S, the
+    # layout of ISTA-DASLab's (shard 2 is the same file).  Its image encoder has the original's file name but other
+    # bytes, so it is kept in a folder of its own ("mmproj_dir") and neither replaces the other
+    "sc117-abl": {"title": "Qwen3.8-Flash-Next abliterated (SC117)", "by": "a community build: SC117's abliterated "
+                                                                           "GSQ-RCO files",
+                  "about": "the original model with its refusals removed by SC117; IQ3_S only",
+                  "hf": hf("SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF") + "{q}/",
+                  "file": "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf", "tag": "sc117-abl-",
+                  "mmproj_hf": hf("SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"),
+                  "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mmproj_dir": "sc117", "name": "qwen3.8-abl",
+                  "sha256": COMMUNITY_SHARDS},
+    # SC117's abliterated Swift 1.5: IQ3_XXS (the repository keeps IQ3_S beside the folders, not in one: not offered).
+    # Its image encoder is the same file as sc117-abl's (the same SHA-256), so the two share one copy
+    "sc117-swift-abl": {"title": "Swift 1.5 abliterated (SC117)", "by": "a community build: SC117's abliterated "
+                                                                        "GSQ-RCO files of Swift 1.5",
+                        "about": "Swift 1.5 with its refusals removed by SC117; IQ3_XXS only",
+                        "hf": hf("SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF") + "{q}/",
+                        "file": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf",
+                        "tag": "sc117-swift-abl-",
+                        "mmproj_hf": hf("SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"),
+                        "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "mmproj_dir": "sc117",
+                        "name": "swift-1.5-abliterated",
+                        "license": "Swift Open License 1.0: https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
+                        "sha256": COMMUNITY_SHARDS},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -1579,7 +1652,8 @@ GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|B
 SUPPORTED_GGUFS = ("Strata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
                    "1.5's; the Coder's IQ1_M) and Unsloth's UD-Q4_K_XL and UD-IQ4_XS only: other GGUFs (Unsloth's "
                    "UD-IQ3_XXS or "
-                   "UD-Q2_K_XL, K-quants) cannot be used")
+                   "UD-Q2_K_XL, K-quants) cannot be used, except the community builds in setup's menu (bartowski's "
+                   "Swift 1.5 Q4_0, SC117's abliterated IQ3_S and Swift 1.5 IQ3_XXS)")
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -4857,7 +4931,8 @@ def sycl_setup(argv) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5; "
+                    "bartowski-swift, sc117-abl, sc117-swift-abl = community builds")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -5465,7 +5540,7 @@ def main() -> int:
         ok("experimental speed projection: " + ("ON (experimental)" if esp else "off"))
     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off"
-             if family == "swift" else f"the experimental speed projection is not tested with {model}: left off")
+             if "Swift" in fam["title"] else f"the experimental speed projection is not tested with {model}: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
         [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
@@ -5565,8 +5640,10 @@ def main() -> int:
                 ok(f"{s.name} already downloaded")
                 continue
             # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
+            # (SC117's abliterated build of the original ships the same bytes too: the same SHA-256 on the Hub)
             other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf") if done(p)]
-            if family in ("qwen", "coder") and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
+            if family in ("qwen", "coder", "sc117-abl") and s.name.endswith("00002-of-00002.gguf") and other \
+                    and not s.exists():
                 try:
                     os.link(other[0], s)
                     mark(s)
@@ -5576,13 +5653,15 @@ def main() -> int:
                     pass
             download(fam["hf"].format(q=model) + s.name, s)
     check_shards(shards)
-    for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
+    for s in shards:                                   # the Unsloth files and the community builds: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
             verify_sha256(s, *fam["sha256"][s.name])
     ok("model files present")
-    mmproj = Path(a.models_dir) / fam["mmproj"]
+    # ("mmproj_dir": an encoder named like another family's but with other bytes is kept in a folder of its own)
+    mmproj_rel = "/".join(x for x in (fam.get("mmproj_dir"), fam["mmproj"]) if x)
+    mmproj = Path(a.models_dir) / mmproj_rel
     if not mmproj.exists():
-        mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
+        mmproj = find_in(roots, f"models/{mmproj_rel}") or mmproj
     if vision != "none":
         if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
             mmproj = Path(a.gguf_dir) / fam["mmproj"]

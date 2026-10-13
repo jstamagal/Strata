@@ -53,9 +53,10 @@ FALLBACK_MODELS = {
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
                "arena_gb": 35.5},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "sc117-swift-abl")},
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117-abl")},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but most experts come from the "
@@ -66,6 +67,9 @@ FALLBACK_MODELS = {
                            "less than ~80 GB of RAM part of its experts are read from the SSD",
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "vision": True},
+    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
+                      "RAM so far", "download_gb": 100.6,
+             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -77,6 +81,16 @@ FALLBACK_FAMILIES = {
                                                                   "of RAM part of its experts are read from the SSD "
                                                                   "(UD-Q4_K_XL, 111 GB: experimental)",
                 "tag": "unsloth-", "vision": False},
+    # the community builds (setup.py's FAMILIES says where each comes from)
+    "bartowski-swift": {"title": "Swift 1.5 (bartowski)", "about": "Q4_0: a 101 GB download with 68 GB of experts; "
+                                                                   "run with 92 GB of RAM so far",
+                        "tag": "bartowski-swift-"},
+    "sc117-abl": {"title": "Qwen3.8-Flash-Next abliterated (SC117)", "about": "the original model with its refusals "
+                                                                              "removed by SC117; IQ3_S only",
+                  "tag": "sc117-abl-"},
+    "sc117-swift-abl": {"title": "Swift 1.5 abliterated (SC117)", "about": "Swift 1.5 with its refusals removed by "
+                                                                           "SC117; IQ3_XXS only",
+                        "tag": "sc117-swift-abl-"},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -943,7 +957,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
          "annotations": ro},
         {"name": "strata_models", "title": "Strata models",
          "description": "The models and sizes Strata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
-                        "Swift 1.5, coder = the Coder, unsloth = Unsloth's ~4-bit), with download size, RAM needed, "
+                        "Swift 1.5, coder = the Coder, unsloth = Unsloth's ~4-bit; bartowski-swift, sc117-abl and "
+                        "sc117-swift-abl = community builds), with download size, RAM needed, "
                         "whether each fits this PC, which are installed, the context lengths, and the recommendation. "
                         "Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
@@ -961,7 +976,10 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                         "description": "qwen = Qwen3.8-Flash-Next (the original), swift = Swift 1.5 (thinks "
                                        "shorter), coder = the Coder (half the experts, ~32 GB RAM, for code), "
                                        "unsloth = Unsloth's ~4-bit (UD-IQ4_XS; UD-Q4_K_XL is "
-                                       "experimental), part of the experts read from the SSD"},
+                                       "experimental), part of the experts read from the SSD; "
+                                       "bartowski-swift = bartowski's Swift 1.5 Q4_0, sc117-abl and "
+                                       "sc117-swift-abl = SC117's abliterated IQ3_S and Swift 1.5 IQ3_XXS "
+                                       "(community builds)"},
              "model": {"type": "string", "enum": list(models),
                        "description": "the size (quantization): see strata_models"},
              "context": {"type": "integer", "enum": contexts,
