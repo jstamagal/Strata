@@ -649,6 +649,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_dq8_parity PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_dq8_parity COMMAND hip_dq8_parity)
     list(APPEND _strata_hip_tests hip_dq8_parity)
+    # STRATA_HC_GATED16 / STRATA_HC_DOWNINJ: the FP16 prompt path's hyper-connection read against the default
+    # sequence (bit for bit / against FP64), with timings; exit 77 off the FP16 prompt path
+    add_executable(hip_hc_read_parity tests/hip/hc_read_parity.cpp)
+    target_link_libraries(hip_hc_read_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_hc_read_parity COMMAND hip_hc_read_parity)
+    set_tests_properties(hip_hc_read_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_hc_read_parity)
     add_executable(hip_q2_zero tests/hip/q2_zero.cpp)
     target_link_libraries(hip_q2_zero PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME hip_q2_zero COMMAND hip_q2_zero)

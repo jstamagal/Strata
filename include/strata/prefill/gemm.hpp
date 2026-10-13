@@ -31,6 +31,12 @@ public:
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               float beta = 0.0f, int64_t ldx = 0);
 
+    /// STRATA_HC_DOWNINJ: two BF16 weights over the same K as one product on the FP16 path - Y[T, N1 + N2] (row stride
+    /// ldy >= N1 + N2) = X . [W1; W2]^T, W1's N1 outputs first.  False (nothing launched) off the FP16 path or when the
+    /// two weights do not fit the scratch together; the caller then runs the two products.
+    bool bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* Y, int64_t T,
+                   int64_t K, int64_t ldy);
+
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).
@@ -51,6 +57,12 @@ public:
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
+    /// STRATA_HC_GATED16: the next bf16() on the FP16 path leaves its output as the GEMM wrote it - FP16 at the start
+    /// of each FP32 row of Y (row t's N halves at Y + t * ldy) - and does not widen it, for a reader that takes the
+    /// halves itself (gr_mix_r).  kept_f16() says whether that call did so (not off the FP16 path, nor when the weight
+    /// went through the scratch in row slices); the request never outlives one bf16() call.
+    void keep_f16_next() { keep_f16_ = true; }
+    bool kept_f16() const { return kept_f16_; }
 
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
@@ -77,6 +89,7 @@ private:
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
     void* dense_timer_ = nullptr;     // STRATA_DENSE_TIMING
     bool f16_io_ = false;
+    bool keep_f16_ = false, kept_f16_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed
     /// algorithm (ALGO2) survives that state, but is markedly slower for the wide shapes, so only the shapes that
@@ -95,7 +108,8 @@ private:
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
-    void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+    void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                     bool keep_f16 = false);
 };
 
 /// HIP on gfx103x (RDNA2), for the current device: rocBLAS's tuned GEMMs there are FP16 in -> FP16 out only (FP16 or

@@ -2740,8 +2740,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     hcd = true;
                 }
+                // STRATA_HC_DOWNINJ=1 (opt-in, HIP FP16 prompt path; FP16-rounding-level differences): the down and inject
+                // projections, which read the same T x 10240 image, as one product with the weights stacked (N 324).
+                // On a Radeon PRO V620 the N 324 product takes what N 320 takes (0.72 ms at 2048 tokens) and the N 4
+                // one 0.19 ms more.  The output goes through `gated` (free until the up projection writes it).
+                static const bool hc_downinj = [] { const char* e = std::getenv("STRATA_HC_DOWNINJ"); return e && e[0] == '1'; }();
+                bool downinj = false;
+                if (hc_downinj && m.f16_io && !hcd && !hdown && ldx == D && !m.xn16_lo && !m.lo16_lo &&
+                    wd->q8_scale == nullptr && wi->q8_scale == nullptr && wd->kind == core::WeightKind::Bf16InF32 &&
+                    wi->kind == core::WeightKind::Bf16InF32 && wd->data && wi->data && wd->ne0 == D && wd->ne1 == LR &&
+                    wi->ne0 == D && wi->ne1 == HC) {
+                    downinj = m.gemm.bf16_pair(m.xn16, (const uint16_t*) wd->data, LR, (const uint16_t*) wi->data, HC,
+                                               m.gated, T, D, LR + HC);
+                    if (downinj) gr_silu_inj(m.gated, LR + HC, m.lo16, m.inj, T, m.cs);
+                }
+                if (!downinj) {
                 if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                }
                 m.gemm.tmark("hc silu");
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= pf_switch_min_t() && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
@@ -2770,14 +2786,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
                 }
+                // STRATA_HC_GATED16=1 (opt-in, HIP FP16 prompt path, the same bits): the up projection's output stays
+                // FP16 and gr_mix_r widens it as it reads - T x 10240 values are not widened in place and read back
+                static const bool hc_gated16 = [] { const char* e = std::getenv("STRATA_HC_GATED16"); return e && e[0] == '1'; }();
+                const bool want_g16 = hc_gated16 && !upmixed && !gr_unfused() && !m.lo16_lo && wu->q8_scale == nullptr;
+                if (want_g16) m.gemm.keep_f16_next();
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs)) return false;
+                const bool g16 = want_g16 && m.gemm.kept_f16();
+                if (!hcd && !downinj && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs)) return false;
                 if (upmixed) {
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
-                             m.mixed_bf_lo);
+                             m.mixed_bf_lo, g16);
                 }
                 m.gemm.tmark("hc mix");
 

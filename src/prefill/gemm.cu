@@ -811,6 +811,9 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx) {
+    const bool want_f16 = keep_f16_;
+    keep_f16_ = false;
+    kept_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
@@ -835,7 +838,9 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
             tmark("other");
             bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W + r0 * K, (__half*) scratch_, n * K);
             tmark("w bf16->f16", T, n, K);
-            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy);
+            // one product only (a slice's halves start at its own columns); STRATA_DBG_NAN counts in the widening
+            kept_f16_ = want_f16 && n == N && std::getenv("STRATA_DBG_NAN") == nullptr;
+            f16_inplace(X, scratch_, Y + r0, T, n, K, ldy, kept_f16_);
         }
         return;
     }
@@ -913,6 +918,23 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
+}
+
+bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* Y,
+                     int64_t T, int64_t K, int64_t ldy) {
+#if defined(__HIPCC__)
+    const int64_t N = N1 + N2;
+    if (!f16_io_ || T <= 0 || N1 <= 0 || N2 <= 0 || ldy < N || N * K > scratch_elems_) return false;
+    tmark("other");
+    bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(W1, (__half*) scratch_, N1 * K);
+    bf16_to_f16_rows<<<64, 256, 0, (cudaStream_t) stream_>>>(W2, (__half*) scratch_ + N1 * K, N2 * K);
+    tmark("w bf16->f16", T, N, K);
+    f16_inplace(X, scratch_, Y, T, N, K, ldy);
+    return true;
+#else
+    (void) X; (void) W1; (void) N1; (void) W2; (void) N2; (void) Y; (void) T; (void) K; (void) ldy;
+    return false;
+#endif
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
@@ -1036,7 +1058,8 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     return true;
 }
 #endif
-void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                       bool keep_f16) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
     bool done = false;
@@ -1052,6 +1075,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
     }
     if (dense_timing_on()) tmark(done ? "gemm tuned" : "gemm default", T, N, K);
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
+    if (keep_f16) return;   // the reader takes the halves (STRATA_HC_GATED16)
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
     tmark("widen", T, N, K);
     if (dbg_nan) {   // debug only: a sync per GEMM
@@ -1064,7 +1088,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
         }
     }
 #else
-    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) keep_f16;
 #endif
 }
 
