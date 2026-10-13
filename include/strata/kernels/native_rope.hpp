@@ -28,4 +28,8 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
 /// CUDA build it is on unless STRATA_NO_NORM_ROPE=1; on the HIP build it is off until the AMD parity check passes there
 /// (rope_parity check 6) and only STRATA_NORM_ROPE=1 turns it on.
 bool native_norm_rope_usable(int head_dim, int n_rot);
+// Tests (HIP): which form of the rotation native_qsa_rms_norm_rope launches: 0 the CUDA kernel's explicit fused
+// multiply-adds (STRATA_NORM_ROPE=1), 1 the expression as native_rope_apply writes it (=2), 2 with contraction off
+// (=3); -1 = the environment again.
+void native_norm_rope_tune(int form);
 }
