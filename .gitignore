@@ -61,3 +61,18 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# written by tools/decode_probe.py
+/bench/probe/
+
+# the local model configs and their launchers (also covered by the two patterns above)
+/strata-bartowski-swift-q4_0.json
+/strata-sc117-abl-iq3_s.json
+/strata-sc117-swift-abl-iq3_xxs.json
+/strata-swift-iq3_xxs.json
+/strata-unsloth-ud-q4_k_xl.json
+/run-bartowski-swift-q4_0.sh
+/run-sc117-abl-iq3_s.sh
+/run-sc117-swift-abl-iq3_xxs.sh
+/run-swift-iq3_xxs.sh
+/run-unsloth-ud-q4_k_xl.sh
