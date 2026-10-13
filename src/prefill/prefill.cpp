@@ -915,6 +915,12 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
         st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
 }
+// STRATA_KV_PF_RESIDENT=1 (opt-in, KV streaming): a streamed layer whose blocks up to the chunk's end fit its VRAM
+// slots is read from those slots by the prompt path, not from the staging pool (see the QSA layer of run_chunks)
+bool kv_pf_resident(const core::QsaState& st, int64_t p0, int64_t T, const strata::kernels::QsaShapes& s) {
+    static const bool on = [] { const char* e = std::getenv("STRATA_KV_PF_RESIDENT"); return e && e[0] == '1'; }();
+    return on && st.kv_mode == 1 && (p0 + T + s.page_size - 1) / s.page_size <= st.map.n_slots;
+}
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
@@ -2424,7 +2430,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (int64_t l = layer; l < LE; ++l) {
                 if (!core::is_qsa_layer(g, l)) continue;
                 const core::QsaState& state = ss.qsa_states[ordinal];
-                if (state.kv_mode != 1) { ++ordinal; continue; }
+                if (state.kv_mode != 1 || kv_pf_resident(state, p0, T, s)) { ++ordinal; continue; }
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
                 // [0, p0) host prefix is immutable throughout this chunk; its new rows are appended later.
                 if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
@@ -2916,7 +2922,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
-                    const bool staged = st.kv_mode == 1;
+                    // STRATA_KV_PF_RESIDENT=1 (opt-in): while the layer's blocks [0, p0 + T) fit its VRAM slots they are
+                    // all made resident instead (the chunk's new blocks and whatever a resume left in RAM come in
+                    // through the residency map; the rest is already there), the append writes the host copy and
+                    // those slots, and the attention reads the slots through the page table: nothing is staged, and
+                    // the prompt leaves its K/V resident for the decode.  The same bytes reach the same kernels.
+                    const bool streamed = st.kv_mode == 1;
+                    const bool resident = streamed && kv_pf_resident(st, p0, T, s);
+                    const bool staged = streamed && !resident;
+                    if (resident) {
+                        pt.mark(kPfKvStage, cs);
+                        strata::kernels::kv_stream_resolve_range(st.map, core::qsa_attn_pools(st), st.host,
+                                                                 core::qsa_kv_format(st), 0,
+                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
+                        pt.mark(kPfQsa, cs);
+                        pf_step("reading the prompt (batched, step sync): the K/V made resident at layer", l);
+                    }
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
@@ -2973,7 +2994,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 core::qsa_kv_format(st), p0 / s.page_size,
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
-                    if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+                    if (streamed) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
