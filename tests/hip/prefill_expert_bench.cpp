@@ -53,8 +53,11 @@ std::vector<uint8_t> random_rows(ggml_type type, int64_t rows, int64_t cols, std
     for (size_t b = 0; b * bs < out.size(); ++b) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(u(rng));
         std::memcpy(out.data() + b * bs, &d, 2);
-        if (type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1) {
-            const ggml_fp16_t m = ggml_fp32_to_fp16(-8.0f * u(rng));
+        if (type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+            // Q4_K / Q5_K: {f16 d; f16 dmin; 6-bit scales and minima; codes} - d and dmin scale 6-bit integers
+            const bool k = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K;
+            if (k) { const ggml_fp16_t dk = ggml_fp32_to_fp16(u(rng) / 32.0f); std::memcpy(out.data() + b * bs, &dk, 2); }
+            const ggml_fp16_t m = ggml_fp32_to_fp16((k ? -0.25f : -8.0f) * u(rng));
             std::memcpy(out.data() + b * bs + 2, &m, 2);
         }
     }
@@ -76,7 +79,9 @@ uint64_t fnv(const void* p, size_t n) {
     return h;
 }
 
-Result run_case(const Case& c, bool check, unsigned seed, int reps) {
+// `each`: the experts lie apart on the device (in reverse order, a gap of 4,112 bytes between two) and the product
+// reads each where it lies (Product::each, STRATA_PF_DIRECT=1) - the output must be the gathered one's, bit for bit
+Result run_case(const Case& c, bool check, unsigned seed, int reps, bool each = false) {
     std::mt19937 rng(seed);
     const int n = (int) c.counts.size();
     int total = 0, max_rows = 0;
@@ -97,6 +102,14 @@ Result run_case(const Case& c, bool check, unsigned seed, int reps) {
     std::vector<int32_t> ids((size_t) total);
     for (int i = 0; i < total; ++i) ids[(size_t) i] = i;
 
+    const size_t gap = 4112, eb_apart = eb + gap;
+    std::vector<uint8_t> w_apart;
+    if (each) {
+        w_apart.assign((size_t) n * eb_apart + tail, 0x7f);   // 0x7f7f: an FP16 NaN wherever a kernel reads past a matrix
+        for (int e = 0; e < n; ++e) std::memcpy(w_apart.data() + (size_t) (n - 1 - e) * eb_apart, w.data() + (size_t) e * eb, eb);
+    }
+    Dev dwa(w_apart.size());
+    if (each) ok(hipMemcpy(dwa.p, w_apart.data(), w_apart.size(), hipMemcpyHostToDevice), "w apart");
     Dev dw(w.size()), dx(x.size() * 4), dq(mmq::q8_bytes(total, c.cols)), db(bounds.size() * 4), di(ids.size() * 4),
         dd((size_t) total * c.w_rows * 4);
     ok(hipMemcpy(dw.p, w.data(), w.size(), hipMemcpyHostToDevice), "w");
@@ -109,6 +122,17 @@ Result run_case(const Case& c, bool check, unsigned seed, int reps) {
     p.w = dw.p; p.type = c.type; p.w_rows = c.w_rows; p.w_cols = c.cols; p.expert_bytes = eb; p.n = n;
     p.xq = dq.p; p.bounds = (const int32_t*) db.p; p.ids = (const int32_t*) di.p;
     p.total_rows = total; p.max_rows = max_rows; p.dst = (float*) dd.p; p.ld_dst = c.w_rows;
+    if (each) {
+        if (n > mmq::kGatherGroupMax) throw std::runtime_error("too many experts for a product over their own blobs");
+        p.each = true;
+        p.w_split = c.w_rows == 1280 ? 640 : c.w_rows;   // gate/up: the up rows as a run of their own
+        const size_t rb = ggml_row_size(c.type, c.cols);
+        for (int e = 0; e < n; ++e) {
+            p.w0[e] = (const uint8_t*) dwa.p + (size_t) (n - 1 - e) * eb_apart;
+            p.w1[e] = (const uint8_t*) p.w0[e] + (p.w_split < c.w_rows ? (size_t) p.w_split * rb : 0);
+        }
+        p.w = nullptr;
+    }
     Result r;
     r.ms_q = r.ms_p = 1e30;
     for (int rep = 0; rep < reps; ++rep) {
@@ -160,10 +184,16 @@ int main(int argc, char** argv) {
     try {
         bool only_time = false;
         std::vector<ggml_type> types = {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S,
-                                        GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0};
+                                        GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_0,
+                                        GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0};
+        // --rows N: the uniform case's rows per expert (default 320: a 16K chunk; a 2,048-token chunk of the two-card
+        // pipeline routes 40 to an expert, where a kernel's per-expert weight decode weighs 8 times more)
+        int uni_rows = 320;
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--time-only") == 0) only_time = true;
             else if (std::strcmp(argv[i], "--type") == 0 && i + 1 < argc) types = {(ggml_type) std::atoi(argv[++i])};
+            else if (std::strcmp(argv[i], "--rows") == 0 && i + 1 < argc) uni_rows = std::atoi(argv[++i]);
+            else if (std::strcmp(argv[i], "--nl-tile") == 0 && i + 1 < argc) q4::set_nl_tile(std::atoi(argv[++i]));
             else if (std::strcmp(argv[i], "--q4-variant") == 0 && i + 1 < argc) q4::set_variant(std::atoi(argv[++i]));
         }
         // the skewed set: 16 experts of a 16K chunk as the router fills them (a few busy, most near the mean, some idle)
@@ -185,14 +215,31 @@ int main(int argc, char** argv) {
                                 pass ? "PASS" : "FAIL", ggml_type_name(t), shape_name(w_rows), (long long) w_rows,
                                 (long long) cols, r.rel, (unsigned long long) r.hash);
                 }
-                const Result u = run_case({t, w_rows, cols, std::vector<int>(16, 320)}, false, 7, 7);
+                // STRATA_PF_DIRECT=1: a product over the experts' own blobs gives the gathered one's bits
+                const bool can_each = mmq::direct_blobs(t, shape == 1);
+                if (can_each && !only_time) {
+                    const Result a = run_case({t, w_rows, cols, {37, 0, 70, 32, 1, 129}}, false, 11u + (unsigned) t, 1);
+                    const Result b = run_case({t, w_rows, cols, {37, 0, 70, 32, 1, 129}}, false, 11u + (unsigned) t, 1, true);
+                    const bool same = a.hash == b.hash && b.finite;
+                    all &= same;
+                    std::printf("%s %-8s %-7s experts read from their own blobs: %s (hash %016llx)\n", same ? "PASS" : "FAIL",
+                                ggml_type_name(t), shape_name(w_rows), same ? "the same bits" : "outputs differ",
+                                (unsigned long long) b.hash);
+                }
+                if (can_each) {
+                    const Result ue = run_case({t, w_rows, cols, std::vector<int>(16, uni_rows)}, false, 7, 7, true);
+                    std::printf("time %-8s %-7s 16 x %d rows, from their own blobs: product %.3f ms = %.0f G MAC/s\n",
+                                ggml_type_name(t), shape_name(w_rows), uni_rows, ue.ms_p,
+                                16.0 * (double) uni_rows * (double) w_rows * (double) cols / ue.ms_p / 1e6);
+                }
+                const Result u = run_case({t, w_rows, cols, std::vector<int>(16, uni_rows)}, false, 7, 7);
                 const Result s = run_case({t, w_rows, cols, skew}, false, 7, 7);
-                const double mac_u = 16.0 * 320.0 * (double) w_rows * (double) cols;
+                const double mac_u = 16.0 * (double) uni_rows * (double) w_rows * (double) cols;
                 double rows_s = 0;
                 for (int k : skew) rows_s += k;
                 const double mac_s = rows_s * (double) w_rows * (double) cols;
-                std::printf("time %-8s %-7s 16 x 320 rows: quantize %.3f ms, product %.3f ms = %.0f G MAC/s | skewed %d rows: "
-                            "%.3f ms = %.0f G MAC/s\n", ggml_type_name(t), shape_name(w_rows), u.ms_q, u.ms_p,
+                std::printf("time %-8s %-7s 16 x %d rows: quantize %.3f ms, product %.3f ms = %.0f G MAC/s | skewed %d rows: "
+                            "%.3f ms = %.0f G MAC/s\n", ggml_type_name(t), shape_name(w_rows), uni_rows, u.ms_q, u.ms_p,
                             mac_u / u.ms_p / 1e6, (int) rows_s, s.ms_p, mac_s / s.ms_p / 1e6);
             }
         }

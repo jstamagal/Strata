@@ -35,6 +35,27 @@ inline bool mmq_resident_sort_eligible(bool requested, bool use_mmq, bool native
 // order contains each positive-count expert once in ID order; off has count.size()+1 entries;
 // routes fits its original int32 offsets, and slot/src each have routes writable entries.
 // After sorting, off[e] is an expert-indexed START, not an ID-prefix end at off[e+1].
+// The row tables for the experts in `order`'s order (any permutation of the positive-count experts): off[e] the
+// first row of expert e, slot/src rebuilt to match.  The same preconditions as mmq_resident_sort_rows.
+inline void mmq_order_rows(const int32_t* ids, int64_t routes, int32_t k,
+                           const std::vector<int32_t>& count, std::vector<int32_t>& off,
+                           const std::vector<int32_t>& order, int32_t* slot, int32_t* src) {
+    std::fill(off.begin(), off.end(), 0);
+    int32_t cursor = 0;
+    for (int32_t e : order) {
+        off[(size_t) e] = cursor;
+        cursor += count[(size_t) e];
+    }
+    off.back() = cursor;
+    std::vector<int32_t> fill(off.begin(), off.end() - 1);
+    for (int64_t i = 0; i < routes; ++i) {
+        const int32_t e = ids[(size_t) i];
+        const int32_t p = fill[(size_t) e]++;
+        slot[(size_t) i] = p;
+        src[(size_t) p] = (int32_t) (i / k);
+    }
+}
+
 inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
                                    const std::vector<int32_t>& count, std::vector<int32_t>& off,
                                    std::vector<int32_t>& order, int32_t* slot, int32_t* src) {

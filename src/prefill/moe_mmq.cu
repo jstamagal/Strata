@@ -167,6 +167,24 @@ unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 bool built() { return true; }
 
+bool direct_blobs(int t, bool down) {
+#if defined(__HIPCC__)
+    if (q4::covers(t)) return q4::direct();   // STRATA_PF_DIRECT=1 on gfx103x, Strata's own kernel
+    static const bool env = [] { const char* v = std::getenv("STRATA_PF_DIRECT"); return v != nullptr && v[0] == '1'; }();
+    if (!env) return false;
+    if (q4::nl_fits(t, down ? 640 : 2560)) return true;   // STRATA_PF_NL=1: Strata's IQ4_NL kernel, any matrix
+#if defined(MMQ_X_EACH_MAX)             // llama.cpp with patch 0003
+    static_assert(MMQ_X_EACH_MAX >= kGatherGroupMax, "a group's pointers fit the kernel's table");
+    return !down && supported(t);
+#else
+    return false;
+#endif
+#else
+    (void) t; (void) down;
+    return false;
+#endif
+}
+
 bool supported(int t) {
 #if defined(__HIPCC__)
     if (q4::covers(t)) return q4::enabled();
@@ -281,13 +299,46 @@ void Context::run(const Product& p, void* stream) {
         return;
     }
 #endif
+#if defined(__HIPCC__)
+    if (q4::nl_fits(p.type, p.w_cols)) {   // STRATA_PF_NL=1: IQ4_NL on Strata's tiles, MMQ's activations and bits
+        q4::nl_run(p, stream);
+        return;
+    }
+#endif
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
-    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
+    mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, nullptr,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
                         p.max_rows, p.max_rows};
+    if (p.each) {
+#if defined(MMQ_X_EACH_MAX)
+        // each expert's matrix where it lies: its rows must be one run (gate rows, then up rows right behind them)
+        const size_t split_bytes = (size_t) p.w_split * (size_t) bpr * ggml_type_size(t);
+        if (p.n > MMQ_X_EACH_MAX) {
+            std::fprintf(stderr, "prefill mmq: %d experts in a product over their own blobs (at most %d)\n", p.n, MMQ_X_EACH_MAX);
+            std::exit(1);
+        }
+        for (int e = 0; e < p.n; ++e) {
+            if ((const char*) p.w1[e] != (const char*) p.w0[e] + split_bytes && p.w_split < p.w_rows) {
+                std::fprintf(stderr, "prefill mmq: an expert's gate and up rows are not one run\n");
+                std::exit(1);
+            }
+            a.x_each.p[e] = (const char*) p.w0[e];
+        }
+        a.x_each.n = p.n;
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata: prompt kernels: MMQ gate/up products read the experts from their own blobs, no "
+                                 "group copy (STRATA_PF_DIRECT=1)\n");
+        }
+#else
+        std::fprintf(stderr, "prefill mmq: this build's llama.cpp has no per-channel weight pointers (patch 0003)\n");
+        std::exit(1);
+#endif
+    }
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     switch (t) {

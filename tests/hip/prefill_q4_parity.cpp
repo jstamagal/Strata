@@ -75,10 +75,12 @@ double ref_dot(ggml_type type, const uint8_t* wrow, const float* x, int64_t cols
     return acc;
 }
 
-// `variant`: q4::set_variant's (0 the 64 x 32 tile, 1 the 256 x 32 ones); `keep`: the output, for a bitwise compare
+// `variant`: q4::set_variant's (0 the 64 x 32 tile, 1 the 256 x 32 ones), or 2: the 256 x 32 ones reading each expert
+// through its own two pointers (Product::each: the halves of its rows apart and swapped, at an odd address);
+// `keep`: the output, for a bitwise compare
 bool check(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<int>& counts, unsigned seed, int variant = 0,
            std::vector<float>* keep = nullptr) {
-    q4::set_variant(variant);
+    q4::set_variant(variant == 2 ? 1 : variant);
     std::mt19937 rng(seed);
     const int n = (int) counts.size();
     int total = 0, max_rows = 0;
@@ -111,6 +113,27 @@ bool check(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<int>&
     p.w = dw.p; p.type = type; p.w_rows = w_rows; p.w_cols = cols; p.expert_bytes = eb; p.n = n;
     p.xq = dq.p; p.bounds = (const int32_t*) db.p; p.ids = (const int32_t*) di.p;
     p.total_rows = total; p.max_rows = max_rows; p.dst = (float*) dd.p; p.ld_dst = w_rows;
+    // variant 2: expert e at 3 + e * (eb + 10) of a second buffer, rows [split, w_rows) first, then 6 bytes, then rows [0, split)
+    const size_t rbw = ggml_row_size(type, cols);
+    const int64_t split = w_rows / 2;
+    const size_t lo = (size_t) split * rbw, hi = eb - lo;
+    std::vector<uint8_t> w2(3 + (size_t) n * (eb + 10), 0xa5);
+    for (int e = 0; e < n; ++e) {
+        uint8_t* base = w2.data() + 3 + (size_t) e * (eb + 10);
+        std::memcpy(base, w.data() + (size_t) e * eb + lo, hi);
+        std::memcpy(base + hi + 6, w.data() + (size_t) e * eb, lo);
+    }
+    Dev dw2(w2.size());
+    if (variant == 2) {
+        if (n > mmq::kGatherGroupMax) throw std::runtime_error("too many experts for Product::each");
+        ok(hipMemcpy(dw2.p, w2.data(), w2.size(), hipMemcpyHostToDevice), "w2");
+        p.w = nullptr; p.expert_bytes = 0; p.each = true; p.w_split = split;
+        for (int e = 0; e < n; ++e) {
+            const uint8_t* base = (const uint8_t*) dw2.p + 3 + (size_t) e * (eb + 10);
+            p.w1[e] = base;
+            p.w0[e] = base + hi + 6;
+        }
+    }
     ctx.run(p, s);
     ok(hipDeviceSynchronize(), "sync");
     std::vector<float> y((size_t) total * w_rows);
@@ -205,7 +228,7 @@ int main() {
             // each tile against FP64, and the 256 x 32 tiles (STRATA_PF_Q4_WIDE=1) against the 64 x 32 one bit for bit
             std::vector<float> y0, yv;
             all &= check(c.type, c.w_rows, c.cols, c.counts, seed, 0, &y0);
-            for (int v = 1; v <= 1; ++v) {
+            for (int v = 1; v <= 2; ++v) {
                 all &= check(c.type, c.w_rows, c.cols, c.counts, seed, v, &yv);
                 const bool same = y0.size() == yv.size() && std::memcmp(y0.data(), yv.data(), y0.size() * 4) == 0;
                 std::printf("%s v%d against v0: %s\n", same ? "PASS" : "FAIL", v, same ? "the same bits" : "outputs differ");

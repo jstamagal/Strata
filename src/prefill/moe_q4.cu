@@ -224,11 +224,29 @@ __global__ void __launch_bounds__(THREADS) q4_product_kernel(Args a) {
 //
 // A token row past the expert's last one is skipped (a uniform branch), so a tile with 3 rows does 3 rows of work.
 constexpr int WI = 256;                // weight rows a workgroup
+constexpr int WN = mmq::kGatherGroupMax;   // experts a launch: each has its own weight pointers
+
+// The wide tiles' arguments: expert e's rows [0, split) start at w0[e], rows [split, w_rows) at w1[e].  So a launch
+// reads an expert where it lies (its blob: gate at one offset, up at another) as well as from a group buffer.
+struct ArgsW {
+    const uint8_t* w0[WN];
+    const uint8_t* w1[WN];
+    const uint8_t* xq;       // rows of (w_cols / 128) chunks
+    const int32_t* bounds;   // n + 1
+    const int32_t* ids;      // dst row of an activation row
+    float* dst;
+    int64_t ld_dst;
+    int w_rows, w_cols, split;
+};
+__device__ __forceinline__ const uint8_t* row_ptr(const ArgsW& a, int e, int i, size_t w_row) {
+    const int ii = i < a.w_rows ? i : 0;
+    return ii < a.split ? a.w0[e] + (size_t) ii * w_row : a.w1[e] + (size_t) (ii - a.split) * w_row;
+}
 
 // R weight rows a thread (256 / R threads a workgroup), TJ token rows a workgroup, KS 32-value blocks a step.
 // IDENT: the 64 x 32 tile's float order (a chunk's 4 blocks summed first; needs KS == 4).
 template <bool Q41, int R, int KS, int TJ, bool IDENT>
-__global__ void __launch_bounds__(WI / R) q4_blk_kernel(Args a) {
+__global__ void __launch_bounds__(WI / R) q4_blk_kernel(ArgsW a) {
     static_assert(!IDENT || KS == 4, "the chunk's partial sum needs the whole chunk in one step");
     constexpr int NT = WI / R;
     __shared__ __align__(16) uint32_t act[TJ * CHUNK_WORDS];
@@ -246,7 +264,6 @@ __global__ void __launch_bounds__(WI / R) q4_blk_kernel(Args a) {
     const int chunks = a.w_cols / CHUNK;
     const size_t x_row = (size_t) chunks * CHUNK_BYTES;
     const size_t w_row = (size_t) (a.w_cols / 32) * BLOCK_BYTES;
-    const uint8_t* we = a.w + (size_t) e * a.expert_bytes;
     const uint8_t* xt = a.xq + (size_t) j0 * x_row;
 
     float acc[R * TJ];
@@ -280,7 +297,7 @@ __global__ void __launch_bounds__(WI / R) q4_blk_kernel(Args a) {
 #pragma unroll
             for (int r = 0; r < R; ++r) {
                 const int i = i0 + r * NT;
-                const uint8_t* wr = we + (size_t) (i < a.w_rows ? i : 0) * w_row;
+                const uint8_t* wr = row_ptr(a, e, i, w_row);
 #pragma unroll
                 for (int b = 0; b < KS; ++b) {
                     const uint8_t* blk = wr + (size_t) (c * 4 + ks + b) * BLOCK_BYTES;
@@ -352,7 +369,7 @@ __global__ void __launch_bounds__(WI / R) q4_blk_kernel(Args a) {
 // R weight rows a thread (256 / R threads a workgroup), TJ token rows a workgroup; the activations by scalar loads
 // (`xq` 4-byte aligned)
 template <bool Q41, int R, int TJ>
-__global__ void __launch_bounds__(WI / R) q4_sload_kernel(Args a) {
+__global__ void __launch_bounds__(WI / R) q4_sload_kernel(ArgsW a) {
     constexpr int NT = WI / R;
     constexpr int BLOCK_BYTES = Q41 ? 20 : 18;
     constexpr int QS_OFF = Q41 ? 4 : 2;
@@ -366,7 +383,6 @@ __global__ void __launch_bounds__(WI / R) q4_sload_kernel(Args a) {
     const int chunks = a.w_cols / CHUNK;
     const int x_row_w = chunks * CHUNK_WORDS;                  // a token row in words
     const size_t w_row = (size_t) (a.w_cols / 32) * BLOCK_BYTES;
-    const uint8_t* we = a.w + (size_t) e * a.expert_bytes;
     const uint32_t* xc = (const uint32_t*) a.xq + (size_t) j0 * (size_t) x_row_w;   // the tile's first row, chunk c
     float acc[R * TJ];
 #pragma unroll
@@ -377,7 +393,7 @@ __global__ void __launch_bounds__(WI / R) q4_sload_kernel(Args a) {
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const int i = i0 + r * NT;
-            const uint8_t* wr = we + (size_t) (i < a.w_rows ? i : 0) * w_row;
+            const uint8_t* wr = row_ptr(a, e, i, w_row);
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
                 const uint8_t* blk = wr + (size_t) (c * 4 + b) * BLOCK_BYTES;
@@ -443,16 +459,112 @@ __global__ void __launch_bounds__(WI / R) q4_sload_kernel(Args a) {
 }
 
 template <bool Q41, int R, int TJ>
-void launch_sload(const Args& a, const mmq::Product& p, cudaStream_t s) {
+void launch_sload(const ArgsW& a, const mmq::Product& p, cudaStream_t s) {
     const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
     q4_sload_kernel<Q41, R, TJ><<<g, WI / R, 0, s>>>(a);
 }
 
 template <bool Q41, int R, int KS, int TJ, bool IDENT>
-void launch_blk(const Args& a, const mmq::Product& p, cudaStream_t s) {
+void launch_blk(const ArgsW& a, const mmq::Product& p, cudaStream_t s) {
     const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
     q4_blk_kernel<Q41, R, KS, TJ, IDENT><<<g, WI / R, 0, s>>>(a);
 }
+
+// ---- IQ4_NL on the 256-row tiles (STRATA_PF_NL=1, opt-in) -----------------------------------------------------------
+// An IQ4_NL block is a Q4_0 block with another meaning of the code: {f16 d; 16 bytes}, weight v < 16 in the low
+// nibble of byte v, weight 16 + v in the high nibble, w = d * kvalues_iq4nl[q].  39 of the IQ3_S pack's 48 layers
+// keep their down projection in it.  This is q4_sload_kernel for that format, written to give llama.cpp's MMQ kernel
+// output bit for bit, so it takes MMQ's own activations and repeats its arithmetic:
+//   - the activations are block_q8_1_mmq in the D4 layout as quantize_mmq_q8_1 (or swiglu_quant) wrote them:
+//     {float d[4]; int8 q[128]} for 128 values of one row, block (k / 128, row) at index (k / 128) * ncols_y + row.
+//     The rows of a tile are 36 words apart, at an address that is the same for every thread: scalar loads;
+//   - per 32 values MMQ adds d_w * d_x * (float) sum q a to the output's sum, in K order
+//     (ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a / vec_dot_q8_0_q8_1_impl); so does this.
+// What MMQ does and this does not: it walks K in steps of 256, so for a 640-column matrix it also adds four blocks
+// that lie past the row (the next row's, times activations that are zero).  Those terms are +-0; they can turn an
+// output of exactly -0 into +0 and change nothing else.  And it never reads past a matrix, so a down product can
+// read an expert in its cache slot (STRATA_PF_DIRECT=1).
+// The codes are decoded two at a time through a 256-entry table (byte -> the int8 of its low and of its high nibble).
+struct NlPairs {
+    uint16_t v[256];
+    constexpr NlPairs() : v() {
+        constexpr int kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};   // kvalues_iq4nl
+        for (int b = 0; b < 256; ++b) v[b] = (uint16_t) (((unsigned) kv[b & 15] & 0xffu) | (((unsigned) kv[b >> 4] & 0xffu) << 8));
+    }
+};
+static __device__ const NlPairs nl_pairs{};
+
+struct ArgsN {
+    const uint8_t* w0[WN];
+    const uint8_t* w1[WN];
+    const uint32_t* y;       // block_q8_1_mmq, D4 layout
+    const int32_t* bounds;   // n + 1
+    const int32_t* ids;      // dst row of an activation row
+    float* dst;
+    int64_t ld_dst;
+    int64_t ncols_y;         // activation rows in y (the block index's stride)
+    int w_rows, w_cols, split;
+};
+
+template <int TJ>
+__global__ void __launch_bounds__(WI) nl_sload_kernel(ArgsN a) {
+    constexpr int BLOCK_BYTES = 18;
+    const int t = threadIdx.x;
+    const int e = blockIdx.z;
+    const int r0 = a.bounds[e], r1 = a.bounds[e + 1];
+    const int j0 = r0 + (int) blockIdx.y * TJ;
+    if (j0 >= r1) return;
+    const int nj = min(TJ, r1 - j0);
+    const int i = (int) blockIdx.x * WI + t;
+    const int chunks = a.w_cols / CHUNK;
+    const size_t w_row = (size_t) (a.w_cols / 32) * BLOCK_BYTES;
+    const int ii = i < a.w_rows ? i : 0;
+    const uint8_t* wr = ii < a.split ? a.w0[e] + (size_t) ii * w_row : a.w1[e] + (size_t) (ii - a.split) * w_row;
+    float acc[TJ];
+#pragma unroll
+    for (int q = 0; q < TJ; ++q) acc[q] = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        uint32_t w[32];
+        float dw[4];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const uint8_t* blk = wr + (size_t) (c * 4 + b) * BLOCK_BYTES;
+            dw[b] = load_f16(blk);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t x = load32(blk + 2 + 4 * k);
+                const uint32_t t0 = nl_pairs.v[x & 0xffu], t1 = nl_pairs.v[(x >> 8) & 0xffu],
+                               t2 = nl_pairs.v[(x >> 16) & 0xffu], t3 = nl_pairs.v[x >> 24];
+                w[b * 8 + k] = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);   // weights 4k .. 4k+3
+                w[b * 8 + 4 + k] = (t0 >> 8) | ((t1 >> 8) << 8) | ((t2 >> 8) << 16) | ((t3 >> 8) << 24);   // 16+4k .. 16+4k+3
+            }
+        }
+        const uint32_t* aj = a.y + ((size_t) c * (size_t) a.ncols_y + (size_t) j0) * CHUNK_WORDS;
+#pragma unroll
+        for (int jj = 0; jj < TJ; ++jj, aj += CHUNK_WORDS) {
+            if (jj < nj) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    const float dx = bits_float(aj[b]);
+                    int sm = 0;
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) sm = __dp4a((int) w[b * 8 + k], (int) aj[4 + b * 8 + k], sm);
+                    acc[jj] += dw[b] * dx * (float) sm;    // MMQ's expression and order: d8_0 * d8_1 * (float) sumi
+                }
+            }
+        }
+    }
+    if (i >= a.w_rows) return;
+#pragma unroll
+    for (int jj = 0; jj < TJ; ++jj) {
+        if (jj < nj) {
+            const int64_t row = a.ids != nullptr ? (int64_t) a.ids[j0 + jj] : (int64_t) (j0 + jj);
+            a.dst[row * a.ld_dst + i] = acc[jj];
+        }
+    }
+}
+
+int g_nl_tj = 0;                       // set_nl_tile's (tests); 0: the launch's own choice
 
 int g_variant = -1;                    // set_variant's (tests); -1: the environment decides
 
@@ -480,7 +592,68 @@ bool device_is_gfx103x() {
 
 bool covers(int t) { return t == kTypeQ4_0 || t == kTypeQ4_1; }
 
+void set_nl_tile(int tj) { g_nl_tj = tj; }
+
+bool nl_on() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_PF_NL");
+        return v != nullptr && v[0] == '1';
+    }();
+    return env && device_is_gfx103x();
+}
+
+// The down shape only (K 640).  Measured on a V620 against llama.cpp's MMQ, 16 experts: down x 40 rows 0.100 ->
+// 0.095 ms, x 320 rows 15.2 -> 17.2 T MAC/s, a skewed 5,120 rows 0.610 -> 0.493 ms; gate/up (K 2560) loses, x 40 rows
+// 0.166 -> 0.193 ms, x 320 rows 18.3 -> 17.0 T MAC/s, so that shape stays with MMQ (no pack here has it in IQ4_NL).
+bool nl_fits(int t, int64_t w_cols) { return t == 20 /* GGML_TYPE_IQ4_NL */ && w_cols == 640 && nl_on(); }
+
+void nl_run(const mmq::Product& p, void* stream) {
+    if (p.n <= 0 || p.max_rows <= 0) return;
+    if (p.w_cols % CHUNK != 0 || p.n > WN || ((uintptr_t) p.xq & 3) != 0) {
+        std::fprintf(stderr, "prefill iq4_nl experts: %lld columns, %d experts: not covered\n", (long long) p.w_cols, p.n);
+        std::exit(1);
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata: prompt kernels: IQ4_NL experts on the 256-row tiles (STRATA_PF_NL=1: MMQ's output "
+                             "bits)\n");
+    }
+    ArgsN a{};
+    for (int e = 0; e < p.n; ++e) {
+        a.w0[e] = p.each ? (const uint8_t*) p.w0[e] : (const uint8_t*) p.w + (size_t) e * p.expert_bytes;
+        a.w1[e] = p.each ? (const uint8_t*) p.w1[e] : a.w0[e];
+    }
+    a.split = p.each ? (int) p.w_split : (int) p.w_rows;
+    a.y = (const uint32_t*) p.xq;
+    a.bounds = p.bounds;
+    a.ids = p.ids;
+    a.dst = p.dst;
+    a.ld_dst = p.ld_dst;
+    a.ncols_y = p.total_rows;
+    a.w_rows = (int) p.w_rows;
+    a.w_cols = (int) p.w_cols;
+    const cudaStream_t s = (cudaStream_t) stream;
+    // 32 token rows a tile.  48 and 64 (an expert's weights decoded once for more rows) were measured on a V620 and
+    // lose: 16 experts x 40 rows of down take 0.095 ms at 32, 0.145 at 48, 0.147 at 64 (the accumulators and the
+    // decoded weights no longer fit the registers).  set_nl_tile keeps them for a test.
+    const int tj = g_nl_tj > 0 ? g_nl_tj : 32;
+    const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + tj - 1) / tj), (unsigned) p.n);
+    if (tj == 64) nl_sload_kernel<64><<<g, WI, 0, s>>>(a);
+    else if (tj == 48) nl_sload_kernel<48><<<g, WI, 0, s>>>(a);
+    else nl_sload_kernel<32><<<g, WI, 0, s>>>(a);
+    ck(cudaGetLastError(), "product (iq4_nl)");
+}
+
 void set_variant(int v) { g_variant = v; }
+
+bool direct() {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_PF_DIRECT");
+        return v != nullptr && v[0] == '1';
+    }();
+    return env && enabled();
+}
 
 bool enabled() {
     // STRATA_PF_Q4=0 turns it off (those experts take the FP16 path again); unset or anything else: on, on gfx103x
@@ -517,6 +690,45 @@ void run(const mmq::Product& p, void* stream) {
         std::fprintf(stderr, "prefill q4 experts: type %d with %lld columns is not covered\n", p.type, (long long) p.w_cols);
         std::exit(1);
     }
+    const cudaStream_t s = (cudaStream_t) stream;
+    // STRATA_PF_Q4_WIDE=1 (the scalar loads need the activations word-aligned: they are, the quantizer writes words)
+    const bool wide = (variant() == 1 || p.each) && ((uintptr_t) p.xq & 3) == 0 && p.n <= WN;
+    if (p.each && !wide) {
+        std::fprintf(stderr, "prefill q4 experts: a product over the experts' own blobs needs the wide tiles\n");
+        std::exit(1);
+    }
+    if (wide) {
+        static bool said = false, said_each = false;
+        if (!said && g_variant < 0) {
+            said = true;
+            std::fprintf(stderr, "strata: prompt kernels: Q4_0 / Q4_1 experts on the 256 x 32 tiles (STRATA_PF_Q4_WIDE=1: "
+                                 "the same output bits)\n");
+        }
+        if (p.each && !said_each) {
+            said_each = true;
+            std::fprintf(stderr, "strata: prompt kernels: Q4_0 / Q4_1 experts read from their own blobs, no group copy "
+                                 "(STRATA_PF_DIRECT=1)\n");
+        }
+        ArgsW a{};
+        for (int e = 0; e < p.n; ++e) {
+            a.w0[e] = p.each ? (const uint8_t*) p.w0[e] : (const uint8_t*) p.w + (size_t) e * p.expert_bytes;
+            a.w1[e] = p.each ? (const uint8_t*) p.w1[e] : a.w0[e];
+        }
+        a.split = p.each ? (int) p.w_split : (int) p.w_rows;
+        a.xq = (const uint8_t*) p.xq;
+        a.bounds = p.bounds;
+        a.ids = p.ids;
+        a.dst = p.dst;
+        a.ld_dst = p.ld_dst;
+        a.w_rows = (int) p.w_rows;
+        a.w_cols = (int) p.w_cols;
+        // (Q4_0 with 64 token rows a tile, so that a 2,048-token chunk's 40 rows an expert decode its weights once:
+        // measured slower on a V620, 16 experts x 40 rows 0.163 -> 0.221 ms, x 320 rows 22.5 -> 17.4 T MAC/s)
+        if (p.type == kTypeQ4_1) launch_blk<true, 2, 4, 32, true>(a, p, s);
+        else launch_sload<false, 1, 32>(a, p, s);
+        ck(cudaGetLastError(), "product (wide)");
+        return;
+    }
     Args a{};
     a.w = (const uint8_t*) p.w;
     a.xq = (const uint8_t*) p.xq;
@@ -527,20 +739,6 @@ void run(const mmq::Product& p, void* stream) {
     a.expert_bytes = (uint64_t) p.expert_bytes;
     a.w_rows = (int) p.w_rows;
     a.w_cols = (int) p.w_cols;
-    const cudaStream_t s = (cudaStream_t) stream;
-    // STRATA_PF_Q4_WIDE=1 (the scalar loads need the activations word-aligned: they are, the quantizer writes words)
-    if (variant() == 1 && ((uintptr_t) p.xq & 3) == 0) {
-        static bool said = false;
-        if (!said && g_variant < 0) {
-            said = true;
-            std::fprintf(stderr, "strata: prompt kernels: Q4_0 / Q4_1 experts on the 256 x 32 tiles (STRATA_PF_Q4_WIDE=1: "
-                                 "the same output bits)\n");
-        }
-        if (p.type == kTypeQ4_1) launch_blk<true, 2, 4, 32, true>(a, p, s);
-        else launch_sload<false, 1, 32>(a, p, s);
-        ck(cudaGetLastError(), "product (wide)");
-        return;
-    }
     const dim3 grid((unsigned) ((p.w_rows + TI - 1) / TI), (unsigned) ((p.max_rows + TJ - 1) / TJ), (unsigned) p.n);
     if (p.type == kTypeQ4_1) q4_product_kernel<true><<<grid, THREADS, 0, s>>>(a);
     else q4_product_kernel<false><<<grid, THREADS, 0, s>>>(a);

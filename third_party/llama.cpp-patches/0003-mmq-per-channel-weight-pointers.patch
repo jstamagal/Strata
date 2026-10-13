@@ -1,0 +1,123 @@
+MMQ: per-channel weight pointers, so a MoE launch reads each expert where it lies
+
+Strata's prompt path multiplies a group of up to 16 experts in one mul_mat_q launch (a channel per expert).  The
+kernel finds channel c's matrix at x + c * stride_channel_x blocks, so Strata copied every expert out of its cache
+slot (or staging-ring slot) into one group buffer first: 1.5-4 MB an expert, about 9% of the GPU time of a 2,048-token
+prompt chunk on two Radeon PRO V620 ("dequant" in STRATA_PREFILL_TIMING).
+
+mmq_args gets `x_each` ({const char * p[MMQ_X_EACH_MAX]; int n}).  With n > 0 the kernel takes channel c's matrix
+from p[c] and reads neither `x` nor stride_channel_x; n == 0 (what llama.cpp's own callers leave it at, and Strata
+without STRATA_PF_DIRECT=1) is the stock addressing.  The same blocks reach the same tile loaders: the output is bit
+for bit the same (tests/hip/prefill_expert_bench.cpp checks every expert weight type with the experts apart and
+FP16 NaNs between them).
+
+Strata uses it for gate/up only (K 2560).  mul_mat_q reads K in steps of MMQ_ITER_K = 256 values, so 128 values past
+each row of a 640-column down matrix, and past the matrix for its last row; in the group buffer a zeroed tail makes
+that harmless, in a cache slot the next bytes are whatever was there.
+
+Base: llama.cpp 3cf03257f219afbe7334045ff7c6a06ac68c627d with 0001 and 0002 applied (mmq.cuh: it applies after 0002).
+Apply:  patch -p1 -d third_party/llama.cpp < third_party/llama.cpp-patches/0003-mmq-per-channel-weight-pointers.patch
+Remove: the same with -R.  Without it Strata builds as before and STRATA_PF_DIRECT=1 covers Q4_0 / Q4_1 only
+(src/prefill/moe_mmq.cu tests MMQ_X_EACH_MAX).
+
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1011,6 +1011,15 @@
+ 
+ // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
+ 
++// Strata (third_party/llama.cpp-patches 0003): the channels' (a MoE launch's experts') weight matrices need not lie
++// stride_channel_x blocks apart.  With n > 0, channel c's matrix starts at p[c] (c < n <= MMQ_X_EACH_MAX) and `x` and
++// stride_channel_x are not read; n == 0 is the stock addressing.  The same blocks are read either way.
++#define MMQ_X_EACH_MAX 16
++struct mmq_x_each {
++    const char * p[MMQ_X_EACH_MAX];
++    int n;
++};
++
+ template <ggml_type type, int J, bool fallback>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+ static __global__ void mul_mat_q(
+@@ -1020,7 +1029,7 @@
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx, const mmq_x_each x_each) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+@@ -1122,11 +1131,13 @@
+         const int tile_x_max_i = nrows_x  - it*I - 1;
+         const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
++        const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
++        const int offset_x = x_each.n > 0 ? it*I*stride_row_x
++                           : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+@@ -1216,11 +1227,13 @@
+         const int tile_x_max_i = nrows_x  - it*I - 1;
+         const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
++        const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
++        const int offset_x = x_each.n > 0 ? it*I*stride_row_x
++                           : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ 
+@@ -1300,11 +1313,13 @@
+     const int tile_x_max_i = nrows_x  - it*I - 1;
+     const int tile_y_max_j = col_diff - jt*J - 1;
+ 
+-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
++    const char * x_z   = x_each.n > 0 ? x_each.p[fastdiv(zt, channel_ratio)] : x;
++    const int offset_x = x_each.n > 0 ? it*I*stride_row_x
++                       : fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     mul_mat_q_process_tile<type, J, fallback, fixup>
+-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++        (x_z, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
+          stride_row_x, ncols_y, stride_col_dst,
+          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ }
+@@ -1455,6 +1470,7 @@
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+     int64_t ncols_max;
+     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
++    mmq_x_each x_each; // Strata (patch 0003): per-channel weight pointers, n == 0: none
+ };
+ 
+ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
+@@ -1504,7 +1520,7 @@
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, args.x_each);
+         return;
+     }
+ 
+@@ -1533,7 +1549,7 @@
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-         ntx_fd);
++         ntx_fd, args.x_each);
+ 
+     if (!fixup_needed) {
+         return;
