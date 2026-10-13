@@ -2932,9 +2932,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool staged = streamed && !resident;
                     if (resident) {
                         pt.mark(kPfKvStage, cs);
+                        // blocks from ceil(p0 / page) on hold no cell yet: they get their slots without a read
                         strata::kernels::kv_stream_resolve_range(st.map, core::qsa_attn_pools(st), st.host,
                                                                  core::qsa_kv_format(st), 0,
-                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
+                                                                 (p0 + T + s.page_size - 1) / s.page_size,
+                                                                 (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
                         pf_step("reading the prompt (batched, step sync): the K/V made resident at layer", l);
                     }

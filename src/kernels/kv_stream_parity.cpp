@@ -156,7 +156,7 @@ bool run(int fmt) {
     std::vector<float> hk(H * D), hv(H * D), hq(NQ * NH * D), a((size_t) NQ * NH * D), b2((size_t) NQ * NH * D);
     std::vector<int32_t> pt(n_blocks), sb(n_slots);
 
-    int batches = 0, bad = 0, range_calls = 0, range_checked = 0;
+    int batches = 0, bad = 0, range_calls = 0, range_checked = 0, range_ahead = 0;
     for (int64_t pos = 0; pos < N; ++pos) {
         for (auto& x : hk) x = nd(rng) * ((pos % 17 == 0) ? 30.f : 1.f);
         for (auto& x : hv) x = nd(rng);
@@ -187,10 +187,15 @@ bool run(int fmt) {
         //    STRATA_KV_PF_RESIDENT): the whole run is in the table afterwards, and one query whose selection is `cap`
         //    consecutive cells of the run reads the resident pool's values from it WITHOUT a resolve of its own
         if (batches % 3 == 2) {
+            // every other one runs past the written cells (up to 64 blocks that hold no cell yet, as a prompt chunk's
+            // new blocks): those get slots without a read, and the appends that follow must fill slot and host alike
             const int64_t nbk = (pos + 4) / 4;
-            const int64_t len = std::min<int64_t>(nbk, 1 + (int64_t) (rng() % (uint64_t) n_slots));
-            const int64_t rb0 = (int64_t) (rng() % (uint64_t) (nbk - len + 1)), rb1 = rb0 + len;
-            k::kv_stream_resolve_range(m, slots.attn(m.page_table), host.p, fmt, rb0, rb1, s, nullptr);
+            const int64_t len = std::min<int64_t>(nbk, 1 + (int64_t) (rng() % (uint64_t) (n_slots - 64)));
+            const int64_t ahead = (range_calls & 1) ? std::min<int64_t>(64, n_blocks - nbk) : 0;
+            const int64_t rb0 = ahead > 0 ? nbk - len : (int64_t) (rng() % (uint64_t) (nbk - len + 1));
+            const int64_t rb1 = rb0 + len + ahead;
+            range_ahead += rb1 > nbk;
+            k::kv_stream_resolve_range(m, slots.attn(m.page_table), host.p, fmt, rb0, rb1, nbk, s, nullptr);
             ++range_calls;
             ck(cudaDeviceSynchronize(), "range");
             ck(cudaMemcpy(pt.data(), m.page_table, n_blocks * 4, cudaMemcpyDeviceToHost), "pt");
@@ -246,9 +251,10 @@ bool run(int fmt) {
     std::printf("  %s: %d batches, %llu block lookups, %llu misses (%.1f%% hit), overflow %d, %d failures\n",
                 name, batches, (unsigned long long) c.lookups, (unsigned long long) c.misses,
                 c.lookups ? 100.0 * (double) (c.lookups - c.misses) / (double) c.lookups : 0.0, (int) c.overflow, bad);
-    std::printf("  %s: %d range resolves, %d of them read back through the attention\n", name, range_calls, range_checked);
+    std::printf("  %s: %d range resolves, %d of them read back through the attention, %d reached past the written cells\n",
+                name, range_calls, range_checked, range_ahead);
     if (c.overflow || c.calls != (uint64_t) (batches + range_calls) || c.misses == 0 || c.misses >= c.lookups) ++bad;
-    if (range_checked == 0) ++bad;
+    if (range_checked == 0 || range_ahead == 0) ++bad;
 
     // 4. a ring over the same host copy: blocks [b1 - R, b1) restored, read through `b % R`
     {
