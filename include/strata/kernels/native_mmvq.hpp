@@ -153,5 +153,16 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 int native_mmvq_il_rows_for(int cc, int ggml_type, int ncols, int n_out);
 // Tests and benchmarks: every native_mmvq_il call takes `rows` a warp (0: the table).
 void native_mmvq_il_tune(int rows);
+// STRATA_MMVQ_ROW (wave32 HIP): tests and benchmarks pick the layout: rows a wavefront (1, 2, 4) and wavefronts a
+// block (1, 2, 4, 8); rows 0 = the default kernels whatever the environment says, -1 = the environment again.
+void native_mmvq_row_tune(int rows, int warps);
+// STRATA_MMVQ_SET=1 (wave32 HIP, opt-in): 2 or 3 matrices that read the same q8_1 activations (n_in, ncols) in one
+// launch; each y[c * n_out + r] is bitwise its own native_mmvq call's.  False (nothing launched, call native_mmvq for
+// each) when the switch is off, a type is not Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K / IQ4_XS, n_in is not a multiple of 256,
+// or a matrix has a packed copy registered.
+struct NativeMmvqItem { int type; const void* weights; float* y; int n_out; };
+bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream);
+// Tests: 1 / 0 = on / off whatever the environment says, -1 = the environment again.
+void native_mmvq_set_tune(int on);
 
 } // namespace strata::kernels
