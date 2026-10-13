@@ -163,6 +163,132 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+#if defined(__HIPCC__)
+// ---- Q5_1 down products on a 256 x 32 tile without shared memory (STRATA_PF_Q51=1, opt-in, gfx103x) -------------------
+// Unsloth's UD-Q4_K_XL keeps the down projection of 43 of its 48 layers in Q5_1.  This is the tile of moe_q4.cu's
+// q4_sload_kernel / nl_sload_kernel for that format, here because it gives llama.cpp's MMQ kernel output bit for bit by
+// calling MMQ's own arithmetic: a thread owns one weight row and decodes 128 of its values (4 blocks of {half2 dm;
+// 4 bytes qh; 16 bytes qs}) into 32 registers exactly as ggml_cuda_mmq_load_tiles_q5_1 does into shared memory, the
+// tile's token rows come by scalar loads from the block_q8_1_mmq rows quantize() wrote (DS4: {half d, half s} per 32
+// values), and each 32 values add vec_dot_q8_1_q8_1_impl<8> to the output's sum in K order, as
+// ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a does.  What MMQ does and this does not: its K steps of 256 values add four
+// more blocks past a 640-column row, times zero activations (d and s zero): terms of +-0, which can only turn an
+// output of exactly -0 into +0.  It never reads past a matrix, so the product can read an expert in its cache slot
+// (STRATA_PF_DIRECT=1) and the down gather goes too.
+struct ArgsQ51 {
+    const char* w[kGatherGroupMax];
+    const int* y;            // block_q8_1_mmq rows, DS4
+    const int32_t* bounds;   // n + 1
+    const int32_t* ids;
+    float* dst;
+    int64_t ld_dst, ncols_y;
+    int w_rows, w_cols;
+};
+
+__device__ __forceinline__ int q51_ld32(const void* p) {
+    int v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+
+__global__ void __launch_bounds__(256) q51_sload_kernel(ArgsQ51 a) {
+    constexpr int TJ = 32;
+    constexpr int CW = sizeof(block_q8_1_mmq) / sizeof(int);   // 36
+    const int t = threadIdx.x;
+    const int e = blockIdx.z;
+    const int r0 = a.bounds[e], r1 = a.bounds[e + 1];
+    const int j0 = r0 + (int) blockIdx.y * TJ;
+    if (j0 >= r1) return;
+    const int nj = min(TJ, r1 - j0);
+    const int i = (int) blockIdx.x * 256 + t;
+    const int chunks = a.w_cols / QK8_1_MMQ;
+    const block_q5_1* wr = (const block_q5_1*) a.w[e] + (size_t) (i < a.w_rows ? i : 0) * (size_t) (a.w_cols / QK5_1);
+    float acc[TJ];
+#pragma unroll
+    for (int q = 0; q < TJ; ++q) acc[q] = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        int w[32];
+        half2 dm[4];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const block_q5_1* bx = wr + c * 4 + b;
+            dm[b] = bx->dm;
+            const int qh0 = q51_ld32(bx->qh);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {   // ggml_cuda_mmq_load_tiles_q5_1's two words
+                const int ql = q51_ld32(bx->qs + 4 * k);
+                const int qh = qh0 >> (4 * k);
+                int qs0 = (ql >> 0) & 0x0F0F0F0F;
+                qs0 |= (qh << 4) & 0x00000010;
+                qs0 |= (qh << 11) & 0x00001000;
+                qs0 |= (qh << 18) & 0x00100000;
+                qs0 |= (qh << 25) & 0x10000000;
+                int qs1 = (ql >> 4) & 0x0F0F0F0F;
+                qs1 |= (qh >> 12) & 0x00000010;
+                qs1 |= (qh >> 5) & 0x00001000;
+                qs1 |= (qh << 2) & 0x00100000;
+                qs1 |= (qh << 9) & 0x10000000;
+                w[b * 8 + k] = qs0;
+                w[b * 8 + 4 + k] = qs1;
+            }
+        }
+        const int* aj = a.y + ((size_t) c * (size_t) a.ncols_y + (size_t) j0) * CW;
+#pragma unroll
+        for (int jj = 0; jj < TJ; ++jj, aj += CW) {
+            if (jj < nj) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    int u[8];
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) u[k] = aj[4 + b * 8 + k];
+                    half2 ds;
+                    __builtin_memcpy(&ds, aj + b, 4);
+                    acc[jj] += vec_dot_q8_1_q8_1_impl<QR5_1 * VDR_Q5_1_Q8_1_MMQ>(&w[b * 8], u, dm[b], ds);
+                }
+            }
+        }
+    }
+    if (i >= a.w_rows) return;
+#pragma unroll
+    for (int jj = 0; jj < TJ; ++jj) {
+        if (jj < nj) a.dst[(int64_t) a.ids[j0 + jj] * a.ld_dst + i] = acc[jj];
+    }
+}
+
+bool q51_on() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_PF_Q51"); return v != nullptr && v[0] == '1'; }();
+    return env && q4::gfx103x();
+}
+// the down shape only (K 640), as moe_q4.cu's IQ4_NL tile: at K 2560 MMQ's own tile is the faster one
+bool q51_fits(int t, int64_t w_cols) { return t == (int) GGML_TYPE_Q5_1 && w_cols == 640 && q51_on(); }
+
+void q51_run(const Product& p, cudaStream_t s) {
+    if (p.n > kGatherGroupMax || p.ids == nullptr || ((uintptr_t) p.xq & 3) != 0) {
+        std::fprintf(stderr, "prefill q5_1 experts: %d experts, ids %p: not covered\n", p.n, (const void*) p.ids);
+        std::exit(1);
+    }
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata: prompt kernels: Q5_1 down experts on the 256 x 32 tiles (STRATA_PF_Q51=1: MMQ's "
+                             "output bits)\n");
+    }
+    ArgsQ51 a{};
+    for (int e = 0; e < p.n; ++e) a.w[e] = p.each ? (const char*) p.w0[e] : (const char*) p.w + (size_t) e * p.expert_bytes;
+    a.y = (const int*) p.xq;
+    a.bounds = p.bounds;
+    a.ids = p.ids;
+    a.dst = p.dst;
+    a.ld_dst = p.ld_dst;
+    a.ncols_y = p.total_rows;
+    a.w_rows = (int) p.w_rows;
+    a.w_cols = (int) p.w_cols;
+    const dim3 g((unsigned) ((p.w_rows + 255) / 256), (unsigned) ((p.max_rows + 31) / 32), (unsigned) p.n);
+    q51_sload_kernel<<<g, 256, 0, s>>>(a);
+    ck(cudaGetLastError(), "product (q5_1)");
+}
+#endif
+
 }  // namespace
 
 bool built() { return true; }
@@ -172,7 +298,8 @@ bool direct_blobs(int t, bool down) {
     if (q4::covers(t)) return q4::direct();   // STRATA_PF_DIRECT=1 on gfx103x, Strata's own kernel
     static const bool env = [] { const char* v = std::getenv("STRATA_PF_DIRECT"); return v != nullptr && v[0] == '1'; }();
     if (!env) return false;
-    if (q4::nl_fits(t, down ? 640 : 2560)) return true;   // STRATA_PF_NL=1: Strata's IQ4_NL kernel, any matrix
+    if (q4::nl_fits(t, down ? 640 : 2560)) return true;   // STRATA_PF_NL=1: Strata's IQ4_NL tile (down)
+    if (q51_fits(t, down ? 640 : 2560)) return true;       // STRATA_PF_Q51=1: the Q5_1 tile (down)
 #if defined(MMQ_X_EACH_MAX)             // llama.cpp with patch 0003
     static_assert(MMQ_X_EACH_MAX >= kGatherGroupMax, "a group's pointers fit the kernel's table");
     return !down && supported(t);
@@ -302,6 +429,10 @@ void Context::run(const Product& p, void* stream) {
 #if defined(__HIPCC__)
     if (q4::nl_fits(p.type, p.w_cols)) {   // STRATA_PF_NL=1: IQ4_NL on Strata's tiles, MMQ's activations and bits
         q4::nl_run(p, stream);
+        return;
+    }
+    if (q51_fits(p.type, p.w_cols)) {      // STRATA_PF_Q51=1: Q5_1 down likewise
+        q51_run(p, (cudaStream_t) stream);
         return;
     }
 #endif

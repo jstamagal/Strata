@@ -491,6 +491,89 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   kernel and is unchanged (IQ3_S: 1,400 / 1,830 tok/s without, 1,406 / 1,833 with). Not measured: one card, a
   gfx1031 / gfx1032 card, Windows.
 
+- **Streamed prompt experts by routing (`STRATA_PF_STREAM_ROUTED=1`, opt-in):** a pack that does not fit VRAM (Q4_0
+  here: 19.6K of 24.6K expert pairs resident; UD-Q4_K_XL: 17.5-18.8K) streams the rest per prompt chunk. From 1,024
+  tokens a chunk on, the engine copies EVERY non-resident expert of every layer, in a fixed order, so that the copies
+  run ahead of the routing. `STRATA_PF_STREAM_STATS=1` prints what that costs, per chunk and stage: on Q4_0 a
+  2,048-token chunk copies 2,450-2,484 experts (6.5 GiB) of which the routing picked 480-1,530; on UD-Q4_K_XL an
+  8,192-token chunk copies 3,970-4,448 (11.8-13.3 GiB) for 1,740-1,935 picked. The experts that are not in VRAM are
+  the rarely used ones, so most of those bytes are never read. On this PC the first card's slot is PCIe 4.0 x8 and the
+  second card's x4 (`current_link_width` of the root port above each card in sysfs), and the
+  second stage (layers 24-47) was waiting for its copies: 6.5 GiB a chunk is about a second on that link, as long as
+  the whole chunk took. With the switch a layer's copies are queued when its routing is known, only for the experts it
+  picked, and the layer walks its resident experts first, the streamed ones last (the row tables are rebuilt for that
+  order as `STRATA_MMQ_RESIDENT_SORT_NE` rebuilds them). The same bytes reach the same products: a 1,832- and a
+  5,504-token prompt's final residuals (`STRATA_PREFILL_DUMP_R`) are the same file with and without, on Q4_0 and
+  UD-Q4_K_XL, and the same as the build this branch started from. `=2` keeps the routed list in id order (the A/B
+  arm; measured on the commit before the reorder, with `STRATA_PF_DIRECT=1`: Q4_0 1,713 / 2,162 tok/s in id order,
+  1,765 / 2,218 with the streamed experts last; UD `stage13-q` 1,357 / 1,703 and 1,401 / 1,770). It applies only
+  where every streamed expert is copied from page-locked memory and no helper card takes part; any other chunk
+  keeps the fixed list - a ONE-chunk prompt on two cards does (the idle stage helps and streams a share over its
+  own link: a 1,825-token prompt still copied 1,498 + 1,519 experts for 462 + 396 picked).
+
+- **Prompt experts read where they lie (`STRATA_PF_DIRECT=1`, opt-in, gfx103x):** an MMQ launch takes a group of 16
+  experts from one buffer, so each expert was first copied out of its cache slot (1.5-4 MB, about 9% of the GPU time of
+  a 2,048-token chunk: `dequant` in `STRATA_PREFILL_TIMING`). With the switch the gate/up product of every MMQ type
+  takes a pointer per expert (`third_party/llama.cpp-patches/0003`: `mmq_args::x_each`), and so do both products of
+  the Q4_0 / Q4_1 kernel. llama.cpp's own down products keep the copy: they read K in steps of 256 values, 128 past
+  each row of a 640-column matrix and past the matrix for its last row, and only the group buffer's zeroed tail makes
+  that harmless. `hip_prefill_expert_bench` runs every expert type both ways with the experts apart and FP16 NaNs
+  between them: the same output hash, the same speed.
+
+- **IQ4_NL down products on Strata's 256 x 32 tile (`STRATA_PF_NL=1`, opt-in, gfx103x):** 39 of the IQ3_S pack's 48
+  layers keep the down projection in IQ4_NL, which is Q4_0's block with a table behind the code. The Q4_0 tile for
+  that format, reading llama.cpp's own q8_1 activations and adding each 32 values as its MMQ kernel does: the bench's
+  output hash is MMQ's (one known exception: MMQ also adds four zero terms past a 640-column row, which can turn an
+  output of exactly -0 into +0). The kernel itself is about MMQ's speed where an expert has 40 rows (16 experts, down:
+  0.100 -> 0.095 ms) and faster where it has many (x 320 rows 15.2 -> 17.2 T MAC/s; a skewed 5,120 rows 0.610 ->
+  0.493 ms); what it brings is that it never reads past a matrix, so with `STRATA_PF_DIRECT=1` those layers lose the
+  down copy too. Gate/up in IQ4_NL (no pack here) stays with MMQ, which is faster at K 2560 (0.166 against 0.193 ms).
+
+- **Q5_1 down products on the same tile (`STRATA_PF_Q51=1`, opt-in, gfx103x):** UD-Q4_K_XL keeps the down projection
+  of 43 of its 48 layers in Q5_1. The tile calls llama.cpp's own `vec_dot_q8_1_q8_1_impl` on registers, so the output
+  hash is MMQ's (the same -0 note). It is NOT faster than MMQ as a kernel (16 experts, down: x 40 rows 0.105 -> 0.111
+  ms, x 320 rows 14.1 -> 13.4 T MAC/s, a skewed 5,120 rows 0.653 -> 0.624 ms); it is there so that those layers'
+  down matrices are read in place with `STRATA_PF_DIRECT=1`. End to end that is small: see the table.
+
+  Why there is no such kernel for the IQ3_S pack's gate/up types: a two-card prompt reads 2,048-token chunks, which
+  route about 40 rows to an expert, and there MMQ is close to the Q4_0 tile. 16 experts x 40 rows of gate+up on a
+  V620: Q4_0 tile 0.157 ms (13.4 T MAC/s; 22.4 at 320 rows), MMQ IQ4_XS 0.165, IQ3_XXS 0.195, IQ3_S 0.199, IQ2_S
+  0.211, Q4_K 0.192, Q5_K 0.193 (0.133 of IQ3_S's 0.199 ms is there at ONE row an expert: the decode into shared
+  memory, which a register tile would pay again in table lookups). `hip_prefill_expert_bench --rows 40` prints them.
+
+  Measured on 2x Radeon PRO V620 (gfx1030, 32 GB each, PCIe 4.0 x8 and x4, Ryzen 9 9950X, 92 GB, Linux, ROCm in
+  `/opt/rocm`), `--layer-split 24`, `tools/strata_bench.py --temperature 1.0 --top-p 0.95 --top-k 20 --runs 1`, the
+  same night, `STRATA_PF_Q4_WIDE=1 STRATA_PA_DOT4=1 STRATA_GDN_HEAD=1 STRATA_GDN_PP=2 STRATA_GDN_NOY=1` in every
+  arm, prompt tok/s at 4K / 16K (the range where an arm ran more than once):
+
+  | pack, settings | without | with | switches |
+  |---|---|---|---|
+  | Swift Q4_0, `q4_0-stage13-q` | 1,320-1,323 / 1,632-1,638 | 1,753-1,765 / 2,207-2,218 | ROUTED, DIRECT |
+  | UD-Q4_K_XL, `stage12-u` (8,192-token chunks) | 969-974 / 1,485-1,499 | 1,122 / 1,613-1,618 | ROUTED, DIRECT |
+  | the same | | 1,141 / 1,630 | ROUTED, DIRECT, Q51 |
+  | UD-Q4_K_XL, `stage13-q` (2,048-token chunks) | 841 / 990 | 1,401-1,421 / 1,769-1,781 | ROUTED, DIRECT |
+  | the same | | 1,431-1,441 / 1,763-1,787 | ROUTED, DIRECT, Q51 |
+  | IQ3_S (all experts resident), `iq3_s-stage13-q` | 1,495 / 1,959-1,965 | 1,517 / 1,984-1,985 | DIRECT |
+  | the same | | 1,573-1,576 / 2,053-2,055 | DIRECT, NL |
+  | the same | | 1,577-1,578 / 2,049-2,051 | `STRATA_MMQ_RESIDENT_SORT_NE=1` alone |
+  | the same | | 1,635-1,638 / 2,119-2,122 | DIRECT, NL, `STRATA_MMQ_RESIDENT_SORT_NE=1` |
+
+  With the routed stream the UD pack is faster on 2,048-token chunks and its own prompt buffers than on the
+  8,192-token chunks that were its best setting before (a small chunk no longer pays a full pass over the streamed
+  experts). Decode is not touched by any of them (chat decode medians of 56-89 tok/s over the arms, no pattern).
+  The residual dumps of all arms above match per pack. Not measured: one card, a card whose experts are not
+  page-locked (the routed stream then does not engage), `--prefill-pipe` values other than 1, prompts past 16K,
+  Windows, CUDA (DIRECT, NL and Q51 are gfx103x-only; the routed stream is not backend-specific but has only run here).
+
+- **K-quant MMQ wide-LDS activation windows (`-DSTRATA_MMQ_WIDE_LDS=ON`, llama.cpp patch 0002) on a real model:**
+  the same V620 pair, a second build with only that option changed. Kernel, 16 experts of gate+up, stock -> wide:
+  Q4_K x 40 rows 0.192 -> 0.182 ms, x 160 rows 11.3 -> 13.1 T MAC/s, x 320 rows 14.0 -> 16.3; Q5_K 0.194 -> 0.192 ms,
+  11.1 -> 13.0, 13.7 -> 16.1; the same output hashes, `hip_prefill_kquant_parity` passes. UD-Q4_K_XL end to end with
+  the routed stream and direct experts: `stage13-q` 1,401-1,421 / 1,769-1,781 -> 1,415-1,433 / 1,766-1,800 tok/s,
+  `stage12-u` 1,122 / 1,613-1,618 -> 1,142 / 1,640; the residual dumps are the same file. So it is correct and worth
+  about 1% of a UD prompt on gfx1030, at the edge of what these runs resolve: small, because at 40 rows an expert the
+  tile is J = 40 and most of its time is the weight decode, not the activation window.
+
 - **QSA block scores on the FP32 tiled scorer (`STRATA_SELECT_SIMT=1`, opt-in, as on CUDA below sm_80):** without
   matrix cores the prompt path's QSA selection scores every (query, KV block) pair on the warp kernel, the one prompt
   term that grows with the context. The switch runs the FP32 tiled scorer instead (FP32 in another summation order:

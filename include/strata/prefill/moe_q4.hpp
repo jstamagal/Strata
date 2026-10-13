@@ -44,6 +44,8 @@ bool direct();
 bool nl_on();
 bool nl_fits(int ggml_type, int64_t w_cols);
 void nl_run(const mmq::Product& p, void* stream);
+/// The current device is gfx103x (what these kernels were written and measured for).
+bool gfx103x();
 /// Tests: the token rows of a tile (32, 48 or 64); 0: the launch's own choice.
 void set_nl_tile(int tj);
 

@@ -594,6 +594,8 @@ bool covers(int t) { return t == kTypeQ4_0 || t == kTypeQ4_1; }
 
 void set_nl_tile(int tj) { g_nl_tj = tj; }
 
+bool gfx103x() { return device_is_gfx103x(); }
+
 bool nl_on() {
     static const bool env = [] {
         const char* v = std::getenv("STRATA_PF_NL");
