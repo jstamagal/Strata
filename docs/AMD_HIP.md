@@ -471,6 +471,26 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   summary: [bench/results/2026-10-05-rdna2-rocblas-table](../bench/results/2026-10-05-rdna2-rocblas-table/README.md). Decode does not use these GEMMs and is unchanged. See [Tuning
   table](#tuning-table) for making a table for another rocBLAS build.
 
+- **Q4_0 / Q4_1 prompt experts on 256 x 32 tiles (`STRATA_PF_Q4_WIDE=1`, opt-in, gfx103x):** a plain Q4_0 GGUF's
+  prompt experts do not go through rocBLAS or llama.cpp's MMQ on RDNA2 but through Strata's own int8 kernel
+  (`src/prefill/moe_q4.cu`, on by default there, `STRATA_PF_Q4=0` turns it off). Its 64 x 32 tile waits on shared
+  memory: every 4 dots need a 16-byte read of activations from LDS. With the switch the Q4_0 products read a tile's
+  token rows through scalar loads instead (no shared memory, no barrier), fold the zero point into the weight bytes,
+  and give each thread one weight row against 32 token rows; the Q4_1 products keep shared memory and put two weight
+  rows on a thread. The output is the same, bit for bit (`hip_prefill_q4_parity` compares every output of both
+  shapes; a 3.2K-token prompt's final residuals, `STRATA_PREFILL_DUMP_R` with the CPU share off, are the same file
+  with and without). Measured on 2x Radeon PRO V620 (gfx1030, 32 GB each, Ryzen 9 9950X, 92 GB, Linux, ROCm in
+  `/opt/rocm`, rocBLAS 5.8.0), this branch: the kernel alone, 16 experts x 320 token rows, gate+up 6.4 -> 22.3 T MAC/s,
+  down 6.2 -> 23.6 (Q4_0) and 7.6 -> 15.9 (Q4_1) - llama.cpp's MMQ on the same card and shapes runs its i-quant
+  kernels at 13-18 (`hip_prefill_expert_bench`). End to end, bartowski's Swift Q4_0 on both cards (`--layer-split 24`,
+  the `q4_0-stage13-q.json` settings, `tools/strata_bench.py --runs 1`, the same day, two runs each): a 4K prompt
+  1,083-1,090 -> 1,294-1,298 tok/s, a 16K prompt 1,393-1,398 -> 1,595-1,597 tok/s; decode unchanged. With
+  `STRATA_PREFILL_TIMING=1` the 16K prompt's `gemm gate/up` fell 2,556 -> 888 ms and `gemm down` 1,227 -> 386 ms of a
+  10.4 s timeline; about a quarter of that saving came back as waiting for the streamed experts' copies
+  (`embed+steps` and `wait copy`, +600 ms), which is what bounds that prompt now. An i-quant pack does not use this
+  kernel and is unchanged (IQ3_S: 1,400 / 1,830 tok/s without, 1,406 / 1,833 with). Not measured: one card, a
+  gfx1031 / gfx1032 card, Windows.
+
 - **QSA block scores on the FP32 tiled scorer (`STRATA_SELECT_SIMT=1`, opt-in, as on CUDA below sm_80):** without
   matrix cores the prompt path's QSA selection scores every (query, KV block) pair on the warp kernel, the one prompt
   term that grows with the context. The switch runs the FP32 tiled scorer instead (FP32 in another summation order:
