@@ -1,0 +1,323 @@
+// tests/hip/decode_expert_lab.cpp - the decode path's routed experts on this card: what one grouped call costs per
+// format pair, split into gate/up (+ SwiGLU + q8_1) and down, against what the card can read (a plain 16-byte-load
+// streaming kernel over the same bytes).  Synthetic blobs (random codes are valid for every format), no model.
+//
+//     hip_decode_expert_lab            the table: us per call and GB/s of weights read, per format pair and window shape
+//     hip_decode_expert_lab --hash     one line of output hashes per format pair and plan (fixed seed): two runs with
+//                                      different STRATA_* switches must print the same lines when a switch is bitwise
+//
+// A call is a layer's work in a verify window: T tokens x 10 experts, grouped by expert.  The 24 calls of a card's layers
+// run in one graph, every layer with its own experts, so the weights stream from DRAM as they do in the engine.
+#include "strata/kernels/iq_kernels.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace k = strata::kernels;
+
+namespace {
+
+void ck(cudaError_t e, const char* what) {
+    if (e != cudaSuccess) { std::fprintf(stderr, "error in %s: %s\n", what, cudaGetErrorString(e)); std::exit(2); }
+}
+template<typename T> T* dalloc(size_t n) {
+    T* p = nullptr;
+    ck(cudaMalloc(&p, n * sizeof(T) + 256), "malloc");
+    ck(cudaMemset(p, 0, n * sizeof(T) + 256), "memset");
+    return p;
+}
+const char* name_of(int t) {
+    switch (t) {
+        case 18: return "IQ3_XXS"; case 20: return "IQ4_NL"; case 21: return "IQ3_S"; case 22: return "IQ2_S";
+        case 23: return "IQ4_XS"; case 42: return "Q2_0"; case 12: return "Q4_K"; case 13: return "Q5_K";
+        case 7: return "Q5_1"; case 8: return "Q8_0"; case 2: return "Q4_0"; default: return "?";
+    }
+}
+int block_values(int t) { return t == 20 || t == 7 || t == 8 || t == 2 ? 32 : t == 42 ? 64 : 256; }
+
+std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
+    const size_t rb = k::iq_row_bytes(t, n), bs = k::iq_row_bytes(t, block_values(t));
+    std::vector<uint8_t> w((size_t) rows * rb);
+    std::uniform_int_distribution<int> ex(2, 8), man(0, 1023), sgn(0, 1);
+    uint32_t* w32 = (uint32_t*) w.data();
+    for (size_t i = 0; i < w.size() / 4; ++i) w32[i] = rng();
+    for (size_t o = 0; o < w.size(); o += bs) {
+        const int e = (t == 12 || t == 13) ? 1 + ex(rng) % 4 : ex(rng);
+        const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (e << 10) | man(rng));
+        std::memcpy(&w[o], &h, 2);
+        if (t == 12 || t == 13 || t == 7) {
+            const int em = (t == 7) ? ex(rng) : 1 + ex(rng) % 4;
+            const uint16_t m = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (em << 10) | man(rng));
+            std::memcpy(&w[o + 2], &m, 2);
+        }
+    }
+    return w;
+}
+
+// a plain read of `bytes` from each of *n pointers, 16 bytes a load: what the card streams when nothing else is done
+__global__ void stream_kernel(const unsigned long long* __restrict__ ptr, int n, long long bytes, unsigned* __restrict__ out) {
+    const long long words = bytes / 16;
+    unsigned acc = 0;
+    for (int g = blockIdx.y; g < n; g += gridDim.y) {
+        const uint4* p = (const uint4*) ptr[g];
+        for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < words; i += (long long) gridDim.x * blockDim.x) {
+            const uint4 v = p[i];
+            acc += v.x ^ v.y ^ v.z ^ v.w;
+        }
+    }
+    if (acc == 0x12345678u) out[0] = acc;
+}
+
+constexpr int kLayers = 24;
+
+struct Lab {
+    k::NativeExpertLayout L;
+    int T, K, cap, per;
+    size_t slot;
+    uint8_t* arena = nullptr;
+    uint8_t* xq = nullptr;
+    uint8_t* scr = nullptr;
+    float* out = nullptr;
+    unsigned long long* ptr[kLayers];
+    int32_t *start, *n, *dst, *tok;
+    int ng = 0;
+    size_t scr_bytes = 0;
+
+    Lab(int gu, int dt, int tokens, int per_layer, std::mt19937& rng, cudaStream_t s) {
+        L = k::native_expert_layout(gu, dt, 2560, 640);
+        T = tokens; K = 10; cap = T * K; per = per_layer;
+        slot = (L.bytes + 255) & ~(size_t) 255;
+        arena = dalloc<uint8_t>(slot * (size_t) (kLayers * per));
+        {   // 4 distinct random blobs, tiled: the reads still stream (every slot is its own memory)
+            std::vector<std::vector<uint8_t>> src;
+            for (int b = 0; b < 4; ++b) {
+                auto blob = random_rows(gu, 2 * 640, 2560, rng);
+                const auto down = random_rows(dt, 2560, 640, rng);
+                blob.insert(blob.end(), down.begin(), down.end());
+                if (blob.size() != L.bytes) { std::fprintf(stderr, "blob size\n"); std::exit(2); }
+                src.push_back(std::move(blob));
+            }
+            for (int i = 0; i < kLayers * per; ++i)
+                ck(cudaMemcpy(arena + slot * (size_t) i, src[(size_t) (i % 4)].data(), L.bytes, cudaMemcpyHostToDevice), "blob");
+        }
+        for (int l = 0; l < kLayers; ++l) {
+            std::vector<unsigned long long> p;
+            for (int j = 0; j < per; ++j) p.push_back((unsigned long long) (arena + slot * (size_t) (l * per + j)));
+            ptr[l] = dalloc<unsigned long long>(p.size());
+            ck(cudaMemcpy(ptr[l], p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
+        }
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> x((size_t) T * 2560);
+        for (auto& v : x) v = nd(rng);
+        float* dx = dalloc<float>(x.size());
+        ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+        xq = dalloc<uint8_t>((size_t) T * 80 * 36);
+        k::quantize_q8_1_rows(dx, T, 2560, xq, s);
+        ck(cudaStreamSynchronize(s), "quantize");
+        cudaFree(dx);
+        scr_bytes = k::native_expert_scratch_bytes(cap, 640);
+        scr = dalloc<uint8_t>(scr_bytes);
+        out = dalloc<float>((size_t) cap * 2560);
+        start = dalloc<int32_t>(cap + 1); n = dalloc<int32_t>(1); dst = dalloc<int32_t>(cap); tok = dalloc<int32_t>(cap);
+    }
+    ~Lab() {
+        cudaFree(arena); cudaFree(xq); cudaFree(scr); cudaFree(out);
+        for (auto* p : ptr) cudaFree(p);
+        cudaFree(start); cudaFree(n); cudaFree(dst); cudaFree(tok);
+    }
+    // groups of these sizes (entries); a group's entries are different tokens, as the engine's are
+    void plan(const std::vector<int>& sizes, std::mt19937& rng) {
+        std::vector<int32_t> st(1, 0), tk, ds(cap);
+        for (const int m : sizes) {
+            std::vector<int> t(T);
+            std::iota(t.begin(), t.end(), 0);
+            std::shuffle(t.begin(), t.end(), rng);
+            std::sort(t.begin(), t.begin() + m);
+            for (int i = 0; i < m; ++i) tk.push_back(t[(size_t) i]);
+            st.push_back(st.back() + m);
+        }
+        if (st.back() > cap || (int) sizes.size() > per) { std::fprintf(stderr, "plan does not fit\n"); std::exit(2); }
+        tk.resize(cap, 0);
+        ng = (int) sizes.size();
+        std::iota(ds.begin(), ds.end(), 0);
+        std::shuffle(ds.begin(), ds.end(), rng);
+        ck(cudaMemcpy(start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
+        ck(cudaMemcpy(n, &ng, 4, cudaMemcpyHostToDevice), "n");
+        ck(cudaMemcpy(dst, ds.data(), ds.size() * 4, cudaMemcpyHostToDevice), "dst");
+        ck(cudaMemcpy(tok, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice), "tok");
+    }
+    cudaGraphExec_t graph(cudaStream_t s, int phase, int layers) {
+        k::native_expert_set_mode(-1, phase);
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int l = 0; l < layers; ++l)
+            k::native_expert_grouped(L, ptr[l], start, n, dst, tok, cap, cap, xq, scr, out, s, 0);
+        ck(cudaStreamEndCapture(s, &g), "capture");
+        ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+        ck(cudaGraphDestroy(g), "graph");
+        k::native_expert_set_mode(-1, 0);
+        return ge;
+    }
+    cudaGraphExec_t stream_graph(cudaStream_t s, long long bytes, size_t off, unsigned* sink) {
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int l = 0; l < kLayers; ++l) {
+            // pointers offset by `off` cannot be made on the host for a device array without a copy: use a second array
+            stream_kernel<<<dim3(64, (unsigned) std::max(ng, 1)), 256, 0, s>>>(ptr_off[l], ng, bytes, sink);
+        }
+        (void) off;
+        ck(cudaStreamEndCapture(s, &g), "capture");
+        ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+        ck(cudaGraphDestroy(g), "graph");
+        return ge;
+    }
+    unsigned long long* ptr_off[kLayers] = {};
+    void make_ptr_off(size_t off) {
+        for (int l = 0; l < kLayers; ++l) {
+            std::vector<unsigned long long> p;
+            for (int j = 0; j < per; ++j) p.push_back((unsigned long long) (arena + slot * (size_t) (l * per + j) + off));
+            if (!ptr_off[l]) ptr_off[l] = dalloc<unsigned long long>(p.size());
+            ck(cudaMemcpy(ptr_off[l], p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
+        }
+    }
+};
+
+float launch_us(cudaStream_t s, cudaGraphExec_t ge, cudaEvent_t e0, cudaEvent_t e1, int layers) {
+    ck(cudaEventRecord(e0, s), "record");
+    ck(cudaGraphLaunch(ge, s), "launch");
+    ck(cudaEventRecord(e1, s), "record");
+    ck(cudaEventSynchronize(e1), "bench");
+    float ms = 0;
+    ck(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+    return 1e3f * ms / (float) layers;
+}
+float median_us(cudaStream_t s, cudaGraphExec_t ge, int layers = kLayers) {
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    std::vector<float> v;
+    for (int i = 0; i < 70; ++i) {
+        const float t = launch_us(s, ge, e0, e1, layers);
+        if (i >= 20) v.push_back(t);
+    }
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+uint64_t fnv(const void* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t* b = (const uint8_t*) p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// the window shapes: group sizes of a T-token window (10 experts a token; tokens of one window share some experts)
+std::vector<int> shape(int T) {
+    switch (T) {
+        case 1: return std::vector<int>(10, 1);
+        case 2: { std::vector<int> v(14, 1); v.insert(v.end(), 3, 2); return v; }                          // 17 groups, 20
+        case 3: { std::vector<int> v(15, 1); v.insert(v.end(), 6, 2); v.insert(v.end(), 1, 3); return v; }  // 22 groups, 30
+        default: { std::vector<int> v(16, 1); v.insert(v.end(), 9, 2); v.insert(v.end(), 2, 3); return v; } // 27 groups, 40
+    }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    const bool hash = argc > 1 && std::string(argv[1]) == "--hash";
+    int only_gu = -1, only_d = -1, only_T = 0;
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string(argv[i]) == "--pair") { std::sscanf(argv[i + 1], "%d/%d", &only_gu, &only_d); }
+        if (std::string(argv[i]) == "--T") only_T = std::atoi(argv[i + 1]);
+    }
+    cudaStream_t s;
+    ck(cudaStreamCreate(&s), "stream");
+    const int pairs[][2] = {{18, 20}, {22, 20}, {21, 20}, {22, 42}, {18, 42}, {21, 42}, {23, 20}, {12, 7}, {12, 8}, {13, 8}};
+    if (hash) {
+        for (const auto& pr : pairs) {
+            if (only_gu >= 0 && (pr[0] != only_gu || pr[1] != only_d)) continue;
+            if (!k::native_expert_supported(pr[0], pr[1], 2560, 640)) continue;
+            std::mt19937 rng(1234u + (unsigned) pr[0] * 100u + (unsigned) pr[1]);
+            for (const int T : {1, 2, 3, 4, 7}) {
+                Lab lab(pr[0], pr[1], T, T * 10, rng, s);
+                for (int v = 0; v < 3; ++v) {
+                    std::vector<int> sizes;
+                    if (v == 0) sizes = T <= 4 ? shape(T) : std::vector<int>{7, 6, 5, 4, 3, 2, 1, 1, 1, 5, 5, 4, 1, 1, 1, 1};
+                    else if (v == 1) sizes = std::vector<int>((size_t) T * 10, 1);
+                    else { int left = T * 10; while (left > 0) { const int m = std::min(left, T); sizes.push_back(m); left -= m; } }
+                    lab.plan(sizes, rng);
+                    ck(cudaMemset(lab.out, 0xFF, (size_t) lab.cap * 2560 * 4), "memset");
+                    ck(cudaMemset(lab.scr, 0x5A, lab.scr_bytes), "memset");
+                    k::native_expert_grouped(lab.L, lab.ptr[0], lab.start, lab.n, lab.dst, lab.tok, lab.cap, lab.cap, lab.xq,
+                                             lab.scr, lab.out, s, 0);
+                    ck(cudaStreamSynchronize(s), "sync");
+                    std::vector<float> o((size_t) lab.cap * 2560);
+                    ck(cudaMemcpy(o.data(), lab.out, o.size() * 4, cudaMemcpyDeviceToHost), "out");
+                    size_t nan = 0;
+                    for (const float f : o) nan += f != f;
+                    std::printf("%-8s/%-7s T %d plan %d (%2zu groups): out %016llx (%zu non-finite)\n", name_of(pr[0]),
+                                name_of(pr[1]), T, v, sizes.size(), (unsigned long long) fnv(o.data(), o.size() * 4), nan);
+                }
+            }
+        }
+        return 0;
+    }
+    std::printf("decode expert lab: us per layer call (median of 50 launches of a %d-layer graph, every layer its own experts)\n"
+                "and GB/s of expert weights read; 'stream' = a plain 16-byte-load read of the same bytes\n", kLayers);
+    unsigned* sink = dalloc<unsigned>(4);
+    {   // what a launch costs by itself: 24 launches of 1 block that reads nothing
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        unsigned long long* none = dalloc<unsigned long long>(1);
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int l = 0; l < kLayers; ++l) stream_kernel<<<dim3(1, 1), 256, 0, s>>>(none, 0, 0, sink);
+        ck(cudaStreamEndCapture(s, &g), "capture");
+        ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+        std::printf("an empty launch in a graph: %.2f us\n", median_us(s, ge));
+        ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "capture");
+        for (int l = 0; l < kLayers; ++l) stream_kernel<<<dim3(80, 40), 256, 0, s>>>(none, 0, 0, sink);
+        ck(cudaStreamEndCapture(s, &g), "capture");
+        ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+        std::printf("an empty launch of 80 x 40 blocks in a graph: %.2f us\n", median_us(s, ge));
+    }
+    for (const auto& pr : pairs) {
+        if (only_gu >= 0 && (pr[0] != only_gu || pr[1] != only_d)) continue;
+        if (!k::native_expert_supported(pr[0], pr[1], 2560, 640)) { std::printf("%s/%s: not supported\n", name_of(pr[0]), name_of(pr[1])); continue; }
+        std::mt19937 rng(99);
+        for (const int T : {1, 2, 3, 4}) {
+            if (only_T && T != only_T) continue;
+            Lab lab(pr[0], pr[1], T, T * 10, rng, s);
+            const auto sizes = shape(T);
+            lab.plan(sizes, rng);
+            const double gu_mb = (double) sizes.size() * (double) lab.L.down_off / 1e6;
+            const double d_mb = (double) sizes.size() * (double) (lab.L.bytes - lab.L.down_off) / 1e6;
+            cudaGraphExec_t g1 = lab.graph(s, 1, kLayers), g2 = lab.graph(s, 2, kLayers), g0 = lab.graph(s, 0, kLayers);
+            const float t1 = median_us(s, g1), t2 = median_us(s, g2), t0 = median_us(s, g0);
+            lab.make_ptr_off(0);
+            cudaGraphExec_t gs1 = lab.stream_graph(s, (long long) lab.L.down_off, 0, sink);
+            const float ts1 = median_us(s, gs1);
+            lab.make_ptr_off(lab.L.down_off);
+            cudaGraphExec_t gs2 = lab.stream_graph(s, (long long) (lab.L.bytes - lab.L.down_off), 0, sink);
+            const float ts2 = median_us(s, gs2);
+            std::printf("%-8s/%-7s T %d %2zu groups %2d entries | gate/up %7.1f us %5.0f GB/s (stream %6.1f us %4.0f GB/s) | "
+                        "down %7.1f us %5.0f GB/s (stream %6.1f us %4.0f GB/s) | all %7.1f us\n",
+                        name_of(pr[0]), name_of(pr[1]), T, sizes.size(), T * 10, t1, gu_mb / t1 * 1e3, ts1, gu_mb / ts1 * 1e3,
+                        t2, d_mb / t2 * 1e3, ts2, d_mb / ts2 * 1e3, t0);
+            std::fflush(stdout);
+            for (auto ge : {g1, g2, g0, gs1, gs2}) cudaGraphExecDestroy(ge);
+        }
+    }
+    return 0;
+}
