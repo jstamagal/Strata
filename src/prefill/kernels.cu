@@ -115,7 +115,8 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
 }
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
                                 const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo,
+                                int g_f16) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -124,7 +125,14 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
     for (int c = 0; c < HC; ++c) {
         const int64_t j = t * D + c * N + d;
         const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
-        s = fmaf(x, sigm(g[j]), s);
+#if defined(__HIPCC__)
+        // STRATA_HC_GATED16: `gated` as the FP16-out GEMM left it (row t's D halves at the start of its FP32 row),
+        // widened here - the value the in-place widening would have stored
+        const float gv = g_f16 ? __half2float(reinterpret_cast<const __half*>(g + t * D)[c * N + d]) : g[j];
+#else
+        const float gv = g[j];
+#endif
+        s = fmaf(x, sigm(gv), s);
     }
     s /= (float) HC;
     mixed[i] = s;
@@ -243,6 +251,18 @@ __global__ void gr_silu_kernel(const float* __restrict__ lo, uint16_t* __restric
     const uint16_t h = act16(v);
     lo16[i] = h;
     if (lo16_lo) lo16_lo[i] = bf_lo(v, h);
+}
+// STRATA_HC_DOWNINJ: gr_silu_kernel over the down outputs of a [down; inject] product (row stride ld, the HC inject
+// logits after the LR down outputs), and the inject logits copied to their own rows
+__global__ void gr_silu_inj_kernel(const float* __restrict__ lo, int64_t ld, uint16_t* __restrict__ lo16,
+                                   float* __restrict__ inj, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * LR) return;
+    const int64_t t = i / LR, k = i % LR;
+    const float x = lo[t * ld + k] / (float) HC;
+    const float v = x / (1.0f + __expf(-x));
+    lo16[i] = act16(v);
+    if (k < HC) inj[t * HC + k] = lo[t * ld + LR + k];
 }
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
@@ -1900,9 +1920,9 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
     check("gr_norm_rs");
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+              int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo, bool gated_f16) {
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
-                                                                          mixed_h, mixed16_lo);
+                                                                          mixed_h, mixed16_lo, gated_f16 ? 1 : 0);
     check("gr_mix_r");
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
@@ -1942,6 +1962,10 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo) {
     gr_silu_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, lo16, lo16_lo, T * LR);
     check("gr_silu");
+}
+void gr_silu_inj(const float* lo, int64_t ld, uint16_t* lo16, float* inj, int64_t T, void* stream) {
+    gr_silu_inj_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, ld, lo16, inj, T);
+    check("gr_silu_inj");
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h, uint16_t* mixed16_lo) {

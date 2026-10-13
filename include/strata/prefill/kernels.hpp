@@ -21,8 +21,10 @@ void gr_norm(const float* R, const float* w_norm, float eps, float* xn, uint16_t
 void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint16_t* xn16, int64_t T, void* stream,
                 uint16_t* xn16_lo = nullptr, int64_t ldx = 0);   // ldx: xn16's token stride (0 = 10240)
 /// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
+/// `gated_f16` (STRATA_HC_GATED16, HIP): `gated` holds FP16 at the start of each FP32 row (Gemm::keep_f16_next).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
-              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+              int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr,
+              bool gated_f16 = false);
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
 /// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its
@@ -40,6 +42,8 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
                            uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr, int64_t ldx = 0);
 /// lo16[t, k] = bf16(silu(lo[t, k] / hc))
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
+/// STRATA_HC_DOWNINJ: gr_silu over lo[t, 0..320) of rows with stride `ld` (>= 324), and inj[t, c] = lo[t, 320 + c].
+void gr_silu_inj(const float* lo, int64_t ld, uint16_t* lo16, float* inj, int64_t T, void* stream);
 /// The BF16-weight GEMMs' activation image (gr_* kernels, to_bf16) in FP16 instead of BF16, on the current device.
 void set_act_f16(bool on);
 /// mixed[t, d] = mean_c xn[t, c, d] * sigmoid(gated[t, c, d]); FP32, BF16 and FP16 (either image may be null).
