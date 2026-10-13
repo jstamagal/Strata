@@ -33,4 +33,18 @@ void run(const mmq::Product& p, void* stream);
 /// and benches: an A/B in one process.
 void set_variant(int v);
 
+/// STRATA_PF_DIRECT=1 (opt-in) and `enabled`: the prompt path gives `run` each expert's own blob (Product::each)
+/// instead of a copy of it in the group buffer.  Such a product runs on the 256 x 32 tiles whatever STRATA_PF_Q4_WIDE says.
+bool direct();
+
+/// STRATA_PF_NL=1 (opt-in, gfx103x): IQ4_NL down products (`w_cols` 640) on the 256-row tiles instead of
+/// llama.cpp's MMQ, from MMQ's own activations (mmq::quantize / swiglu_quant for that type), with MMQ's output bits
+/// (see moe_q4.cu for the one exception, the sign of an exact zero).  Never reads past a matrix, so Product::each
+/// works for a down matrix too.
+bool nl_on();
+bool nl_fits(int ggml_type, int64_t w_cols);
+void nl_run(const mmq::Product& p, void* stream);
+/// Tests: the token rows of a tile (32, 48 or 64); 0: the launch's own choice.
+void set_nl_tile(int tj);
+
 }  // namespace strata::prefill::q4

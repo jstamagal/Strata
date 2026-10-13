@@ -63,6 +63,7 @@
 // A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
 namespace strata::prefill::mmq {
 bool built() { return false; }
+bool direct_blobs(int, bool) { return false; }
 bool supported(int) { return false; }
 bool fits(int, int64_t) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
@@ -2489,6 +2490,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        bool routed_stream = false;   // STRATA_PF_STREAM_ROUTED=1: seq grows layer by layer, after each routing
+        bool routed_last = false;     // ... and a layer's streamed experts are walked after its resident ones
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
@@ -2534,12 +2537,47 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
+            // STRATA_PF_STREAM_ROUTED=1 (opt-in): the stream carries only the experts the routing PICKED.  The fixed
+            // list above copies every non-resident expert of every layer each chunk, so that the copies can run through
+            // the attention halves, ahead of the routing - but a 2,048-token chunk routes to a fifth to a half of them
+            // (they are the rarely used ones: that is why they are not in VRAM), and on a card whose link is the limit
+            // (a PRO V620 behind a PCIe 4.0 x4 slot: 6.5 GiB a chunk at ~6.5 GB/s) the prompt waits for copies of
+            // experts it never reads.  Here a layer's entries are appended once its routing is known (`plan_layer`,
+            // below) and the same ring, group gather and release events carry them: the same bytes into the same
+            // products, so the same output.  What it gives up is the copies' run through the attention half of a
+            // layer; they overlap the layer's resident experts instead (see where plan_layer is called).  Only where
+            // every streamed blob is DMA'd from page-locked memory (no stager jobs), no peer and no fused kernels take
+            // part; any other chunk keeps the fixed list.
+            static const int routed_env = [] {
+                const char* v = std::getenv("STRATA_PF_STREAM_ROUTED");
+                return v != nullptr && (v[0] == '1' || v[0] == '2') ? v[0] - '0' : 0;
+            }();
+            routed_last = routed_env == 1;
+            routed_stream = routed_env != 0 && js.empty() && !ps_on && m.pp == nullptr && !fused_ring() && !m.fused_bufs;
+            if (routed_stream) {
+                seq.clear();   // keeps its capacity (every non-resident expert): plan_layer never reallocates it
+                std::fill(seq_start.begin(), seq_start.end(), (size_t) 0);
+            }
             m.stager->start(std::move(js));
         }
         struct StagerDone {
             Stager* st;
             ~StagerDone() { if (st) st->finish(); }
         } chunk_stager_done{stream_all ? m.stager.get() : nullptr};
+        // STRATA_PF_STREAM_STATS=1 (diagnosis): a line per chunk on what the streamed experts cost - the entries
+        // copied and how many of them the routing picked, the host time inside the copy calls, the issuer's time waiting
+        // for ring slots, and the launching thread's time waiting for a copy to be issued or to land.  "To land" is
+        // taken with a blocking wait on the copy's event before the group that needs it is queued: the host runs
+        // ahead of the GPU, so it is an upper bound of the GPU's wait, not the wait itself, and it holds the host
+        // back - compare speeds without the variable.
+        // STRATA_PF_STREAM_STATS=skip: the copies are NOT made (the ring keeps whatever it held: the output is
+        // garbage) - the prompt speed with free copies, the bound of anything a faster copy path could give.
+        static const int sstat = [] {
+            const char* v = std::getenv("STRATA_PF_STREAM_STATS");
+            return v == nullptr ? 0 : std::strcmp(v, "skip") == 0 ? 2 : std::atoi(v) != 0 ? 1 : 0;
+        }();
+        double ss_ring_ms = 0, ss_wait_issue_ms = 0, ss_wait_land_ms = 0;
+        int64_t ss_routed = 0, ss_bytes = 0, ss_late = 0;
         auto issue_until = [&](size_t limit) {
             limit = std::min(limit, seq.size());
             while (issued < limit) {
@@ -2547,6 +2585,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                ss_bytes += (int64_t) bytes;
                 if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                 if (en.job < 0) {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
@@ -2581,23 +2620,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::thread* t;
             ~IssuerJoin() { if (t->joinable()) { stop->store(true); t->join(); } }
         } issuer_join{&a_stop, &issuer};
-        const bool threaded_issue = stream_all && issuer_on;
+        // The routed stream is issued by the launching thread itself, as each layer is planned: every copy is a DMA
+        // from page-locked memory (a few microseconds to queue - the issuer thread exists for host copies of unpinned
+        // blobs), and a hand-over to another thread at every layer cost ~1.4 ms of an idle GPU each (measured: 35 ms of
+        // a 2,048-token chunk).
+        const bool threaded_issue = stream_all && issuer_on && !routed_stream;
         if (threaded_issue) {
             issuer = std::thread([&] {
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
+                    const auto tr = Clock::now();
                     while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
                     }
+                    if (sstat) ss_ring_ms += ms_since(tr);
                     const StreamEntry& en = seq[idx];
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
+                    ss_bytes += (int64_t) bytes;
                     if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
                     if (en.job < 0) {
-                        cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
+                        if (sstat != 2) cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
@@ -2617,11 +2663,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // the consumer's side: entry k's copy is on the copy stream (the thread issued it), then k is given back
         auto wait_issued = [&](size_t k) {
             if (!threaded_issue) return;
+            if (a_issued.load(std::memory_order_acquire) > k) return;
+            const auto tw = Clock::now();
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
+            if (sstat) ss_wait_issue_ms += ms_since(tw);
         };
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
+        };
+        // the routed stream: layer l's routed experts that are not in VRAM, in the walk's (id) order
+        auto plan_layer = [&](int64_t l, const std::vector<int32_t>& order) -> bool {
+            seq_start[(size_t) l] = seq.size();
+            for (const int32_t e : order) {
+                if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
+                const uint8_t* b = m.src->blob_stable(l, e);
+                if (b == nullptr || !m.src->pinned(l, e) || seq.size() == seq.capacity()) {
+                    err = "prefill: the routed stream met an expert it cannot copy from page-locked memory";
+                    return false;
+                }
+                seq.push_back({(int32_t) l, e, b, -1});
+            }
+            for (size_t i = (size_t) l + 1; i < seq_start.size(); ++i) seq_start[i] = seq.size();
+            issue_until(consumed + (size_t) m.ring);   // the layer's copies start now, as far as the ring has room
+            return true;
         };
         if (ps_on) {
             int pd = 0;
@@ -3465,6 +3530,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 (!on_peer.empty() && on_peer[(size_t) e] ? order_peer : order).push_back(e);
                         for (int32_t e = 0; e < m.g->n_expert && !on_peer.empty(); ++e)   // the peer-streamed ones last:
                             if (on_peer[(size_t) e] == 2) order_peer.push_back(e);        // their copies get the most time
+                        // The routed stream (STRATA_PF_STREAM_ROUTED=1): the layer's streamed experts go LAST in the walk,
+                        // the resident ones first (each class in id order), so the copies that start now have the
+                        // resident experts' products as a head start instead of the first group waiting for its own
+                        // (measured in id order: 37-44 ms of "wait copy" a 2,048-token chunk and stage on Q4_0, 85-108 ms
+                        // on UD-Q4_K_XL).  The rows are laid out in that order, as STRATA_MMQ_RESIDENT_SORT_NE lays a
+                        // resident layer's out by row count: slot/src/off rebuilt together, each output's arithmetic
+                        // untouched - the same bits.  STRATA_PF_STREAM_ROUTED=2: the routed stream in id order (the A/B).
+                        if (routed_stream && routed_last && use_mmq && on_peer.empty() && on_cpu.empty() && m.cache && m.host_res) {
+                            const int32_t* res = m.host_res + (size_t) l * m.g->n_expert;
+                            const auto mid = std::stable_partition(order.begin(), order.end(),
+                                                                   [&](int32_t e) { return res[(size_t) e] >= 0; });
+                            if (mid != order.begin() && mid != order.end())
+                                detail::mmq_order_rows(ids_h, T * K, (int32_t) K, m.cnt, m.off, order, slot_h, src_h);
+                        }
+                        if (routed_stream && !plan_layer(l, order)) return false;
                         // Aurora (STRATA_MMQ_RESIDENT_SORT_NE=1, opt-in): a layer whose experts are ALL resident and
                         // run through MMQ groups takes them in row-count order, so each 16-expert group's max_rows
                         // (its padded tile rows) is close to its experts' own; slot/src/off are rebuilt coherently
@@ -3931,14 +4011,72 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
                         int gg_nslots = 0;   // ring slots gathered by the next flush
-                        auto flush = [&]() {
+                        int dbg_flushes = 0;
+                        // STRATA_PF_DIRECT=1 (HIP gfx103x, opt-in): a group's products read each expert where it lies -
+                        // its cache slot or ring slot - so the group is not copied into grp_gu / grp_d first (2-4 MB an
+                        // expert; "dequant" in STRATA_PREFILL_TIMING).  Gate/up of every MMQ type and of Q4_0 / Q4_1;
+                        // down only of Q4_0 / Q4_1 (`direct_d`): llama.cpp's MMQ reads K in steps of 256, so 128
+                        // values past each row of a 640-column matrix, and past the blob for the last row - the
+                        // group buffer's zeroed tail is what makes that harmless.  Such a down matrix is still
+                        // gathered (a third of the bytes).  The ring slots are then released by the event after the
+                        // group's products instead of the one after its gather.  A flush before the group is complete
+                        // (a ring entry the routing skipped) still gathers what the group holds so far, and those
+                        // experts are read from the group buffer.  The same bytes reach the same kernels' arithmetic.
+                        const bool direct = group_gather && mmq::direct_blobs(mmq_gt, false);
+                        const bool direct_d = direct && mmq::direct_blobs(mmq_dt, true);
+                        const uint8_t* dp_gate[MMQ_GROUP];
+                        const uint8_t* dp_up[MMQ_GROUP];
+                        const uint8_t* dp_down[MMQ_GROUP];
+                        auto flush = [&](bool hold = false) {
                             if (gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
+                            if (hold) {   // direct: the wait for the group's last copy; the slots stay held
+                                if (gg_nslots > 0) {
+                                    if (sstat == 1 && cudaEventQuery(m.copied[gg_slots[gg_nslots - 1]]) != cudaSuccess) {
+                                        const auto tw = Clock::now();
+                                        cudaEventSynchronize(m.copied[gg_slots[gg_nslots - 1]]);
+                                        ss_wait_land_ms += ms_since(tw);
+                                        ++ss_late;
+                                    }
+                                    pt.mark(kPfWaitCopy, cs);
+                                    cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
+                                    pt.mark(kPfDequant, cs);
+                                }
+                                if (!direct_d) {   // the down matrices alone (16-byte aligned, or one at a time)
+                                    if (!mmq::gather_native_group(gg, f.up_off, 0, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                                                  m.grp_d, mmq_db, m.cs)) {
+                                        for (int i = gg.first; i < gg.n; ++i) {
+                                            const uint8_t* b = gg.blob[i];
+                                            mmq::gather_native(b, b, 0, b + f.down_off, mmq_db, m.grp_gu + i * mmq_gub,
+                                                               m.grp_d + i * mmq_db, m.cs);
+                                        }
+                                    }
+                                }
+                                gg.first = gg.n;
+                                return;
+                            }
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
+                                if (sstat == 1 && cudaEventQuery(m.copied[gg_slots[gg_nslots - 1]]) != cudaSuccess) {
+                                    // (diagnosis only) the group's last copy has not landed when the host is ready to
+                                    // launch it: how long until it does
+                                    const auto tw = Clock::now();
+                                    cudaEventSynchronize(m.copied[gg_slots[gg_nslots - 1]]);
+                                    ss_wait_land_ms += ms_since(tw);
+                                    ++ss_late;
+                                }
                                 pt.mark(kPfWaitCopy, cs);
                                 cudaStreamWaitEvent(m.cs, m.copied[gg_slots[gg_nslots - 1]], 0);
                                 pt.mark(kPfDequant, cs);
                             }
+                            // STRATA_PF_STREAM_STATS=nogather (diagnosis, WRONG output): only a layer's first two
+                            // groups are gathered, the others read what the buffer holds - the prompt speed without
+                            // the gather, the bound of reading the experts where they lie
+                            static const bool dbg_nogather = [] {
+                                const char* v = std::getenv("STRATA_PF_STREAM_STATS");
+                                return v != nullptr && std::strcmp(v, "nogather") == 0;
+                            }();
+                            if (dbg_nogather && ++dbg_flushes > 2) {
+                            } else
                             if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
                                                           m.grp_d, mmq_db, m.cs)) {
                                 for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
@@ -3951,6 +4089,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int rel = gg_slots[gg_nslots - 1];
                                 cudaEventRecord(m.used[rel], m.cs);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                            }
+                            for (int i = gg.first; i < gg.n && direct; ++i) {   // gathered after all: read from the group buffer
+                                dp_gate[i] = (const uint8_t*) m.grp_gu + (size_t) i * mmq_gub;
+                                dp_up[i] = dp_gate[i] + mmq_gub / 2;
+                                dp_down[i] = (const uint8_t*) m.grp_d + (size_t) i * mmq_db;
                             }
                             gg_nslots = 0;
                             gg.first = gg.n;
@@ -3967,8 +4110,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
+                                    if (direct) {
+                                        const auto& f = lay.fmt[(size_t) l];
+                                        dp_gate[q] = blob_dev;
+                                        dp_up[q] = blob_dev + f.up_off;
+                                        dp_down[q] = blob_dev + f.down_off;
+                                    }
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
-                                    flush();
+                                    flush(direct);
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
@@ -3987,12 +4136,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
                                 // the zeroed tail after the group's last expert (see MMQ_TAIL)
-                                cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
-                                cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
+                                // (direct: no product reads past a gate/up matrix - K 2560 is whole steps of 256 - and
+                                // a direct down product is not MMQ's)
+                                if (!direct) cudaMemsetAsync(m.grp_gu + (size_t) ngx * mmq_gub, 0, MMQ_TAIL, m.cs);
+                                if (!direct_d) cudaMemsetAsync(m.grp_d + (size_t) ngx * mmq_db, 0, MMQ_TAIL, m.cs);
                                 mmq::Product gu;
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+                                if (direct) {
+                                    gu.each = true;
+                                    gu.w_split = 640;
+                                    for (int i = 0; i < ngx; ++i) { gu.w0[i] = dp_gate[i]; gu.w1[i] = dp_up[i]; }
+                                }
                                 m.mmq_ctx->run(gu, m.cs);
                                 // swiglu and H's q8_1 rows in one pass where the down type reads D4 rows
                                 const bool sq = swiglu_quant_on() && mmq::swiglu_quant_ok(mmq_dt);
@@ -4005,7 +4161,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
+                                if (direct_d) {
+                                    dn.each = true;
+                                    dn.w_split = N;
+                                    for (int i = 0; i < ngx; ++i) { dn.w0[i] = dp_down[i]; dn.w1[i] = dp_down[i]; }
+                                }
                                 m.mmq_ctx->run(dn, m.cs);
+                                if (direct && gg_nslots > 0) {   // the ring slots this group read are free now
+                                    const int rel = gg_slots[gg_nslots - 1];
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                    gg_nslots = 0;
+                                }
                                 return true;
                             }
                             const int q = (int) (j % DQ);
@@ -4057,7 +4224,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             size_t k = seq_start[(size_t) l];
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
-                                while (k < kend && seq[k].e < e_stop) {
+                                // (the routed stream has no entry the routing skipped, and its walk is not in id order)
+                                while (!routed_stream && k < kend && seq[k].e < e_stop) {
                                     if (gg_nslots > 0) flush();   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
                                     cudaEventRecord(m.used[sl], m.cs);
@@ -4071,6 +4239,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
+                                    ++ss_routed;
                                     wait_issued(k);
                                     if (!group_gather) {
                                         pt.mark(kPfWaitCopy, cs);
@@ -4247,6 +4416,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
         }
+        if (sstat && stream_all)
+            std::fprintf(stderr, "strata prefill stream: layers %lld-%lld, %lld tokens: %zu experts copied (%.0f MiB), %lld "
+                             "of them routed; host: in the copy calls %.0f ms, issuer waiting for ring slots %.0f ms "
+                             "(ring %d), launcher waiting for an issue %.0f ms, for a copy to land %.0f ms (%lld "
+                             "groups)%s%s\n", (long long) LB, (long long) LE - 1, (long long) T, seq.size(),
+                         (double) ss_bytes / 1048576.0, (long long) ss_routed, iss_ms, ss_ring_ms, m.ring,
+                         ss_wait_issue_ms, ss_wait_land_ms, (long long) ss_late, sstat == 2 ? " [copies skipped]" : "",
+                         routed_stream ? " [routed stream]" : "");
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
@@ -4275,7 +4452,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
             cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
-            if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
+            // a layer split: every stage dumps what it hands on, and with several chunks two stages write at the
+            // same time.  STRATA_PREFILL_DUMP_R_STAGES=1 gives each stage its own file (`<dump>.L<first layer>`)
+            static const bool per_stage = [] { const char* v = std::getenv("STRATA_PREFILL_DUMP_R_STAGES"); return v && v[0] == '1'; }();
+            const std::string dump_s = per_stage ? std::string(dump) + ".L" + std::to_string(LB) : std::string(dump);
+            if (std::FILE* f = std::fopen(dump_s.c_str(), c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
                 for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);

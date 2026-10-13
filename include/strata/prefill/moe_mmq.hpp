@@ -40,6 +40,7 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
 /// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
 /// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
+constexpr int kGatherGroupMax = 16;
 struct Product {
     const void* w = nullptr;
     int type = -1;
@@ -52,7 +53,21 @@ struct Product {
     int64_t total_rows = 0, max_rows = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
+    // each (only where direct_blobs() said so; n <= kGatherGroupMax): expert e's rows [0, w_split) start at w0[e] and
+    // rows [w_split, w_rows) at w1[e], wherever they lie - `w` and `expert_bytes` are not read
+    bool each = false;
+    int64_t w_split = 0;
+    const void* w0[kGatherGroupMax] = {};
+    const void* w1[kGatherGroupMax] = {};
 };
+
+/// HIP, gfx103x, STRATA_PF_DIRECT=1 (opt-in): a product of this weight type can read each expert from its own blob
+/// (Product::each), so a group need not be gathered into one buffer first.  Q4_0 / Q4_1 (Strata's own kernel): gate/up
+/// and down.  An MMQ type: gate/up only (`down` false) and only in a build whose llama.cpp has the per-channel weight
+/// pointers (third_party/llama.cpp-patches 0003) - MMQ reads K in steps of 256 values, so past each row of a
+/// 640-column down matrix and past the matrix's end for its last row, which only the group buffer's zeroed tail
+/// makes harmless.  false everywhere else.
+bool direct_blobs(int ggml_type, bool down);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {
@@ -74,7 +89,6 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
 /// gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate at +0, up at
 /// +up_off, down at +down_off) to gu_dst + q * gu_stride and d_dst + q * d_stride - the same bytes as one gather_native
 /// each.  Every pointer, offset and size 16-byte aligned (false otherwise: nothing launched, gather one at a time).
-constexpr int kGatherGroupMax = 16;
 struct GatherGroup {
     const uint8_t* blob[kGatherGroupMax] = {};
     int first = 0, n = 0;
