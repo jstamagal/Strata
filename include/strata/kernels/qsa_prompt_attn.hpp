@@ -16,6 +16,11 @@
 // Not bitwise equal to `qsa_decode_attn_batch`; `qsa_prompt_attn_parity` bounds the difference and the prompt
 // quality gate (needles, teacher-forced top-1) checks it end to end. Q4_0 KV (mode 4): each block's codes enter
 // exactly as int8 and its scale (one per 32 values) in FP32, as int8 KV's do (STRATA_PROMPT_ATTN_Q4=0: the old kernel).
+// RDNA2 (gfx103x, no matrix cores), opt-in STRATA_PA_DOT4=1: the same design on v_dot4_i32_i8 for int8 KV - q and
+// p times the V scale enter as three balanced base-256 digits (23 bits relative to the block's / the chunk's largest),
+// the int8 codes as they are stored, every digit's dot product is exact in int32 and the scales are applied in FP32.
+// FP32-level like the kernels above (qsa_prompt_attn_parity runs it on gfx103x).  STRATA_PA_DOT4=2: two digits
+// (15 bits), faster and rounding-level - it does not hold the parity test's bounds.
 #pragma once
 
 #include "strata/kernels/qsa_decode_attn.hpp"

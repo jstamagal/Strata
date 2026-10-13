@@ -1446,6 +1446,379 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     }
     return true;
 }
+
+// ---- gfx103x (RDNA2, no matrix cores), opt-in (STRATA_PA_DOT4=1): the int8-KV prompt attention on v_dot4_i32_i8.
+// The design of the kernels above - one block per (query, KV head), an online softmax over chunks of the selection,
+// no split-K scratch and no merge kernel - with the signed byte dot product as the multiplier.  The stored int8
+// codes are its second operand as they lie in the pool (no conversion); the first is q, or p times the V scale,
+// scaled so the largest of the block (q) or of the head's chunk (p) is 8,355,000, rounded to an integer and cut into
+// three balanced base-256 digits (23 bits).  Each digit's dot product is exact in int32 (a 64-dim scale group or a
+// 64-cell chunk: |sum| <= 2^20); the three are combined in FP32 and the int8 scales are applied in FP32.
+// FP32-level accuracy (qsa_prompt_attn_parity: 2.8e-6 against FP64 where the FP32 kernel has 2.1e-6, output scale
+// 3.6), deterministic, not bitwise equal to qsa_decode_attn_batch (another summation order, exp2).
+// ND = 2 (STRATA_PA_DOT4=2): two digits, 15 bits of q and p - rounding-level (4.9e-4 on the same test, which it
+// fails), as STRATA_PA_FAST is for the matrix-core kernel.
+//   q.k : 64 / LW lanes hold one (cell, head triple), each LW K words read straight from the pool and the same
+//         words of the triple's q digits in registers: 3 x LW x ND dot4 per lane and cell, then a DPP sum over the
+//         lanes.  No shared-memory traffic inside a step.
+//   p.v : thread = (4 dims, head triple): the chunk's V codes are staged transposed (one word = one dim of 4 cells),
+//         so a dot4 runs over 4 cells: 3 x 4 x ND dot4 per 4 cells.
+// Measured on a Radeon PRO V620 (gfx1030), 2,048 queries of 2,051 cells at 32K, int8 KV: 20.5 ms the FP32 kernel
+// (batches of 32, STRATA_ATTN_MERGE_V2=1), 13.2 ms this one, 10.0 ms with two digits.
+#if (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+     defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)) && \
+    __has_builtin(__builtin_amdgcn_sdot4) && __has_builtin(__builtin_amdgcn_mov_dpp)
+#define STRATA_PA_DOT4 1
+#else
+#define STRATA_PA_DOT4 0
+#endif
+constexpr int DTH = 256;         // threads: 8 waves
+constexpr int DCH = 64;          // cells per chunk (32 measured slower: 14.8 against 13.2 ms for 2,048 queries at 32K)
+struct alignas(16) SmemD {       // 42.7 KB
+    uint32_t qd[G][3][HD / 4];        // q digits: [head][digit][word of 4 dims]
+    uint32_t vt[DCH / 4][HD];         // V codes, transposed: [cell quad][dim], byte j = cell 4 * quad + j
+    uint32_t wd[4][DCH / 4][G][4];    // p * V scale digits: [scale group][cell quad][head][digit], byte j = cell j
+    float sc[G][DCH];                 // q.k
+    float vs[DCH][4];                 // V scale per (cell, group); 0 for a masked cell
+    long long row[DCH];               // pool row, or -1
+    float qmax[DTH / 32];
+    float alpha[G];
+    float lsum[G];
+    float mrow[G];
+    float vdown[G];
+};
+
+__device__ __forceinline__ int dot4_i8(uint32_t a, uint32_t b, int c) {
+#if STRATA_PA_DOT4
+    return __builtin_amdgcn_sdot4((int) a, (int) b, c, false);
+#else
+    __builtin_trap();
+    return c;
+#endif
+}
+// the value of lane ^ M within the lane's 16-lane row (DPP row_xmask, in registers)
+template <int M> __device__ __forceinline__ float row_x(float v) {
+#if STRATA_PA_DOT4
+    return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | M, 0xF, 0xF, false));
+#else
+    __builtin_trap();
+    return v;
+#endif
+}
+// ND balanced base-256 digits of four integers, digit d of element e in byte e of out[d]
+template <int ND> __device__ __forceinline__ void digits4(const int* v4, uint32_t* out) {
+#pragma unroll
+    for (int d = 0; d < ND; ++d) out[d] = 0u;
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        int v = v4[e];
+#pragma unroll
+        for (int d = 0; d < ND; ++d) {
+            const int b = d == ND - 1 ? v : (int) (int8_t) v;
+            out[d] |= ((uint32_t) b & 0xffu) << (8 * e);
+            v = (v - b) >> 8;
+        }
+    }
+}
+template <int ND> __device__ __forceinline__ float undigit(const int* a) {
+    if constexpr (ND == 3) return fmaf((float) a[2], 65536.0f, fmaf((float) a[1], 256.0f, (float) a[0]));
+    else return fmaf((float) a[1], 256.0f, (float) a[0]);
+}
+
+// LW: K words (of 4 dims) a lane holds in q.k.  8 (default): half a scale group, one cell per wave, 3 x 8 x ND q-digit
+// registers (127 VGPRs at ND = 3).  16 (STRATA_PA_DOT4_CFG=16): a whole group, two cells per wave, twice the registers
+// (208 VGPRs) - fewer instructions but measured slower on a V620 (19.1 against 13.2 ms for 2,048 queries at 32K).
+// 4 (a quarter group, a 16-lane row per (cell, head triple)) was measured too: 15.1 ms, more steps per chunk.
+template <int ND, int LW>
+__global__ void __launch_bounds__(DTH) prompt_attn_dot4_kernel(const float* __restrict__ q, QsaAttnPools p,
+                                                               const int32_t* __restrict__ ids,
+                                                               const int32_t* __restrict__ steps, int n_kv_heads,
+                                                               int page_size, float scale_log2,
+                                                               float* __restrict__ attn, int cap) {
+#if STRATA_PA_DOT4
+    __shared__ SmemD S;
+    // |q * qup|, |p * vs * vup| <= QMAX: ND balanced digits (127 * 65536 + 127 * 256 + 127 = 8355711), less a margin
+    // for the products' rounding
+    constexpr float QMAX = ND == 3 ? 8355000.0f : 32600.0f;
+    constexpr int CPS = LW * (DTH / 32) / 8;   // cells per q.k step: 16, 8 or 4
+    const int qi = blockIdx.x, kvh = blockIdx.y;
+    const int n_head = n_kv_heads * G;
+    q += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    attn += (size_t) qi * n_head * HD + (size_t) kvh * G * HD;
+    ids += (size_t) qi * cap;
+    const int n = __ldg(steps + (size_t) qi * kStepCount + kStepWidth);
+    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    // q.k: 64 / LW lanes hold one (cell, head triple): the lane's slice of LW words, its head triple and its cell of
+    // the step's CPS
+    const int unit = t / (64 / LW);                       // 4 * CPS units
+    const int sl_k = lane & (64 / LW - 1), ht_k = unit & 3, cis_k = unit >> 2;
+    const int g_k = sl_k * LW / 16;
+    const int w4 = t & 63, ht_v = t >> 6, g_v = w4 >> 4;                  // p.v: word of 4 dims, head triple, its group
+
+    float qm = 0.0f;
+    for (int i = t; i < G * HD; i += DTH) qm = fmaxf(qm, fabsf(q[i]));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) qm = fmaxf(qm, __shfl_xor_sync(0xffffffffu, qm, o));
+    if (lane == 0) S.qmax[wave] = qm;
+    if (t < G) { S.mrow[t] = -INFINITY; S.lsum[t] = 0.0f; }
+    __syncthreads();
+    qm = 0.0f;
+#pragma unroll
+    for (int i = 0; i < DTH / 32; ++i) qm = fmaxf(qm, S.qmax[i]);
+    const float qup = qm > 0.0f ? QMAX / qm : 0.0f, qdown = scale_log2 * (qm * (1.0f / QMAX));
+    // the q digits: word t % 64 of heads t / 64, + 4, + 8
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int h = (t >> 6) + 4 * j;
+        const float4 a = *reinterpret_cast<const float4*>(q + (size_t) h * HD + 4 * w4);
+        const int v4[4] = {(int) rintf(a.x * qup), (int) rintf(a.y * qup), (int) rintf(a.z * qup), (int) rintf(a.w * qup)};
+        uint32_t d[ND];
+        digits4<ND>(v4, d);
+#pragma unroll
+        for (int k = 0; k < ND; ++k) S.qd[h][k][w4] = d[k];
+    }
+
+    float acc[3][4];
+#pragma unroll
+    for (int h = 0; h < 3; ++h)
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc[h][k] = 0.0f;
+
+    const int n_chunks = (n + DCH - 1) / DCH;
+    for (int ci = 0; ci < n_chunks; ++ci) {
+        const int c0 = ci * DCH;
+        const int n_here = min(DCH, n - c0);
+        // the chunk's pool rows and V scales (row / vs were last read before the previous chunk's third barrier)
+        if (t < DCH) {
+            long long r = -1;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (t < n_here) {
+                const int cell = __ldg(ids + c0 + t);
+                const long long page = (long long) __ldg(p.page_table + cell / page_size);
+                if (page >= 0) {
+                    r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                    const uint16_t* sp = p.v_scale + r * (HD / KV_Q8_GROUP);
+                    v = make_float4(__half2float(__ushort_as_half(__ldg(sp))), __half2float(__ushort_as_half(__ldg(sp + 1))),
+                                    __half2float(__ushort_as_half(__ldg(sp + 2))), __half2float(__ushort_as_half(__ldg(sp + 3))));
+                }
+            }
+            S.row[t] = r;
+            *reinterpret_cast<float4*>(&S.vs[t][0]) = v;
+        }
+        __syncthreads();   // (1) also: the q digits are written (first chunk), the previous chunk's p.v has read vt / wd
+        // ---- q.k
+        {
+            uint32_t qd[3][ND][LW];
+#pragma unroll
+            for (int h = 0; h < 3; ++h)
+#pragma unroll
+                for (int d = 0; d < ND; ++d)
+#pragma unroll
+                    for (int j = 0; j < LW / 4; ++j) {
+                        const uint4 x = *reinterpret_cast<const uint4*>(&S.qd[3 * ht_k + h][d][LW * sl_k + 4 * j]);
+                        qd[h][d][4 * j] = x.x; qd[h][d][4 * j + 1] = x.y; qd[h][d][4 * j + 2] = x.z; qd[h][d][4 * j + 3] = x.w;
+                    }
+            const int n_steps = (n_here + CPS - 1) / CPS;
+            // step s's K words and K scale of this lane (zeros for a masked cell)
+            const auto load_k = [&](int s, uint32_t* kw, float& ksc) {
+#pragma unroll
+                for (int j = 0; j < LW; ++j) kw[j] = 0u;
+                ksc = 0.0f;
+                const long long r = S.row[s * CPS + cis_k];
+                if (r >= 0) {
+                    const uint4* src = reinterpret_cast<const uint4*>(p.k_q + r * HD + sl_k * (LW * 4));
+#pragma unroll
+                    for (int j = 0; j < LW / 4; ++j) {
+                        const uint4 x = __ldg(src + j);
+                        kw[4 * j] = x.x; kw[4 * j + 1] = x.y; kw[4 * j + 2] = x.z; kw[4 * j + 3] = x.w;
+                    }
+                    ksc = __half2float(__ushort_as_half(__ldg(p.k_scale + r * (HD / KV_Q8_GROUP) + g_k)));
+                }
+            };
+            // (loading step s + 1's K before step s's products was measured: 13.4 against 13.2 ms, no gain)
+            for (int s = 0; s < n_steps; ++s) {
+                const int c = s * CPS + cis_k;
+                uint32_t kw[LW];
+                float ksc = 0.0f;
+                load_k(s, kw, ksc);
+#pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    int a[ND];
+#pragma unroll
+                    for (int d = 0; d < ND; ++d) a[d] = 0;
+#pragma unroll
+                    for (int j = 0; j < LW; ++j)
+#pragma unroll
+                        for (int d = 0; d < ND; ++d) a[d] = dot4_i8(qd[h][d][j], kw[j], a[d]);
+                    float f = undigit<ND>(a) * ksc;
+                    f += row_x<1>(f);
+                    f += row_x<2>(f);
+                    if constexpr (LW <= 8) f += row_x<4>(f);
+                    if constexpr (LW == 4) f += row_x<8>(f);
+                    if (sl_k == 0) S.sc[3 * ht_k + h][c] = f;
+                }
+            }
+        }
+        // ---- the chunk's V codes, transposed: 4 cells x 4 dims per (thread, quad)
+#pragma unroll
+        for (int i = 0; i < DCH / 16; ++i) {
+            const int cq = (t >> 6) + 4 * i;
+            uint32_t a[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const long long r = S.row[4 * cq + j];
+                a[j] = r >= 0 ? __ldg(reinterpret_cast<const uint32_t*>(p.v_q + r * HD + 4 * w4)) : 0u;
+            }
+            const uint32_t t0 = (a[0] & 0x00ff00ffu) | ((a[1] & 0x00ff00ffu) << 8);
+            const uint32_t t1 = ((a[0] >> 8) & 0x00ff00ffu) | (a[1] & 0xff00ff00u);
+            const uint32_t u0 = (a[2] & 0x00ff00ffu) | ((a[3] & 0x00ff00ffu) << 8);
+            const uint32_t u1 = ((a[2] >> 8) & 0x00ff00ffu) | (a[3] & 0xff00ff00u);
+            *reinterpret_cast<uint4*>(&S.vt[cq][4 * w4]) =
+                make_uint4((t0 & 0xffffu) | (u0 << 16), (t1 & 0xffffu) | (u1 << 16), (t0 >> 16) | (u0 & 0xffff0000u),
+                           (t1 >> 16) | (u1 & 0xffff0000u));
+        }
+        __syncthreads();   // (2)
+        // ---- online softmax (log2 domain), then p times the V scale as digits: row t / 16 = head, 4 cells per thread
+        if (t < G * 16) {
+            const int h = t >> 4, sub = t & 15;
+            static_assert(DCH == 64, "4 cells per thread: a cell quad's digits are one thread's");
+            float x[4], vsc[4][4], mx = -INFINITY, vm = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int c = sub * 4 + j;
+                x[j] = S.row[c] >= 0 ? S.sc[h][c] * qdown : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+                const float4 v = *reinterpret_cast<const float4*>(&S.vs[c][0]);
+                vsc[j][0] = v.x; vsc[j][1] = v.y; vsc[j][2] = v.z; vsc[j][3] = v.w;
+                vm = fmaxf(vm, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+            }
+            mx = fmaxf(mx, row_x<1>(mx)); mx = fmaxf(mx, row_x<2>(mx)); mx = fmaxf(mx, row_x<4>(mx)); mx = fmaxf(mx, row_x<8>(mx));
+            vm = fmaxf(vm, row_x<1>(vm)); vm = fmaxf(vm, row_x<2>(vm)); vm = fmaxf(vm, row_x<4>(vm)); vm = fmaxf(vm, row_x<8>(vm));
+            const float m_old = S.mrow[h];
+            const float m_new = fmaxf(m_old, mx);
+            float e[4], sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                e[j] = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                sum += e[j];
+            }
+            sum += row_x<1>(sum); sum += row_x<2>(sum); sum += row_x<4>(sum); sum += row_x<8>(sum);
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[h] = a;
+                S.lsum[h] = fmaf(S.lsum[h], a, sum);
+                S.mrow[h] = m_new;
+            }
+            // the weights p * vs are rounded relative to this chunk's largest for this head (emax * vm bounds them):
+            // a chunk of small weights keeps its relative precision.  Below 2^-100 of the running maximum the chunk
+            // adds nothing an FP32 accumulator would keep (and 1 / emax would overflow): it is dropped.
+            const float emax = mx == -INFINITY ? 0.0f : exp2f(mx - m_new);
+            const float wmax = emax * vm;
+            const bool keep = emax > 7.9e-31f && wmax > 1e-30f;
+            const float vup = keep ? QMAX / wmax : 0.0f;
+            if (sub == 0) S.vdown[h] = keep ? wmax * (1.0f / QMAX) : 0.0f;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const int v4[4] = {(int) rintf((e[0] * vsc[0][g]) * vup), (int) rintf((e[1] * vsc[1][g]) * vup),
+                                   (int) rintf((e[2] * vsc[2][g]) * vup), (int) rintf((e[3] * vsc[3][g]) * vup)};
+                uint32_t d[3] = {0u, 0u, 0u};
+                digits4<ND>(v4, d);
+                *reinterpret_cast<uint4*>(&S.wd[g][sub][h][0]) = make_uint4(d[0], d[1], d[2], 0u);
+            }
+        }
+        __syncthreads();   // (3)
+        // ---- p.v
+        {
+            int ia[3][4][ND];
+#pragma unroll
+            for (int h = 0; h < 3; ++h)
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+#pragma unroll
+                    for (int d = 0; d < ND; ++d) ia[h][k][d] = 0;
+            const int n_cq = (n_here + 3) / 4;
+            for (int cq = 0; cq < n_cq; ++cq) {
+                const uint4 vv = *reinterpret_cast<const uint4*>(&S.vt[cq][4 * w4]);
+                const uint32_t v[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    const uint4 ww = *reinterpret_cast<const uint4*>(&S.wd[g_v][cq][3 * ht_v + h][0]);
+                    const uint32_t w[3] = {ww.x, ww.y, ww.z};
+#pragma unroll
+                    for (int k = 0; k < 4; ++k)
+#pragma unroll
+                        for (int d = 0; d < ND; ++d) ia[h][k][d] = dot4_i8(w[d], v[k], ia[h][k][d]);
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < 3; ++h) {
+                const float al = S.alpha[3 * ht_v + h], vdown = S.vdown[3 * ht_v + h];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) acc[h][k] = fmaf(acc[h][k], al, undigit<ND>(ia[h][k]) * vdown);
+            }
+        }
+        // no barrier here: the next chunk writes row / vs (read last before barrier 3) and then waits at barrier 1
+    }
+#pragma unroll
+    for (int h = 0; h < 3; ++h) {
+        const float l = S.lsum[3 * ht_v + h];
+        const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+        *reinterpret_cast<float4*>(attn + (size_t) (3 * ht_v + h) * HD + 4 * w4) =
+            make_float4(acc[h][0] * inv, acc[h][1] * inv, acc[h][2] * inv, acc[h][3] * inv);
+    }
+#else
+    __builtin_trap();
+#endif
+}
+
+// gfx103x only, and only on request: 0 off, 3 or 2 digits
+int hip_dot4_digits() {
+    static const int want = [] {
+        const char* e = std::getenv("STRATA_PA_DOT4");
+        return e == nullptr ? 0 : e[0] == '1' ? 3 : e[0] == '2' ? 2 : 0;
+    }();
+    if (want == 0) return 0;
+    static int arch[64] = {};   // 0 unknown, 1 gfx103x, 2 other
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return 0; }
+    if (arch[dev] == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return 0; }
+        arch[dev] = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
+        static bool told = false;
+        if (!told) {
+            told = true;
+            std::fprintf(stderr, "strata: STRATA_PA_DOT4: the prompt attention on v_dot4_i32_i8, %d digits, %s (%s)\n",
+                         want, arch[dev] == 1 ? "on" : "unavailable", prop.gcnArchName);
+        }
+    }
+    return arch[dev] == 1 ? want : 0;
+}
+
+bool launch_dot4(int digits, const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                 int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, cudaStream_t st) {
+    const float scale_log2 = 1.4426950408889634f / sqrtf((float) HD);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = n_q - q0 < 65535 ? n_q - q0 : 65535;
+        // STRATA_PA_DOT4_CFG=16 (A/B): 16 K words per lane instead of 8
+        static const bool wide = [] { const char* e = std::getenv("STRATA_PA_DOT4_CFG"); return e && std::atoi(e) == 16; }();
+#define STRATA_PA_DOT4_GO(ND_, LW_)                                                                                   \
+    prompt_attn_dot4_kernel<ND_, LW_><<<dim3((unsigned) nb, (unsigned) s.n_head_kv), DTH, 0, st>>>(                  \
+        q + q0 * s.n_head * HD, pools, ids + q0 * cap, steps + q0 * kStepCount, (int) s.n_head_kv, (int) s.page_size, \
+        scale_log2, attn + q0 * s.n_head * HD, (int) cap)
+        if (digits == 2 && wide) STRATA_PA_DOT4_GO(2, 16);
+        else if (digits == 2) STRATA_PA_DOT4_GO(2, 8);
+        else if (wide) STRATA_PA_DOT4_GO(3, 16);
+        else STRATA_PA_DOT4_GO(3, 8);
+#undef STRATA_PA_DOT4_GO
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_prompt_attn_batch (dot4): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
 #endif
 
 }  // namespace
@@ -1484,6 +1857,13 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     // the tensor-core kernels are compiled out on AMD (its major version is not a CUDA sm); RDNA4 has its own int8-KV
     // matrix-core kernel, opt-in (STRATA_HIP_WMMA=1); everything else keeps the old kernel
     (void) turing; (void) volta;
+    // RDNA2: the dot4 kernel, opt-in (STRATA_PA_DOT4=1, or 2 for the two-digit one)
+    if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
+        pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
+        cap > 0 && ids && steps && pools.page_table) {
+        if (const int digits = hip_dot4_digits(); digits != 0)
+            return launch_dot4(digits, q, pools, ids, steps, cap, s, attn, n_q, (cudaStream_t) stream);
+    }
     if (pools.k_q != nullptr && pools.v_q != nullptr && pools.k_scale != nullptr && pools.v_scale != nullptr &&
         pools.k_q4 == nullptr && pools.v_q4 == nullptr && s.head_dim == HD && s.n_head == (int64_t) G * s.n_head_kv &&
         cap > 0 && ids && steps && pools.page_table && hip_wmma_usable())
