@@ -406,7 +406,12 @@ one copy-heavy edit, 400 tokens each, same text hashes in every row):
 | `--spec 8 --mtp-max-t 3`, `STRATA_PL_LOOKUP_STREAK=4` | 114.4 | 107.0 | 298.5 |
 
 In the copied stretch of that edit every window is then a lookup window of 8 tokens verified 23 ms after the one
-before (both cards 91-92% busy). Not measured: other cards, three or more stages, NVIDIA.
+before (both cards 91-92% busy). The last setting ran three times: 302.8, 302.7 and 302.8 tok/s on the edit. Q4_0 on
+the same box, the same probe: the edit 152.4 and 154.4 tok/s without the switch (two runs), 229.8 with `--spec 3` and
+`STRATA_PL_LOOKUP_STREAK=12`, 223.8 with `--spec 8 --mtp-max-t 3` as well; chat within the spread of the two runs
+without it (102.1-105.0 greedy, 102.5-106.1 sampled; 105.2-106.3 and 105.5-107.4 with it). Q4_0's chat text differed
+between those two runs of one setting, so only the edit's text could be compared there (the same in all four). Not
+measured: other cards, three or more stages, NVIDIA.
 
 `STRATA_PL_FRESH_T` / `STRATA_PL_FRESH_MIN_P` and `STRATA_PL_GUESS_T` / `STRATA_PL_GUESS_MIN_P` (opt-in) give the
 window built after a verdict and the guessed window their own size cap and draft threshold (unset: `--spec` and
