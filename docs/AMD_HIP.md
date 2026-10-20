@@ -747,6 +747,44 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   gfx103x card, Windows, K-quant expert packs; tried and dropped as measured no gain: one GEMM for the GDN qkv + gate
   projections (both already at 34-35 TFLOP/s), a retune of N 640 / N 512 at 2048 tokens (best 0.283 against the
   default's 0.285 ms; 0.201 against 0.218).
+- **The hyper-connection products on v_dot2 (`STRATA_HC_DOWNSK=8`, `STRATA_HC_UPMIX16=1`, opt-in, gfx103x, the
+  FP16 prompt path):** two hand-written FP16 GEMMs on `v_dot2_f32_f16` that read the BF16 weights as they are
+  (each value converted in the kernel as the FP16 path converts it, so no conversion pass and no FP16 copy).
+  (1) `STRATA_HC_DOWNSK=<S>`: the [down; inject] product of `STRATA_HC_DOWNINJ` (N 324, K 10240) with K split in
+  S parts (S divides 10240 into 64-value steps: 1, 2, 4, 5, 8, 10, 16 or 20; the other values up to
+  31 run `STRATA_HC_DOWNINJ`'s product). rocBLAS's best kernel for that shape runs at 17 TFLOP/s here, because at 2048 tokens its tiles make
+  about 48 workgroups for 72 compute units; rocBLAS's own split (strided batched, FP16 in, FP32 out) has no tuned
+  kernel on gfx1030 and ran 1.8-3.2 ms. Here each workgroup sums a 128 x 112 tile of one part in FP32 into `gated`,
+  and the SiLU kernel adds the S parts in order and rounds each output to FP16 as the FP16-out GEMM does. S = 8:
+  down + inject + SiLU at 2048 tokens 0.778 -> 0.563 ms (`hip_hc_downsk_parity --bench`; 1024 tokens 0.412 ->
+  0.329, 4096 tokens 1.231 -> 1.056); in the engine (`STRATA_DENSE_TIMING=1`, first stage, 16K prompt) the
+  product went from 0.832 ms plus 0.051 ms of weight conversion and 0.022 ms of widening to 0.587 ms. (2)
+  `STRATA_HC_UPMIX16=1`: the up projection (N 10240, K 320) with the mix as its epilogue, as `STRATA_HC_UPMIX` does
+  on gfx11 and CUDA: a thread sums 8 tokens x 8 rows (2 outputs with their 4 streams), rounds each sum to FP16 and
+  runs `gr_mix_r`'s arithmetic in its order, so the T x 10240 `gated` image is not written nor read back. Up +
+  mix at 2048 tokens 0.686 -> 0.606 ms, 4096 tokens 1.507 -> 1.175 (`hip_hc_upmix16_parity --bench`; at 1024
+  tokens 0.287 -> 0.293, no gain). Both change only the order of the FP32 sums: against an FP64 reference of the
+  same FP16 operands the outputs are as far as the default's (silu(down) rel RMS 3.0-3.2e-4 in both, inject
+  1.7-2.1e-4, `mixed` 5.7-6.1e-5), finite, and the same bits run to run; 0.4-0.6% of the FP16 SiLU values and 0.3%
+  of `mixed` differ from the default's. A 3K-word prompt at temperature 0 (the CPU share off): the final residuals
+  are the same bits run to run without the switches, 4.0e-2 (rel L2) from them with (1), 3.5e-2 with (1) + (2) -
+  what any change of a GEMM's summation order does (see the paragraph above); the answer's text is the same with
+  (1) + (2), and with (1) alone it takes another word from its 21st on (both read well). Measured end to end on 2x Radeon PRO V620 (gfx1030,
+  ROCm in `/opt/rocm`, rocBLAS 5.8.0), the IQ3_S abliterated pack, `--layer-split 24`, the coordinator's base
+  settings (with `STRATA_HC_DOWNINJ=1`, `STRATA_HC_GATED16=1` and the rocBLAS table) in every arm,
+  `tools/strata_bench.py --temperature 1.0 --top-p 0.95 --top-k 20 --runs 1`, the arms alternated on one binary:
+  without the switches a 4K prompt 1,888.5 / 1,892.5 / 1,886.8 / 1,890.6 tok/s and a 16K prompt 2,505.0 / 2,506.3 /
+  2,499.8 / 2,504.3; with (1) 1,912.6 / 1,920.1 / 1,913.2 and 2,540.7 / 2,552.6 / 2,532.4 (+1.4%, +1.5%); with (1)
+  + (2) 1,849.3 / 1,933.5 / 1,934.7 / 1,939.1 and 2,572.4 / 2,566.2 / 2,561.7 / 2,567.3 (+2.4% on the 4K prompt
+  without its one low run, the first after a rebuild and not explained, and +2.5% on the 16K). With `STRATA_DENSE_TIMING=1` the first
+  stage's marked GPU time on the 16K prompt went 6,779 -> 6,644 (1) -> 6,549 ms (1) + (2); the up projection, its
+  weight conversion and the mix 0.79-0.83 ms -> 0.65 ms a half.
+  Kernel shapes tried for (1) at 2048 tokens: 16 x 7 sums a thread on 8-byte LDS reads 0.53 ms; 8 x 7 sums
+  0.56-0.58; 16-byte reads 0.58; 64 x 112, 256 x 112, 128 x 168 and 128 x 84 tiles 0.60-0.70; padding the
+  20,480-byte row strides of X and W changed nothing; double-buffered LDS spilled registers. With the loads and
+  barriers taken out the inner loop alone runs at about 29 TFLOP/s, so what is left is the LDS-to-register traffic
+  and the register budget (the kernel uses 254 of 256 VGPRs). Not measured: one card, another gfx103x card,
+  Windows, other packs; CUDA and SYCL builds not built (the new code is HIP-only, with no-op stubs elsewhere).
 - **Streamed prompt experts by routing (`STRATA_PF_STREAM_ROUTED=1`, opt-in):** a pack that does not fit VRAM (Q4_0
   here: 19.6K of 24.6K expert pairs resident; UD-Q4_K_XL: 17.5-18.8K) streams the rest per prompt chunk. From 1,024
   tokens a chunk on, the engine copies EVERY non-resident expert of every layer, in a fixed order, so that the copies
