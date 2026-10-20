@@ -10,7 +10,8 @@
 //  4. copy_from_mapped (the indexer tail's snapshot) + native_qsa_indexer_append_steps against the append with `snap`
 //     (the snapshot, tail, dead, pooled keys and block position), windows of 1-8 steps from several positions.
 //  5. STRATA_HC_WIDE8: the hyper-connection read with STRATA_HC_WIDE=3 (7-8 tokens: the row kernel's down in one
-//     launch) against the default read, 1-8 tokens, with and without the pending write (every output).
+//     launch) against the default read, 1-8 tokens, with and without the pending write (every output); and
+//     STRATA_HC_UP_TSUM (the up kernel's per-token sums as one transposed butterfly) against that wide read.
 #include <hip/hip_runtime.h>
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -309,6 +310,7 @@ int main() {
              w_inj = normal_bf16((size_t) HC * D, 0.02f);
         float* d_norm = dev(w_norm);
         uint16_t *d_down = dev(w_down), *d_up = dev(w_up), *d_inj = dev(w_inj);
+        for (int cmp = 0; cmp < 2; ++cmp) {   // 0: STRATA_HC_WIDE8 against the default read; 1: STRATA_HC_UP_TSUM against the wide read
         int cases = 0, wbad = 0;
         for (int rep = 0; rep < 3; ++rep)
             for (int T = 1; T <= kFusedGrMaxT; ++T)
@@ -339,8 +341,8 @@ int main() {
                             x.mixed = a.mixed + (size_t) t * N;
                             x.q8_cnt = a.cnt; x.q8_mixed = a.q8 + (size_t) t * (N / 32) * 36;
                         }
-                        fused_gr_set_wide(k == 0 ? 0 : 3);
-                        fused_gr_set_wide8(k);
+                        if (cmp == 0) { fused_gr_set_wide(k == 0 ? 0 : 3); fused_gr_set_wide8(k); fused_gr_set_up_tsum(0); }
+                        else { fused_gr_set_wide(3); fused_gr_set_wide8(1); fused_gr_set_up_tsum(k); }
                         fused_gr_read_multi(fa, T, a.xn, st);
                         CHECK(hipStreamSynchronize(st));
                     }
@@ -355,12 +357,16 @@ int main() {
                     for (auto& a : arm) { hipFree(a.R); hipFree(a.lo); hipFree(a.rs); hipFree(a.io); hipFree(a.mixed); hipFree(a.xn); hipFree(a.q8); hipFree(a.cnt); }
                     hipFree(d_bo); hipFree(d_inj_prev);
                 }
+        std::printf("hyper-connection read, %s: %d cases, %s\n",
+                    cmp == 0 ? "STRATA_HC_WIDE=3 + STRATA_HC_WIDE8 against the default read"
+                             : "STRATA_HC_UP_TSUM against STRATA_HC_WIDE=3 + STRATA_HC_WIDE8",
+                    cases, wbad ? "DIFFERENT" : "bitwise equal");
+        bad += wbad;
+        }
         fused_gr_set_wide(-1);
         fused_gr_set_wide8(-1);
+        fused_gr_set_up_tsum(-1);
         hipFree(d_norm); hipFree(d_down); hipFree(d_up); hipFree(d_inj);
-        std::printf("hyper-connection read, STRATA_HC_WIDE=3 + STRATA_HC_WIDE8 against the default read: %d cases, %s\n", cases,
-                    wbad ? "DIFFERENT" : "bitwise equal");
-        bad += wbad;
     }
     std::printf(bad ? "FAILED\n" : "all bitwise equal\n");
     return bad ? 1 : 0;
