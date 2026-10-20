@@ -718,6 +718,16 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   that extra gain is close to run variation. Both prompt answers started with “The”. The pack has no IQ2_S / IQ3
   down matrix: K=640 cannot hold 256-value blocks, so down parity uses K=768. Other GPUs, Windows, CUDA, SYCL,
   longer prompts and end-to-end residual identity were not tested.
+  Tried on the same kernels and dropped (2026-10-20, one PRO V620, `hip_prefill_expert_bench`, every variant the
+  same bits as the 16-row tile, gate+up 16 experts x 40 / 80 / 320 rows): 8, 12, 24 or 32 token rows a tile instead
+  of 16 (IQ3_S 11.4 -> 9.8 / 10.6 / 10.7 / 9.4 T MAC/s at 40 rows; 24 rows gains 5% on IQ2_S at 320 rows only); two
+  weight rows a thread on 128 threads (9-12% slower); the kernels compiled for 64-lane waves in a translation unit
+  of their own (`-mwavefrontsize64`, 5-12% slower). End to end the two switches are still worth having on: on 2x
+  PRO V620 with `STRATA_HC_DOWNSK=8 STRATA_HC_UPMIX16=1 STRATA_PF_NOWIDEN=1` and the strata-sync base settings
+  (which leave them off), alternated, `--runs 1`: 4K 1,976.3 / 1,976.0 -> 2,045.6 / 2,047.9 / 2,032.3 / 2,045.4
+  tok/s, 16K 2,622.0 / 2,619.4 -> 2,700.6 / 2,702.7 / 2,698.9 / 2,697.0 (+3.4%, +3.0%). `STRATA_PA_DOT4_CFG=16` on top
+  of that loses: 1,967.1 / 1,967.4 and 2,587.7 / 2,589.2 (-3.7%, -4.1%). With the IQ tiles on, the routed experts' gate / up are
+  still the largest GPU phase of the first stage on a 16K prompt (1,065 of 5,434 ms).
 
 - **Q4_0 / Q4_1 prompt experts on 256 x 32 tiles (`STRATA_PF_Q4_WIDE=1`, opt-in, gfx103x):** a plain Q4_0 GGUF's
   prompt experts do not go through rocBLAS or llama.cpp's MMQ on RDNA2 but through Strata's own int8 kernel
