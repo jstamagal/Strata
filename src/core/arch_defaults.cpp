@@ -55,6 +55,9 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
             {"STRATA_PF_NL", "1"},                 // IQ4_NL down products on the no-LDS tile: MMQ's bits
             {"STRATA_PF_Q51", "1"},                // Q5_1 down products on the same tile: MMQ's bits
             {"STRATA_MMQ_RESIDENT_SORT_NE", "1"},  // same bits
+            // as before the 0.2.0 merge: upstream turned these two the other way by default
+            {"STRATA_MMQ_KQ", "1"},                // K-quant experts / dense Q6_K through MMQ (upstream: opt-in since 0.2.0)
+            {"STRATA_QUANT_GATHER", "1"},          // the MMQ input's q8_1 rows by gather (upstream: scatter by default, same bytes)
             // decode
             {"STRATA_SH_STREAM", "1"},             // the shared expert on its own stream
             {"STRATA_QFUSE", "1"},                 // activation q8_1 images written by their producers
