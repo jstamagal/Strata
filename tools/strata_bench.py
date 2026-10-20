@@ -177,7 +177,7 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
         err = repr(e)[:300]
     total = time.perf_counter() - t0
     return {"first": first, "total": total, "text": "".join(text), "usage": usage, "timings": timings, "err": err,
-            "pieces": pieces}
+            "pieces": pieces, "first_content_piece": next((v for v in text if v), "")}
 
 
 def digest(r: dict) -> dict:
@@ -198,6 +198,7 @@ def digest(r: dict) -> dict:
     if pp is None:
         pp, psrc = None, None
     return {"ok": r.get("err") is None and r.get("first") is not None,
+            "first_content_piece": r.get("first_content_piece", ""),
             "err": r.get("err"), "ttft_s": None if r.get("first") is None else round(r["first"], 3),
             "total_s": round(r["total"], 3), "prompt_tokens": prompt_tokens, "reused_tokens": cached,
             "read_tokens": read, "generated_tokens": gen, "prompt_tps": pp, "prompt_tps_source": psrc,

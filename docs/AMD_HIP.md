@@ -685,6 +685,18 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   summary: [bench/results/2026-10-05-rdna2-rocblas-table](../bench/results/2026-10-05-rdna2-rocblas-table/README.md). Decode does not use these GEMMs and is unchanged. See [Tuning
   table](#tuning-table) for making a table for another rocBLAS build.
 
+- **IQ prompt expert tiles (`STRATA_PF_IQ2S=1`, `STRATA_PF_IQ3=1`, opt-in, gfx103x):** 256 weight rows by
+  16 token rows, scalar activation loads and packed signs. The switches cover IQ2_S and IQ3_XXS / IQ3_S,
+  respectively; unset keeps MMQ. With MMQ's q8_1 activations every tested output matched bit for bit
+  (`hip_prefill_iq{22,18,21}_*` CTests). On one PRO V620, Linux, amdclang 24 from `/opt/rocm`, best of five after
+  warmup, 16 experts x 40 rows, W[1280 x 2560]: IQ2_S 9.9 -> 11.2 T MAC/s, IQ3_XXS 10.6 -> 12.3,
+  IQ3_S 10.5 -> 11.4; at 320 rows: 13.4 -> 16.0, 15.7 -> 17.6, 15.6 -> 16.9. On 2x PRO V620 with
+  `sc117-abl-iq3_s`, `strata_bench.py --runs 1`, two baselines and one IQ2_S run: 4K 1,897-1,902 -> 1,937 tok/s,
+  16K 2,511-2,520 -> 2,546. Adding IQ3 in a separate A/B: 4K 1,930-1,932 -> 1,958, 16K 2,527-2,556 -> 2,570;
+  that extra gain is close to run variation. Both prompt answers started with “The”. The pack has no IQ2_S / IQ3
+  down matrix: K=640 cannot hold 256-value blocks, so down parity uses K=768. Other GPUs, Windows, CUDA, SYCL,
+  longer prompts and end-to-end residual identity were not tested.
+
 - **Q4_0 / Q4_1 prompt experts on 256 x 32 tiles (`STRATA_PF_Q4_WIDE=1`, opt-in, gfx103x):** a plain Q4_0 GGUF's
   prompt experts do not go through rocBLAS or llama.cpp's MMQ on RDNA2 but through Strata's own int8 kernel
   (`src/prefill/moe_q4.cu`, on by default there, `STRATA_PF_Q4=0` turns it off). Its 64 x 32 tile waits on shared

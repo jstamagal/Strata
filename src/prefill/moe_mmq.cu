@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 namespace strata::prefill::mmq {
 namespace {
@@ -325,6 +326,171 @@ __global__ void __launch_bounds__(256) q51_sload_kernel(ArgsQ51 a) {
     for (int jj = 0; jj < TJ; ++jj) {
         if (jj < nj) a.dst[(int64_t) a.ids[j0 + jj] * a.ld_dst + i] = acc[jj];
     }
+}
+
+// The IQ2_S, IQ3_XXS and IQ3_S grids have positive, nonzero bytes.
+// Expand four sign bits to byte ones. Complement and add one independently
+// in each negative byte; no byte can overflow, so integer addition is safe.
+__device__ __forceinline__ int iq_grid_sign(unsigned grid, unsigned signs) {
+    const unsigned bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
+    return (grid ^ (bits * 255u)) + bits;
+}
+
+// IQ2_S uses the exact signed grid bytes and 16-value scales of MMQ's loader.
+// Decode 128 weights per thread, then reuse them across 16 token rows. The
+// activation address is uniform across the workgroup, allowing scalar loads.
+__global__ void __launch_bounds__(256) iq2s_sload_kernel(ArgsQ51 a) {
+    constexpr int TJ = 16, NT = 256, CW = sizeof(block_q8_1_mmq) / sizeof(int);
+    const int e = blockIdx.z;
+    const int j0 = a.bounds[e] + (int) blockIdx.y * TJ;
+    const int nj = min(TJ, a.bounds[e + 1] - j0);
+    if (nj <= 0) return;
+    const int i = (int) blockIdx.x * NT + threadIdx.x;
+    const block_iq2_s* wr = (const block_iq2_s*) a.w[e] + (size_t) (i < a.w_rows ? i : 0) * (a.w_cols / QK_K);
+    float acc[TJ] = {};
+    for (int c = 0; c < a.w_cols / 128; ++c) {
+        const block_iq2_s* bx = wr + c / 2;
+        const int off = (c % 2) * 4;
+        int w[32];
+        float d[8];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int qh = bx->qh[off + b];
+            const float db = bx->d;
+            const int ls = bx->scales[off + b];
+            d[2*b] = ((ls & 15)*db + db/2)/4;
+            d[2*b+1] = ((ls >> 4)*db + db/2)/4;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int idx = 4*(off+b) + l;
+                const int* grid = (const int*) (iq2s_grid + (bx->qs[idx] | ((qh << (8-2*l)) & 0x300)));
+                const int signs = bx->qs[32+idx];
+                w[8*b+2*l] = iq_grid_sign(grid[0], signs);
+                w[8*b+2*l+1] = iq_grid_sign(grid[1], signs >> 4);
+            }
+        }
+        const int* aj = a.y + ((size_t) c * a.ncols_y + j0) * CW;
+#pragma unroll
+        for (int jj = 0; jj < TJ; ++jj, aj += CW) {
+            if (jj < nj) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    int u[8];
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) u[k] = aj[4+8*b+k];
+                    float dy;
+                    __builtin_memcpy(&dy, aj+b, 4);
+                    acc[jj] += vec_dot_q8_0_16_q8_1_impl<8>(w+8*b, u, d+2*b, dy);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int jj = 0; jj < TJ; ++jj)
+        if (i < a.w_rows && jj < nj) a.dst[(int64_t) a.ids[j0+jj]*a.ld_dst+i] = acc[jj];
+}
+
+// IQ3 uses one weight scale per 32 values. Keep MMQ's integer dots and
+// floating expression, with the same positive-grid packed sign operation.
+template<bool XXS>
+__global__ void __launch_bounds__(256) iq3_sload_kernel(ArgsQ51 a) {
+    constexpr int TJ = 16, CW = sizeof(block_q8_1_mmq) / sizeof(int);
+    const int e = blockIdx.z;
+    const int j0 = a.bounds[e] + (int) blockIdx.y * TJ;
+    const int nj = min(TJ, a.bounds[e+1] - j0);
+    if (nj <= 0) return;
+    const int i = (int) blockIdx.x*256 + threadIdx.x;
+    using Block = std::conditional_t<XXS, block_iq3_xxs, block_iq3_s>;
+    const Block* wr = (const Block*) a.w[e] + (size_t) (i < a.w_rows ? i : 0)*(a.w_cols/QK_K);
+    float acc[TJ] = {};
+    for (int c = 0; c < a.w_cols/128; ++c) {
+        const Block* bx = wr+c/2;
+        int w[32];
+        float d[4];
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const int k = (c%2)*4+b;
+            const float db = bx->d;
+            if constexpr (XXS) {
+                const unsigned aux = (unsigned) q51_ld32(bx->qs+64+4*k);
+                d[b] = ((aux>>28)*db+db/2)/2;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const unsigned seven = (aux>>(7*l))&127;
+                    const unsigned signs = seven | ((__popc(seven)&1)<<7);
+                    w[8*b+2*l] = iq_grid_sign(iq3xxs_grid[bx->qs[8*k+2*l]], signs);
+                    w[8*b+2*l+1] = iq_grid_sign(iq3xxs_grid[bx->qs[8*k+2*l+1]], signs>>4);
+                }
+            } else {
+                const int qh = bx->qh[k];
+                d[b] = (1+2*((bx->scales[k/2]>>((k%2)*4))&15))*db;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int signs = bx->signs[4*k+l];
+                    const int g0 = bx->qs[8*k+2*l] | ((qh<<(8-2*l))&256);
+                    const int g1 = bx->qs[8*k+2*l+1] | ((qh<<(7-2*l))&256);
+                    w[8*b+2*l] = iq_grid_sign(iq3s_grid[g0], signs);
+                    w[8*b+2*l+1] = iq_grid_sign(iq3s_grid[g1], signs>>4);
+                }
+            }
+        }
+        const int* aj = a.y+((size_t) c*a.ncols_y+j0)*CW;
+#pragma unroll
+        for (int jj = 0; jj < TJ; ++jj, aj += CW) {
+            if (jj < nj) {
+#pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    int u[8];
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) u[k] = aj[4+8*b+k];
+                    float dy;
+                    __builtin_memcpy(&dy, aj+b, 4);
+                    acc[jj] += vec_dot_q8_0_q8_1_impl<float,8>(w+8*b, u, d[b], dy);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int jj = 0; jj < TJ; ++jj)
+        if (i < a.w_rows && jj < nj) a.dst[(int64_t) a.ids[j0+jj]*a.ld_dst+i] = acc[jj];
+}
+
+bool iq_tile_fits(const Product& p) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_IQ2S"); return v && v[0] == '1'; }();
+    static const bool iq3 = [] { const char* v = std::getenv("STRATA_PF_IQ3"); return v && v[0] == '1'; }();
+    const bool enabled = (on && p.type == GGML_TYPE_IQ2_S) ||
+                         (iq3 && (p.type == GGML_TYPE_IQ3_XXS || p.type == GGML_TYPE_IQ3_S));
+    if (!enabled || !q4::gfx103x() || p.n > kGatherGroupMax ||
+        !p.ids || ((uintptr_t) p.xq & 3) || p.w_cols % QK_K) return false;
+    // MMQ's direct gate/up contract requires contiguous rows. Fall back if a
+    // caller supplies separate runs, rather than silently reading the gap.
+    if (p.each) {
+        const size_t split = p.w_split * (p.w_cols / QK_K) * ggml_type_size((ggml_type) p.type);
+        for (int e = 0; e < p.n; ++e)
+            if (p.w_split < p.w_rows && (const char*) p.w1[e] != (const char*) p.w0[e] + split) return false;
+    }
+    return true;
+}
+
+void iq_tile_run(const Product& p, cudaStream_t s) {
+    static const bool said = [] {
+        const char* iq2 = std::getenv("STRATA_PF_IQ2S");
+        const char* iq3 = std::getenv("STRATA_PF_IQ3");
+        std::fprintf(stderr, "strata: prompt kernels: IQ experts on 256 x 16 tiles (STRATA_PF_IQ2S=%s, STRATA_PF_IQ3=%s)\n",
+                     iq2 ? iq2 : "0", iq3 ? iq3 : "0");
+        return true;
+    }();
+    (void) said;
+    ArgsQ51 a{};
+    for (int e = 0; e < p.n; ++e) a.w[e] = p.each ? (const char*) p.w0[e] : (const char*) p.w + e*p.expert_bytes;
+    a.y = (const int*) p.xq; a.bounds = p.bounds; a.ids = p.ids;
+    a.dst = p.dst; a.ld_dst = p.ld_dst; a.ncols_y = p.total_rows;
+    a.w_rows = (int) p.w_rows; a.w_cols = (int) p.w_cols;
+    const dim3 g((p.w_rows+255)/256, (p.max_rows+15)/16, p.n);
+    if (p.type == GGML_TYPE_IQ2_S) iq2s_sload_kernel<<<g, 256, 0, s>>>(a);
+    else if (p.type == GGML_TYPE_IQ3_XXS) iq3_sload_kernel<true><<<g, 256, 0, s>>>(a);
+    else iq3_sload_kernel<false><<<g, 256, 0, s>>>(a);
+    ck(cudaGetLastError(), "product (iq tile)");
 }
 
 bool q51_on() {
@@ -638,6 +804,10 @@ void Context::run(const Product& p, void* stream) {
 #if defined(__HIPCC__)
     if (q4::nl_fits(p.type, p.w_cols)) {   // STRATA_PF_NL=1: IQ4_NL on Strata's tiles, MMQ's activations and bits
         q4::nl_run(p, stream);
+        return;
+    }
+    if (iq_tile_fits(p)) {
+        iq_tile_run(p, (cudaStream_t) stream);
         return;
     }
     if (q51_fits(p.type, p.w_cols)) {      // STRATA_PF_Q51=1: Q5_1 down likewise

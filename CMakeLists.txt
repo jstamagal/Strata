@@ -2036,6 +2036,22 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(hip_prefill_expert_bench tests/hip/prefill_expert_bench.cpp)
     target_include_directories(hip_prefill_expert_bench PRIVATE "${_strata_gg}/include")
     target_link_libraries(hip_prefill_expert_bench PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    # Fresh MMQ outputs, then an all-output comparison on the same q8_1 inputs.
+    # Fixtures order the processes: each environment switch is cached.
+    foreach(_iq_type IN ITEMS 22 18 21)
+        add_test(NAME hip_prefill_iq${_iq_type}_reference COMMAND ${CMAKE_COMMAND} -E env
+            STRATA_PF_IQ2S=0 STRATA_PF_IQ3=0 STRATA_PF_DIRECT=1 $<TARGET_FILE:hip_prefill_expert_bench>
+            --type ${_iq_type} --rows 40 --write-reference ${CMAKE_CURRENT_BINARY_DIR}/iq${_iq_type}-reference)
+        add_test(NAME hip_prefill_iq${_iq_type}_parity COMMAND ${CMAKE_COMMAND} -E env
+            STRATA_PF_IQ2S=1 STRATA_PF_IQ3=1 STRATA_PF_DIRECT=1 $<TARGET_FILE:hip_prefill_expert_bench>
+            --type ${_iq_type} --rows 40 --check-reference ${CMAKE_CURRENT_BINARY_DIR}/iq${_iq_type}-reference)
+        set_tests_properties(hip_prefill_iq${_iq_type}_reference PROPERTIES
+            FIXTURES_SETUP iq${_iq_type}_reference TIMEOUT 300 SKIP_RETURN_CODE 77)
+        set_tests_properties(hip_prefill_iq${_iq_type}_parity PROPERTIES
+            FIXTURES_REQUIRED iq${_iq_type}_reference TIMEOUT 300 SKIP_RETURN_CODE 77)
+        list(APPEND _strata_hip_tests hip_prefill_iq${_iq_type}_reference hip_prefill_iq${_iq_type}_parity)
+    endforeach()
+
     if(STRATA_MMQ_KQUANTS)
       # llama.cpp's Q4_K / Q5_K / Q6_K MMQ kernels through mmq::quantize / mmq::Context::run (the experts' gate+up
       # shape, a dense projection, uneven experts) against an FP64 reference of the same arithmetic; prints a hash
