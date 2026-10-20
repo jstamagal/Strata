@@ -967,6 +967,42 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   `--spec 5`, UD-Q4_K_XL and IQ3_XXS, long contexts, any card other than gfx1030 (the row kernel and the sets are
   compiled for every wave32 AMD card but nothing here says they are faster elsewhere; `STRATA_NORM_ROPE=2` must pass
   `hip_norm_rope_parity` on a card before it is used there).
+- **Decode: fewer nodes in the window graph (`STRATA_NODE_FUSE=1`, opt-in).** With the switches above a 4-token
+  verify window still held 663 nodes on the first card and 651 on the second (IQ3_S, layer split 24, counted with
+  `STRATA_VERIFY_NODES=1`). `STRATA_NODE_FUSE=1` takes them to 514 and 508 (1-token windows: 652 -> 540, 648 -> 532)
+  with launches that compute every value bitwise as the launches they replace:
+  - the MoE combine of a layer made inside the next layer's first hyper-connection norm (one launch less a layer);
+  - the GDN conv + L2 norm and the a/b gates made by the recurrence kernel's own blocks before the recurrence starts
+    (two less a GDN layer; h, gate and beta are still stored for the commit);
+  - a QSA layer's three per-head RMSNorm + RoPE launches (k, q, indexer q) as one, and the indexer tail's window
+    snapshot made by the indexer append (three less a QSA layer);
+  - the shared expert reads the q8_1 image of its input that the hyper-connection read already wrote, and runs gate
+    and up through `STRATA_MMVQ_SET`'s kernel (two less a layer, on the shared expert's own stream);
+  - two one-launch forms that existed but were off on HIP: the n-gram block's window steps in one pass
+    (`STRATA_DF_PLE=1`'s path, about 25 nodes on the first card) and the head's hyper-connection read as one launch
+    set (`STRATA_HEAD_MIX_MULTI=1`'s path), which now also writes the head projection's q8_1 input.
+
+  Any other value of the variable is a bit mask of the single fusions (listed in
+  `include/strata/kernels/node_fuse.hpp`). `hip_node_fuse_parity` checks the four new kernels against the launches
+  they replace for 1-8 tokens; `verify_batch_parity`, `gr_parity` and `hip_head_parity` pass with the engine's switches
+  for the two existing forms.
+
+  Decode on 2x Radeon PRO V620 (IQ3_S abliterated, every expert in VRAM, `--spec 8 --spec-min-p 0.7 --mtp-max-t 3
+  --pipeline-windows 2` with this card's defaults and `STRATA_IDX_PAIR=1 STRATA_QSA_GATE_Q8=1`;
+  `tools/decode_probe.py --warm`: three questions of 400 new tokens greedy, the same three sampled with seed 7, one
+  copy-heavy answer; pooled tok/s, the arms alternated):
+
+  | run | greedy | sampled | copy-heavy |
+  |---|---|---|---|
+  | without, 1 | 127.0 | 116.0 | 348.4 |
+  | `STRATA_NODE_FUSE=1`, 1 | 129.2 | 118.0 | 353.5 |
+  | without, 2 | 126.9 | 116.0 | 347.9 |
+  | `STRATA_NODE_FUSE=1`, 2 | 129.2 | 117.9 | 353.2 |
+
+  +1.8% greedy, +1.7% sampled, +1.5% copy-heavy; the greedy and sampled texts are the same hashes in all four runs.
+  Not measured: CUDA and SYCL builds (the new kernels are compiled for every backend; the SYCL port keeps its own
+  copies and is untouched), one card, UD-Q4_K_XL and Q4_0 (whose doorbell graph takes the combine fusion too), a
+  stage split into two token groups (the GDN fusion stays off there), batch windows, long contexts.
 - **File-tier cache rule on gfx906 (`STRATA_FILE_CACHE_OLD_RULE`):** on an MI50 ROCm queues are suspended while the kernel reclaims around the process's HMM-tracked arena (#1752, KevinX8: stalls, prompt 46 -> 360 tok/s once the file tier stops churning the page cache). The gfx906 backend therefore keeps the old rule (the file cache is used only when the room left is at least the bytes read from the files); other HIP cards keep the current rule. `STRATA_FILE_CACHE_OLD_RULE=1` forces the old rule on any Linux build, `=0` the current one.
 - **Windows** (the report above): setup's ready-made Windows engine 0.1.39 runs the RX 6800 beside a 780M iGPU
   (HIP numbers the RX 6800 1; setup points the engine at it), and `tools/hip/build_windows.bat` with
