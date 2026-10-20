@@ -1297,6 +1297,11 @@ bool qfuse_hc_local() {
 // every call, us per stage with its stamp kernel (default -> wide): down 30.0 / 40.8 / 51.8 -> 20.8 / 25.2 / 28.7
 // at 1 / 4 / 6 tokens, up 24.2 / 41.7 / 52.6 -> 21.0 / 30.8 / 35.2 at 2 / 4 / 5 tokens.
 int g_hc_wide = -1;   // fused_gr_set_wide (the bench); -1 = STRATA_HC_WIDE
+int g_hc_down2 = -1;  // fused_gr_set_down2 (tests); -1 = STRATA_HC_DOWN2
+bool hc_down2() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_HC_DOWN2"); return v != nullptr && std::atoi(v) != 0; }();
+    return g_hc_down2 >= 0 ? g_hc_down2 != 0 : env;
+}
 int g_hc_wide8 = -1;  // fused_gr_set_wide8 (tests); -1 = STRATA_HC_WIDE8
 bool hc_wide8() {
     static const bool env = [] { const char* v = std::getenv("STRATA_HC_WIDE8"); return v != nullptr && std::atoi(v) != 0; }();
@@ -1353,6 +1358,66 @@ __global__ void __launch_bounds__(THREADS) gr_down_rows_kernel(GrMulti m) {
     } else {
         const float x = sum / (float) HC;
         m.a[h].lo[row] = x / (1.0f + __expf(-x));
+    }
+}
+
+// STRATA_HC_DOWN2=1 (opt-in, with STRATA_HC_WIDE's down bit): gr_down_rows_kernel with TWO rows of w_down / w_inject a
+// block.  The row kernel reads every token's 40 KB of normalized activations once per row, from L2: 324 rows x T x 40
+// KB (52 MB at 4 tokens, 104 MB at 8) - more than the weights from memory once T > 1.  Two rows a block halve that.
+// Every chunk dot, the 40-step sum in its order, the xor-tree sum and the epilogue are the row kernel's; the tokens go
+// in passes of 4 so the two rows' partial dots fit LDS (2 x 4 x 40 x 32 floats).
+__global__ void __launch_bounds__(THREADS) gr_down_rows2_kernel(GrMulti m) {
+    constexpr int G = 4;
+    __shared__ float part[2][G][ROW_STEPS][32];
+    const int t = threadIdx.x, lane = t & 31, h = t >> 5;
+    const int T = m.T;
+    const int row_g = (int) blockIdx.x * 2;   // rows row_g, row_g + 1 of [w_down | w_inject] (LR is even: no pair mixes them)
+    const bool inject = row_g >= LR;
+    const int row0 = inject ? row_g - LR : row_g;
+    const uint16_t* wbase = inject ? m.a[0].w_inject : m.a[0].w_down;
+    uint4 wv[2][HQ];
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+        const uint4* w4 = reinterpret_cast<const uint4*>(wbase + (size_t) (row0 + rr) * D) + h * (H_TILE / 8);
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[rr][q] = __ldg(w4 + lane + 32 * q);
+    }
+    for (int k0 = 0; k0 < T; k0 += G) {
+        const int nk = T - k0 < G ? T - k0 : G;
+#pragma unroll 1
+        for (int kk = 0; kk < nk; ++kk) {
+            const float4* x4 = reinterpret_cast<const float4*>(m.xn + (size_t) (k0 + kk) * D + (size_t) h * H_TILE);
+            float4 xa[HQ], xb[HQ];
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                xa[q] = x4[2 * j];
+                xb[q] = x4[2 * j + 1];
+            }
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                part[0][kk][h * HQ + q][lane] = dot8u(unpack8(wv[0][q]), xa[q], xb[q]);
+                part[1][kk][h * HQ + q][lane] = dot8u(unpack8(wv[1][q]), xa[q], xb[q]);
+            }
+        }
+        __syncthreads();
+        const int rr = h / G, kk = h - rr * G;   // wave h: row rr, token k0 + kk
+        if (kk < nk) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int s2 = 0; s2 < ROW_STEPS; ++s2) acc += part[rr][kk][s2][lane];
+            const float sum = warp_sum(acc);
+            if (lane == 0) {
+                const int row = row0 + rr, k = k0 + kk;
+                if (inject) {
+                    m.a[k].inject_out[row] = sum;
+                } else {
+                    const float x = sum / (float) HC;
+                    m.a[k].lo[row] = x / (1.0f + __expf(-x));
+                }
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -1444,12 +1509,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32e_kernel(GrMulti m) {
 // warp_sum's) instead of T butterflies: 9 cross-lane moves a row at 5-8 tokens instead of 25-40.  P = the token count
 // rounded up to a power of two; the padding tokens' dots are zeros and their sums are not stored.  The dots, the
 // epilogue and the mix are gr_up_q32e_kernel's.
-// REG (STRATA_HC_UP_REG=1, with STRATA_HC_UP_TSUM, 7-8 tokens): every token's 8 activations of the lane's first chunk are read from
-// LDS once and kept in registers for all of the warp's rows (they are the same for every row); the lanes' second
-// chunk (lanes 0-7) still from LDS.  dot8u on the same two float4 as dot8u_ptr loads: the same FMAs in the same order.
-// fused_gr_bench, cold weights, up incl. a stamp, 5 / 6 / 7 / 8 tokens: 30.9 / 35.8 / 38.7 / 42.6 -> 32.9 / 35.0 / 37.2 /
-// 38.4 us, so it runs from 7 tokens.
-template <int P, bool REG = false>
+template <int P>
 __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     __shared__ __align__(16) float lo[P][LR];
     __shared__ float g[P][HC][Q32_COLS];
@@ -1461,15 +1521,6 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     __syncthreads();
     const int tk = s26ts::tsum_token<P>(lane);
     const bool owner = lane == s26ts::tsum_lane<P>(tk) && tk < T;
-    float4 xr[REG ? P : 1][2];
-    if constexpr (REG) {
-#pragma unroll
-        for (int k = 0; k < P; ++k) {
-            const float4* x4 = reinterpret_cast<const float4*>(lo[k] + lane * 8);
-            xr[k][0] = k < T ? x4[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            xr[k][1] = k < T ? x4[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        }
-    }
     for (int r = warp; r < HC * Q32_COLS; r += Q32_WARPS) {
         const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
         const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
@@ -1480,8 +1531,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
         for (int k = 0; k < P; ++k) {
             acc[k] = 0.0f;
             if (k < T) {
-                if constexpr (REG) acc[k] = dot8u(wa, xr[k][0], xr[k][1]);
-                else acc[k] = dot8u_ptr(wa, lo[k] + lane * 8);
+                acc[k] = dot8u_ptr(wa, lo[k] + lane * 8);
                 if (lane < LR / 8 - 32) acc[k] += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
             }
         }
@@ -1492,11 +1542,6 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     gr_up_epilogue<P>(m, T, d0, g);
     __syncthreads();
     gr_up_mix<P>(m, T, d0, g, mixed_s);
-}
-int g_hc_up_reg = -1;   // fused_gr_set_up_reg (tests); -1 = STRATA_HC_UP_REG
-bool hc_up_reg() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_HC_UP_REG"); return v != nullptr && std::atoi(v) != 0; }();
-    return g_hc_up_reg >= 0 ? g_hc_up_reg != 0 : on;
 }
 int g_hc_up_tsum = -1;   // fused_gr_set_up_tsum (tests); -1 = STRATA_HC_UP_TSUM
 bool hc_up_tsum() {
@@ -1590,11 +1635,22 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     // tokens on a 64 KB LDS card) take the one-block-per-row kernel's token loop in ONE launch instead of the staged
     // kernel in two; each token's sums are the row kernel's (fused_gr_bench / hip_node_fuse_parity: bitwise)
     const bool wide8 = !q8w && n_tok > chunk_tok && n_tok <= kFusedGrMaxT && (hc_wide() & 1) != 0 && hc_wide8();
+    // STRATA_HC_DOWN2 (with the wide down) from 5 tokens: two rows a block, the whole window in one launch.  fused_gr_bench
+    // on gfx1030, cold weights, down incl. a stamp, 5 / 6 / 7 / 8 tokens: 34.8 / 35.2 / 35.7 / 36.2 -> 27.2 / 28.1 / 29.0 /
+    // 30.1 us; 1-4 tokens within 0.5 us either way (the weights from memory bound it there), so they keep the row kernel.
+    // STRATA_HC_DOWN2_MIN overrides the 5 (measurement only).
+    static const int down2_min = [] { const char* v = std::getenv("STRATA_HC_DOWN2_MIN"); return v != nullptr ? std::atoi(v) : 5; }();
+    const bool down2 = !q8w && hc_down2() && (hc_wide() & 1) != 0 && n_tok >= down2_min && n_tok <= kFusedGrMaxT &&
+                       (n_tok <= chunk_tok || hc_wide8());
+    if (down2) {
+        const unsigned rows = (unsigned) (LR + (m.a[0].w_inject != nullptr ? HC : 0));
+        gr_down_rows2_kernel<<<rows / 2, THREADS, 0, st>>>(m);
+    } else
     if (wide8) {
         const unsigned rows = (unsigned) (LR + (m.a[0].w_inject != nullptr ? HC : 0));
         gr_down_rows_kernel<kFusedGrMaxT, false, true><<<rows, THREADS, 0, st>>>(m);
     }
-    for (int c0 = wide8 ? n_tok : 0; c0 < n_tok; c0 += chunk_tok) {
+    for (int c0 = (wide8 || down2) ? n_tok : 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
         GrMulti c{};
         if (ct == n_tok) {
@@ -1662,9 +1718,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // STRATA_HC_UP_TSUM: the same values, one transposed butterfly a row, from 4 tokens (fused_gr_bench on gfx1030,
         // cold weights, up incl. a stamp: 4 / 5 / 6 / 7 / 8 tokens 30.9 / 35.4 / 42.8 / 48.7 / 53.8 -> 26.2 / 30.9 /
         // 35.9 / 38.8 / 42.6 us; at 2 and 3 tokens the exact-T kernels below stay faster: 21.0 / 22.4 against 22.4 / 24.4)
+        // STRATA_HC_UP_TSUM: the same values, one transposed butterfly a row, from 4 tokens (fused_gr_bench on gfx1030,
+        // cold weights, up incl. a stamp: 4 / 5 / 6 / 7 / 8 tokens 30.9 / 35.4 / 42.8 / 48.7 / 53.8 -> 26.2 / 30.9 /
+        // 35.9 / 38.8 / 42.6 us; at 2 and 3 tokens the exact-T kernels below stay faster: 21.0 / 22.4 against 22.4 / 24.4)
         if (hc_up_tsum() && n_tok >= 4 && !no_multi_gr) {
             if (n_tok == 4) gr_up_q32t_kernel<4><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
-            else if (hc_up_reg() && n_tok >= 7) gr_up_q32t_kernel<8, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
             else gr_up_q32t_kernel<8><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
             return;
         }
@@ -2560,8 +2618,8 @@ int g_gr_fast = -1;
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 void fused_gr_set_wide(int mask) { g_hc_wide = mask < 0 ? -1 : (mask & 3); }
 void fused_gr_set_wide8(int on) { g_hc_wide8 = on < 0 ? -1 : (on != 0); }
+void fused_gr_set_down2(int on) { g_hc_down2 = on < 0 ? -1 : (on != 0); }
 void fused_gr_set_up_tsum(int on) { g_hc_up_tsum = on < 0 ? -1 : (on != 0); }
-void fused_gr_set_up_reg(int on) { g_hc_up_reg = on < 0 ? -1 : (on != 0); }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
