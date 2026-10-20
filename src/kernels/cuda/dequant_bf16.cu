@@ -327,11 +327,7 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
 // per thread (a thread per group writes 2-byte values 64 bytes apart: a Q5_K / Q6_K 10240 x 2560 projection takes
 // 2.0 ms on a Radeon PRO V620, the GEMM it feeds 3.0 ms at 2048 tokens).  Every value is group32's expression.
 template <int TYPE> constexpr bool kPiece8 = TYPE == 2 || TYPE == 6 || TYPE == 12 || TYPE == 13 || TYPE == 14 || TYPE == 23;
-__device__ __forceinline__ uint64_t ld8(const uint8_t* p) {
-    uint64_t v;
-    memcpy(&v, p, 8);
-    return v;
-}
+// ld8: upstream's (above, STRATA_DEQUANT_WIDE) reads the same 8 bytes; every block start here is 2-byte aligned
 template <int TYPE, typename T>
 __device__ __forceinline__ void piece8(const uint8_t* row_blocks, int gi_in_row, int piece, T* v) {
     const int l0 = 8 * piece;
