@@ -4416,11 +4416,15 @@ int main(int argc, char** argv) {
             const strata::core::SessionState* ses = &ss;
             for (const auto& st : stages) if (st->dev == dev) { ses = &st->ss; break; }
             if (ses->qsa_states && ses->qsa_states[ses->qsa_primary()].kv_mode == 1) {
+                // STRATA_PF_SIDE_STREAM=1 allocates its own 32 MiB BLAS workspace and 30 MiB scratch at the first
+                // prompt (prefill.cpp, side_ready): price them too, so they do not eat the margin
+                const char* side_env = std::getenv("STRATA_PF_SIDE_STREAM");
+                const int64_t side_mib = side_env && side_env[0] == '1' ? 62 : 0;
                 const int64_t exact = (int64_t) ((strata::prefill::Prefill::bytes_needed_owned(
-                    g, *ses, o.prefill_chunk) + (1ull << 20) - 1) >> 20) + 64;
+                    g, *ses, o.prefill_chunk) + (1ull << 20) - 1) >> 20) + side_mib + 64;
                 std::fprintf(stderr, "strata generate: STRATA_KV_PF_SLOTS: CUDA%d owned prompt reserve "
-                                     "%lld -> %lld MiB (actual buffers + 64 MiB margin)\n",
-                             dev, (long long) pf, (long long) exact);
+                                     "%lld -> %lld MiB (actual buffers + %lld MiB side stream + 64 MiB margin)\n",
+                             dev, (long long) pf, (long long) exact, (long long) side_mib);
                 pf = exact;
             }
         }
