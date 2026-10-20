@@ -1149,9 +1149,28 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   | without, 1 / 2 / 3 | 129.2 / 129.1 / 129.2 | 117.9 / 117.8 / 117.8 | 353.2 / 353.2 / 353.0 |
   | `STRATA_HC_WIDE8=1`, 1 / 2 / 3 | 129.2 / 129.2 / 129.1 | 117.6 / 117.6 / 117.5 | 372.0 / 372.0 / 372.1 |
 
-  Copy-heavy +5.3%, greedy unchanged, sampled -0.3% (the first sampled question, 164.3 -> 163.5 in all three pairs;
-  not explained: its windows of 7-8 tokens should only be faster). Same hashes in every run. Not measured: windows
-  of 7-8 tokens on cards whose staged chunk is 8 already (they take the row kernel without the switch).
+  Copy-heavy +5.3%, greedy unchanged, sampled -0.3%: the first sampled question, 164.3 -> 163.5 in all three pairs,
+  offers 224 draft tokens instead of 219 and keeps the same 196 (the pipelined windows take as many drafts as the
+  chain has ready when a stage launches, so faster stages change the windows, not the text). Same hashes in every
+  run. Not measured: windows of 7-8 tokens on cards whose staged chunk is 8 already (they take the row kernel without
+  the switch).
+- **Decode: the wide up kernel's sums as one transposed butterfly (`STRATA_HC_UP_TSUM=1`, opt-in).** The wide
+  hyper-connection up kernel summed each row's dot once per token with a 5-step xor butterfly, 20-40 cross-lane moves
+  a row at 4-8 tokens; its time grew by about 5 us a token. `STRATA_HC_UP_TSUM=1` sums them as one transposed
+  butterfly (`s26_tsum.cuh`, which the Q8 read already used: every level adds the pairs the butterfly adds, so each
+  sum is the same bits), from 4 tokens on (at 2-3 the exact-T kernels stay faster). `fused_gr_bench`, cold weights,
+  up incl. a stamp, 4 / 5 / 6 / 7 / 8 tokens: 30.9 / 35.4 / 42.8 / 48.7 / 53.8 -> 26.2 / 30.9 / 35.9 / 38.8 / 42.6 us.
+  `hip_node_fuse_parity` compares the read with it against the wide read without it, 1-8 tokens, every output
+  bitwise. Same setup, `STRATA_NODE_FUSE=1 STRATA_HC_WIDE8=1` in both arms, alternated:
+
+  | run | greedy | sampled | copy-heavy |
+  |---|---|---|---|
+  | without, 1-4 | 129.3 / 128.4 / 129.3 / 129.3 | 117.7 / 117.2 / 117.7 / 117.7 | 371.9 / 372.0 / 371.7 / 372.0 |
+  | `STRATA_HC_UP_TSUM=1`, 1-4 | 129.4 / 129.4 / 129.4 / 129.4 | 117.4 / 117.3 / 117.3 / 117.3 | 381.5 / 184.8 / 381.8 / 381.5 |
+
+  Copy-heavy +2.6%, greedy +0.1%, sampled -0.3% (the second sampled question offers 186 drafts instead of 181 and
+  keeps the same 116: the window sizing above again). Pair 2 was disturbed (its copy-heavy answer ran at half speed
+  with the same drafts, and that pair's run without was slow too); a fourth pair replaced it. Same hashes in every run.
 - **File-tier cache rule on gfx906 (`STRATA_FILE_CACHE_OLD_RULE`):** on an MI50 ROCm queues are suspended while the kernel reclaims around the process's HMM-tracked arena (#1752, KevinX8: stalls, prompt 46 -> 360 tok/s once the file tier stops churning the page cache). The gfx906 backend therefore keeps the old rule (the file cache is used only when the room left is at least the bytes read from the files); other HIP cards keep the current rule. `STRATA_FILE_CACHE_OLD_RULE=1` forces the old rule on any Linux build, `=0` the current one.
 - **Windows** (the report above): setup's ready-made Windows engine 0.1.39 runs the RX 6800 beside a 780M iGPU
   (HIP numbers the RX 6800 1; setup points the engine at it), and `tools/hip/build_windows.bat` with
