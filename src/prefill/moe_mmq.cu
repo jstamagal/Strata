@@ -618,6 +618,7 @@ bool direct_blobs(int t, bool down) {
     static const bool env = [] { const char* v = std::getenv("STRATA_PF_DIRECT"); return v != nullptr && v[0] == '1'; }();
     if (!env) return false;
     if (q4::nl_fits(t, down ? 640 : 2560)) return true;   // STRATA_PF_NL=1: Strata's IQ4_NL tile (down)
+    if (q4::q2_fits(t, down ? 640 : 2560)) return true;   // STRATA_PF_Q2=1: the Q2_0 tile (down)
     if (q51_fits(t, down ? 640 : 2560)) return true;       // STRATA_PF_Q51=1: the Q5_1 tile (down)
 #if defined(MMQ_X_EACH_MAX)             // llama.cpp with patch 0003
     static_assert(MMQ_X_EACH_MAX >= kGatherGroupMax, "a group's pointers fit the kernel's table");
@@ -824,6 +825,10 @@ void Context::run(const Product& p, void* stream) {
 #if defined(__HIPCC__)
     if (q4::nl_fits(p.type, p.w_cols)) {   // STRATA_PF_NL=1: IQ4_NL on Strata's tiles, MMQ's activations and bits
         q4::nl_run(p, stream);
+        return;
+    }
+    if (q4::q2_fits(p.type, p.w_cols)) {   // STRATA_PF_Q2=1: Q2_0 down likewise
+        q4::q2_run(p, stream);
         return;
     }
     if (iq_tile_fits(p)) {
