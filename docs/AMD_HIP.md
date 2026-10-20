@@ -813,7 +813,8 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   weight conversion and the mix 0.79-0.83 ms -> 0.65 ms a half.
   Kernel shapes tried for (1) at 2048 tokens: 16 x 7 sums a thread on 8-byte LDS reads 0.53 ms; 8 x 7 sums
   0.56-0.58; 16-byte reads 0.58; 64 x 112, 256 x 112, 128 x 168 and 128 x 84 tiles 0.60-0.70; padding the
-  20,480-byte row strides of X and W changed nothing; double-buffered LDS spilled registers. With the loads and
+  20,480-byte row strides of X and W changed nothing; double-buffered LDS spilled registers; the same kernel built
+  for 64-lane waves (`-mwavefrontsize64`) ran 0.79 ms against 0.54 (2 waves a SIMD at 254 VGPRs instead of 4). With the loads and
   barriers taken out the inner loop alone runs at about 29 TFLOP/s, so what is left is the LDS-to-register traffic
   and the register budget (the kernel uses 254 of 256 VGPRs). Not measured: one card, another gfx103x card,
   Windows, other packs; CUDA and SYCL builds not built (the new code is HIP-only, with no-op stubs elsewhere).
