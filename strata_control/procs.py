@@ -70,11 +70,12 @@ def start_token(pid: int) -> str | None:
         except (psutil.Error, OSError):
             return None
     try:
-        out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.split(None, 1)
     except (OSError, subprocess.SubprocessError):
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    # the start time only: the state letter changes while the process lives (R just after the fork, S asleep)
+    return None if len(out) < 2 or out[0].startswith("Z") else "s:" + out[1].strip()
 
 
 def command_line(pid: int) -> list[str] | None:

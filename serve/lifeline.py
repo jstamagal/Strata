@@ -100,10 +100,10 @@ for s in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
     signal.signal(s, signal.SIG_IGN)               # it ends with its pipe, not with the terminal
 def start_of(p):
     try:
-        out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.split(None, 1)
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    return None if len(out) < 2 or out[0].startswith("Z") else "s:" + out[1].strip()   # the state (R/S/...) is not part of it
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -135,11 +135,12 @@ _watchers_lock = threading.Lock()
 
 def _start_token(pid: int) -> str:
     try:
-        out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(pid)], capture_output=True, text=True,
-                             timeout=5).stdout.strip()
+        out = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5).stdout.split(None, 1)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    # the start time only: the state letter changes while the process lives (R just after the fork, S asleep)
+    return "" if len(out) < 2 or out[0].startswith("Z") else "s:" + out[1].strip()
 
 
 def _watch(child: subprocess.Popen) -> None:
