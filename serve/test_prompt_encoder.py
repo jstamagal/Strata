@@ -1,225 +1,163 @@
-"""Prompt reuse must match full BPE across edits, clients and image expansion."""
-import concurrent.futures
-import os
+"""serve/test_prompt_encoder.py - #567's incremental prompt encoding with #537's plain spans: every prompt's ids
+are those of a full encode, and a turn reuses the previous one's.
+
+    python -m unittest serve.test_prompt_encoder -v
+"""
+from __future__ import annotations
+
 import random
-import subprocess
+import re
 import sys
-import tempfile
-import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from tools.strata_tokenizer import BYTE_TO_UNICODE, PromptEncoder, Tokenizer
-from serve.frontend import ChatTemplate, openai_to_messages
-from serve.server import ByteTokenizer, MockEngine, Service
-
-
-def tokenizer():
-    tokens = list(BYTE_TO_UNICODE.values()) + ['ab', 'abc', ' a']
-    specials = ['<|im_start|>', '<|im_end|>', '<|endoftext|>', '<|image_pad|>',
-                '<x>', '<x>tail', 'tail>', '<think>', '</think>',
-                '<tool_call>', '</tool_call>', '<tool_response>', '</tool_response>', '<|vision_start|>', '<|vision_end|>']
-    # Literal strings need not be byte-mapped; normal BPE merge tokens do.
-    tokens[258] = BYTE_TO_UNICODE[32] + 'a'
-    return Tokenizer(tokens + specials, ['a b', 'ab c', BYTE_TO_UNICODE[32] + ' a'],
-                     [1] * len(tokens) + [3] * 7 + [4] * (len(specials) - 7))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tools"))
+from serve.frontend import ChatTemplate  # noqa: E402
+from serve.server import ByteTokenizer, MockEngine, Service  # noqa: E402
+from strata_tokenizer import PromptEncoder, plain_agree_until  # noqa: E402
 
 
-class PromptReuse(unittest.TestCase):
-    def setUp(self):
-        env = patch.dict(os.environ, STRATA_PROMPT_REUSE='1')
-        env.start()
-        self.addCleanup(env.stop)
-        self.tok = tokenizer()
-        self.enc = PromptEncoder(self.tok)
-
-    def test_service_reuse_is_opt_in(self):
-        template = ChatTemplate(Path(__file__).with_name('chat_template.jinja'))
-        for value in [None, '0', '1']:
-            with patch.dict(os.environ):
-                if value is None:
-                    os.environ.pop('STRATA_PROMPT_REUSE', None)
-                else:
-                    os.environ['STRATA_PROMPT_REUSE'] = value
-                svc = Service(MockEngine(self.tok, 'abc'), self.tok, template)
-                self.assertEqual(svc.prompt_encoder is not None, value == '1')
-                messages = [{'role': 'user', 'content': '中文abc'}]
-                full = Service(MockEngine(self.tok, 'abc'), self.tok, template, prompt_reuse=False)
-                self.assertEqual(svc.encode_prompt(messages, None, {}), full.encode_prompt(messages, None, {}))
-
-    def check(self, text):
-        self.assertEqual(self.enc.encode(text), self.tok.encode(text, parse_special=True))
-
-    def test_special_overlap_every_cut_and_append(self):
-        old = 'abc<x>tail>中文<|im_end|>abc<think>😀'
-        for cut in range(len(old) + 1):
-            for tail in ['tail', '>', '<x>tail>', 'abc', '\u0301', '\r\n', '']:
-                self.check(old)
-                self.check(old[:cut] + tail)
-
-    def test_random_edits_truncation_and_branches(self):
-        rng = random.Random(904)
-        bank = ['<|im_start|>user\n' + x + '<|im_end|>\n' for x in
-                ['abc' * 20, ' 中文é😀\r\n\x00', '<x>tail>abc', '<tool_call>{"x":1}</tool_call>']]
-        for _ in range(1200):
-            text = rng.choice(bank)
-            at = rng.randrange(len(text) + 1)
-            self.check(text[:at] + rng.choice(bank + ['abc', '', '<|im_sta']))
-
-    def test_plain_bpe_boundary_and_special_completion(self):
-        for text in ['a', 'ab', 'abc', ' a', '<x', '<x>', '<x>tail', '', '<x>ab', '<x>abc']:
-            self.check(text)
-
-    def test_returned_ids_do_not_mutate_cache(self):
-        text = '<|im_start|>user\nabc<|im_end|>'
-        ids = self.enc.encode(text)
-        ids[:] = [999]
-        self.check(text)
-        self.check(text + '<|im_start|>assistant\nabc')
-
-    def test_disabled_unsupported_and_bounded_cache(self):
-        for enc in [PromptEncoder(self.tok, keep=0), PromptEncoder(self.tok, max_chars=0),
-                    PromptEncoder(self.tok, max_tokens=0)]:
-            self.assertEqual(enc.encode('<x>abc'), self.tok.encode('<x>abc', True))
-            self.assertEqual(enc.entries, [])
-        byte = ByteTokenizer()
-        self.assertEqual(PromptEncoder(byte).encode('中文'), byte.encode('中文', True))
-        for i in range(20):self.check(f'<|im_start|>{i}<|im_end|>')
-        self.assertLessEqual(len(self.enc.entries), 4)
-        with self.assertRaises(ValueError):PromptEncoder(self.tok, keep=-1)
-
-    def test_concurrent_clients(self):
-        texts = [f'<|im_start|>user\nclient {i} 中文<x>tail>abc<|im_end|>' for i in range(20)]
-        wanted = {t: self.tok.encode(t, True) for t in texts}
-        def run(i):
-            for k in range(80):
-                text = texts[(i + k) % len(texts)]
-                self.assertEqual(self.enc.encode(text), wanted[text])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(run, range(8)))
-        self.assertLessEqual(len(self.enc.entries), 4)
-
-    def test_service_tools_edits_context_and_cancel(self):
-        template = ChatTemplate(Path(__file__).with_name('chat_template.jinja'))
-        engine = MockEngine(self.tok, 'abc', max_context=4096)
-        cached = Service(engine, self.tok, template)
-        full = Service(engine, self.tok, template, prompt_reuse=False)
-        requests = [
-            {'messages': [{'role': 'user', 'content': '中文abc'}]},
-            {'messages': [{'role': 'system', 'content': 'changed'}, {'role': 'user', 'content': '中文abc'}]},
-            {'messages': [{'role': 'user', 'content': 'use tool'}], 'tools': [{'type': 'function', 'function': {'name': 'lookup', 'parameters': {'type': 'object', 'properties': {}}}}]},
-            {'messages': [{'role': 'user', 'content': 'use tool'}, {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'call1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}]}, {'role': 'tool', 'tool_call_id': 'call1', 'content': '中文😀'}]},
-        ]
-        for req in requests * 2:
-            messages, tools, kw = openai_to_messages(req)
-            self.assertEqual(cached.prepare(messages, tools, kw, 10), full.prepare(messages, tools, kw, 10))
-        cancel = threading.Event();cancel.set()
-        ids = cached.prepare(*openai_to_messages(requests[0]), 10)[0]
-        self.assertEqual(list(engine.generate(ids, 10, {}, cancel)), [])
-        self.assertEqual(cached.prepare(*openai_to_messages(requests[0]), 10), full.prepare(*openai_to_messages(requests[0]), 10))
-        for svc in [cached, full]:
-            with self.assertRaises(ValueError):svc.prepare([{'role': 'user', 'content': 'x' * 5000}], None, {}, 10)
-
-    def test_image_expansion_is_per_request(self):
-        with tempfile.TemporaryDirectory() as directory:
-            class Vision:
-                dir = Path(directory)
-                def __init__(self):self.calls = 0
-                def encode(self, source):
-                    self.calls += 1
-                    path = self.dir / f'{self.calls}.sve';path.write_bytes(b'embedding')
-                    return path, 3
-            vision = Vision()
-            template = ChatTemplate(Path(__file__).with_name('chat_template.jinja'))
-            engine = MockEngine(self.tok, 'abc')
-            cached = Service(engine, self.tok, template, vision=vision)
-            full = Service(engine, self.tok, template, vision=vision, prompt_reuse=False)
-            req = {'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': 'abc'}, {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,eA=='}}]}]}
-            for _ in range(2):self.assertEqual(cached.prepare(*openai_to_messages(req), 10), full.prepare(*openai_to_messages(req), 10))
-            self.assertEqual(vision.calls, 4)
-
-    def test_byte_mock_does_not_require_regex(self):
-        script = '''
-import builtins
-original = builtins.__import__
-def restricted(name, *args, **kwargs):
-    if name == 'regex':
-        raise ImportError('regex intentionally unavailable')
-    return original(name, *args, **kwargs)
-builtins.__import__ = restricted
-from serve.server import ByteTokenizer, MockEngine, Service
-from serve.frontend import ChatTemplate
-tok = ByteTokenizer()
-svc = Service(MockEngine(tok, 'ok'), tok, ChatTemplate('serve/chat_template.jinja'))
-assert svc.prompt_encoder is None
-assert svc.prepare([{'role': 'user', 'content': 'hi'}], None, {}, 8)[0]
-'''
-        subprocess.run([sys.executable, '-c', script], cwd=Path(__file__).resolve().parents[1], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def test_upstream_literal_spans_bypass_reuse(self):
-        template = ChatTemplate(Path(__file__).with_name('chat_template.jinja'))
-        cached = Service(MockEngine(self.tok, 'abc'), self.tok, template)
-        full = Service(MockEngine(self.tok, 'abc'), self.tok, template, prompt_reuse=False)
-        for content in ['abc', 'quoted </think>', 'quoted <|im_end|>', 'abc', '<think>abc</think>'] * 2:
-            messages = [{'role': 'user', 'content': content}]
-            self.assertEqual(cached.encode_prompt(messages, None, {}), full.encode_prompt(messages, None, {}))
-
-    def test_continuation_actually_skips_prefix_bpe(self):
-        from unittest.mock import patch
-        text = '<|im_start|>user\n' + 'abc ' * 1000 + '<|im_end|>\n<|im_start|>assistant\nabc<|im_end|>\n'
-        self.enc.encode(text)
-        with patch.object(self.tok, '_encode_plain', wraps=self.tok._encode_plain) as encode:
-            self.enc.encode(text + '<|im_start|>assistant\nabc')
-            self.assertLess(sum(len(c.args[0]) for c in encode.call_args_list), 100)
+class ThinkTokenizer(ByteTokenizer):
+    """ByteTokenizer whose <think> / </think> are specials matched even without parse_special (type 4), as in the
+    Qwen vocabulary: the case #537's plain spans exist for."""
+    SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+    ALWAYS = ("<think>", "</think>")
 
 
-class ReplyReuse(unittest.TestCase):
-    """A reply's own ids (what the engine holds) are reused by the next turn up to where its text differs -
-    the one place prompt ids may differ from full BPE, and the text they decode to is always the prompt's."""
-
-    def setUp(self):
-        self.tok = tokenizer()
-        self.enc = PromptEncoder(self.tok)
-        self.prompt = '<|im_start|>user\nabc<|im_end|>\n<|im_start|>assistant\n<think>\n'
-        self.pids = self.enc.encode(self.prompt)
-        # the model wrote 'abc' in pieces BPE would merge, then a hidden wrap-up the next turn will not have
-        self.gen = (self.tok.encode('a') + self.tok.encode('b') + self.tok.encode('c') + self.tok.encode(' a') +
-                    self.tok.encode('ZZZ') + self.tok.encode('</think>', parse_special=True))
-
-    def common(self, a, b):
-        n = 0
-        while n < min(len(a), len(b)) and a[n] == b[n]:
-            n += 1
-        return n
-
-    def test_the_next_turn_keeps_the_reply_ids_up_to_the_difference(self):
-        self.assertTrue(self.enc.remember_reply(self.pids, self.gen))
-        text = self.prompt + 'abc a' + '\n</think>\n\nabc<|im_end|>'
-        ids = self.enc.encode(text)
-        self.assertEqual(self.tok.decode(ids), text)
-        self.assertEqual(ids[:len(self.pids) + 4], list(self.pids) + self.gen[:4])   # 'a' 'b' 'c' ' a', as written
-        self.assertLess(self.common(self.tok.encode(text, parse_special=True), list(self.pids) + self.gen),
-                        len(self.pids) + 4)   # full BPE merges 'abc' and leaves the engine's ids earlier
-
-    def test_without_its_prompt_nothing_is_kept(self):
-        self.assertFalse(self.enc.remember_reply([1, 2, 3], self.gen))
-        text = self.prompt + 'abc'
-        self.assertEqual(self.enc.encode(text), self.tok.encode(text, parse_special=True))
-
-    def test_a_tag_across_the_cut_is_encoded_whole(self):
-        gen = self.tok.encode('ab') + self.tok.encode('<') + self.tok.encode('x')   # '<x' as plain text
-        self.assertTrue(self.enc.remember_reply(self.pids, gen))
-        text = self.prompt + 'ab<x>tail' + '<|im_end|>'
-        ids = self.enc.encode(text)
-        self.assertEqual(self.tok.decode(ids), text)
-        self.assertIn(self.tok.encode('<x>tail', parse_special=True)[0], ids)   # the tag, not '<' 'x' '>' 't'...
-
-    def test_a_split_character_is_never_a_cut(self):
-        gen = [self.tok.ids[BYTE_TO_UNICODE[b]] for b in '中'.encode()] + self.tok.encode('abc')
-        self.assertTrue(self.enc.remember_reply(self.pids, gen))
-        for text in (self.prompt + '中abc', self.prompt + '中ab!', self.prompt + '文'):
-            self.assertEqual(self.tok.decode(self.enc.encode(text)), text)
+PIECES = ["<|im_start|>user\n", "<|im_end|>\n", "<think>", "</think>", "hello ", "é你 ", "<|im_sta", "x" * 7,
+          "<|im_start|>assistant\n", "</thi", "\n\n", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>"]
 
 
-if __name__ == '__main__':unittest.main()
+def spans_of(text, rng):
+    """Random plain spans over the specials' texts (<think>, </think>, <|im_start|>, ...), as unmark_think_literals
+    marks the ones quoted inside a message."""
+    matches = re.finditer("|".join(map(re.escape, ThinkTokenizer.SPECIALS)), text)
+    return tuple((m.start(), m.end()) for m in matches if rng.random() < 0.5)   # finditer: left to right, no overlap
+
+
+class Units(unittest.TestCase):
+    def test_plain_agree_until(self):
+        self.assertEqual(plain_agree_until((), (), 50), 50)
+        self.assertEqual(plain_agree_until(((5, 13),), ((5, 13),), 50), 50)
+        self.assertEqual(plain_agree_until(((5, 13),), (), 50), 5)
+        self.assertEqual(plain_agree_until(((5, 13),), ((5, 9),), 50), 9)
+        self.assertEqual(plain_agree_until(((60, 70),), (), 50), 50)          # beyond the shared text: no matter
+        self.assertEqual(plain_agree_until(((5, 13), (20, 28)), ((5, 13),), 50), 20)
+
+    def test_same_ids_as_a_full_encode(self):
+        tok = ThinkTokenizer()
+        rng = random.Random(7)
+        for conv in range(300):
+            enc = PromptEncoder(tok)
+            text, plain = "", ()
+            for turn in range(8):
+                text += "".join(rng.choice(PIECES) for _ in range(rng.randint(1, 12)))
+                if rng.random() < 0.6:
+                    plain = spans_of(text, rng)                     # the spans may change in the shared part too
+                with self.subTest(conv=conv, turn=turn):
+                    self.assertEqual(enc.encode(text, plain), tok.encode(text, True, plain))
+                if rng.random() < 0.2 and len(text) > 10:              # an edit: a client re-rendering its history
+                    cut = rng.randrange(len(text))
+                    text = text[:cut]
+                    plain = tuple((a, b) for a, b in plain if b <= cut)
+
+    def test_a_turn_reuses_the_previous_one(self):
+        tok = ThinkTokenizer()
+        enc = PromptEncoder(tok)
+        # as a chat turn: the earlier prompt goes on past its last special (the answer being written), and the
+        # next one shares it up to there - the resume point needs max_special_len characters after it
+        base = "<|im_start|>user\n" + "quoted </think> here " * 200 + "<|im_end|>\n<|im_start|>assistant\nan answer"
+        plain = tuple((i, i + 8) for i in range(len(base)) if base.startswith("</think>", i))
+        enc.encode(base, plain)
+        more = base + " that goes on<|im_end|>\n<|im_start|>user\nnext<|im_end|>\n"
+        self.assertEqual(enc.encode(more, plain), tok.encode(more, True, plain))
+        self.assertGreater(enc.last_reused, len(base) // 2)
+        # the same text with the quoted </think> no longer plain: nothing before it may be reused past its start
+        self.assertEqual(enc.encode(more, ()), tok.encode(more, True, ()))
+        self.assertLessEqual(enc.last_reused, plain[0][0])
+
+
+class Served(unittest.TestCase):
+    def test_quoted_think_across_turns(self):
+        tok = ThinkTokenizer()
+        template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=1 << 20), tok, template)
+        full = Service(MockEngine(tok, "</think>\n\nok", max_context=1 << 20), tok, template)
+        full.prompts = None                                        # the reference: a full encode every time
+        self.assertIsNotNone(svc.prompts)
+        msgs = [{"role": "system", "content": "Explain tags."}]
+        for turn in range(5):
+            msgs.append({"role": "user", "content": f"turn {turn}: what does </think> mean? <think> too " * 3})
+            got, want = svc.encode_prompt(msgs, None, {}), full.encode_prompt(msgs, None, {})
+            self.assertEqual(got, want)
+            if turn:
+                self.assertGreater(svc.prompts.last_reused, 0)
+            msgs.append({"role": "assistant", "content": "It closes the reasoning: </think> is a marker."})
+
+    def service(self, max_context=1 << 22):
+        tok = ByteTokenizer()
+        return Service(MockEngine(tok, "ok", max_context=max_context), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def test_another_conversation_does_not_evict_the_first(self):
+        """A subagent beside the main conversation: every rendered prompt starts with the template's header, which
+        must not make the second client's prompt a continuation of the first's entry."""
+        svc = self.service()
+        turn2 = [{"role": "user", "content": "a long question " * 500}, {"role": "assistant", "content": "answer"},
+                 {"role": "user", "content": "next"}]
+        svc.encode_prompt(turn2, None, {})
+        svc.encode_prompt([{"role": "user", "content": "one unrelated prompt " * 300}], None, {})
+        self.assertEqual(len(svc.prompts.entries), 2)
+        turn3 = turn2 + [{"role": "assistant", "content": "x"}, {"role": "user", "content": "more"}]
+        svc.encode_prompt(turn3, None, {})
+        self.assertGreater(svc.prompts.last_reused, len(turn2[0]["content"]))
+        self.assertEqual(len(svc.prompts.entries), 2)           # turn 3 replaced turn 2, the other one stayed
+
+    def test_a_refused_prompt_is_not_kept(self):
+        svc = self.service(max_context=4096)
+        svc.fit_max_tokens = False   # the strict mode refuses an over-long max_tokens (the default now shortens it)
+        msgs = [{"role": "user", "content": "kept " * 20}]
+        svc.prepare(msgs, None, {}, 16)
+        refused = msgs + [{"role": "assistant", "content": "a"}, {"role": "user", "content": "more " * 20}]
+        full = self.service(max_context=4096)
+        full.prompts = None
+        refused_ids = full.encode_prompt(refused, None, {})
+        with self.assertRaisesRegex(ValueError, "exceeds the context"):
+            svc.prepare(refused, None, {}, 1 << 20)
+        self.assertNotIn(refused_ids, [e[2] for e in svc.prompts.entries])
+        self.assertNotIn(full.render_prompt(refused, None, {}), [e[0] for e in svc.prompts.entries])
+
+    def test_random_messages_equal_a_full_encode(self):
+        """Messages quoting control-token texts and <think> tags at random, growing, edited and cut back between
+        requests: the incremental encoder's ids are the full encode's, 2400 prompts."""
+        tok = ThinkTokenizer()
+        template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        svc = Service(MockEngine(tok, "ok", max_context=1 << 20), tok, template)
+        full = Service(MockEngine(tok, "ok", max_context=1 << 20), tok, template)
+        full.prompts = None
+        rng = random.Random(567)
+        quoted = ThinkTokenizer.SPECIALS + ["<|im_sta", "</thi"]
+        words = ["hello ", "é你 ", "x" * 9, "\n", "tool "]
+
+        def text():
+            return "".join(rng.choice(quoted if rng.random() < 0.4 else words) for _ in range(rng.randint(1, 10)))
+
+        reused = 0
+        for conv in range(300):
+            msgs = [{"role": "system", "content": text()}]
+            for turn in range(8):
+                msgs.append({"role": "user", "content": text()})
+                if rng.random() < 0.15:                             # an earlier turn edited by the client
+                    msgs[rng.randrange(len(msgs))]["content"] = text()
+                if rng.random() < 0.1 and len(msgs) > 2:            # a shorter conversation
+                    msgs = msgs[:rng.randrange(1, len(msgs))] + msgs[-1:]
+                with self.subTest(conv=conv, turn=turn):
+                    self.assertEqual(svc.encode_prompt(msgs, None, {}), full.encode_prompt(msgs, None, {}))
+                reused += svc.prompts.last_reused > 0
+                msgs.append({"role": "assistant", "content": text()})
+        self.assertGreater(reused, 1000)
+
+
+if __name__ == "__main__":
+    unittest.main()

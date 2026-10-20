@@ -35,6 +35,7 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
@@ -43,6 +44,12 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// HIP: one tiny BF16 and one tiny FP16 product on a private handle, so the first prompt does not pay hipBLAS's one-time
+/// library loads (about 2.5 s on an R9700); once per device, later calls wait for the first and return.  Safe to call from a
+/// thread before the expert arena loads.  STRATA_PREFILL_WARM=0 makes it a no-op.  Nothing on CUDA / SYCL.
+void warm_gemm_libraries(int device);
+
 
 class Prefill {
 public:
@@ -69,7 +76,8 @@ public:
     /// lent for the prompt and refilled after it); null = allocate normally.
     bool init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
               core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
-              void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0);
+              void* stream, std::string& err, void* borrow = nullptr, uint64_t borrow_bytes = 0,
+              bool borrow_spill = false);
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
@@ -156,6 +164,11 @@ public:
     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
     static bool ring_bytes_enabled();
 
+    /// STRATA_MMQ_DIRECT: the guard each sized expert-cache slot keeps after its blob (ExpertCache::set_slot_guard),
+    /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
+    /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
+    static size_t slot_guard_bytes();
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
@@ -180,6 +193,20 @@ public:
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
+    /// The first stage only, checked before every chunk but the first: true ends the run there as if the prompt
+    /// ended there.  `run` returns true once every stage has read the tokens before that chunk, and `stopped_at()`
+    /// says how many of the run's tokens that is (-1 when the run read them all).  A read beside the batch slots
+    /// (STRATA_PIPED_CONCURRENT) gives way to a waiting shorter request there.
+    std::function<bool()> stop_at_chunk;
+    /// 149-prefetch (STRATA_RAM_ADAPT2): a layer's routed expert ids (T x k, -1 = none) after the prompt path downloaded them
+    /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
+    std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
+    int64_t stopped_at() const { return stopped_at_; }
+    /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
+    /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
+    /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
+    /// not be had (it then grows at first use, as before).
+    bool reserve_uploads(int64_t T);
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
@@ -232,11 +259,16 @@ private:
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
+    int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
+    /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
+    const void* hand_ev_ = nullptr;
+    int hand_pieces_ = 0;
 
     std::string next_err_;
     std::future<bool> next_run_;

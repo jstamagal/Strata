@@ -21,6 +21,7 @@ import threading
 import json
 import pathlib
 import sys
+import threading
 
 import regex
 
@@ -119,6 +120,8 @@ class Tokenizer:
         # through __dict__.setdefault on each encoded segment or decoded token.
         self._piece_ids: dict[str, list[int]] = {}
         self._bytes_cache: dict[int, bytes] = {}
+        # How far a special-token match can look ahead of where it starts (PromptEncoder's margin).
+        self.max_special_len = max((len(t) for t in self.special_tokens), default=1)
 
     @staticmethod
     def _alt(literals: list[str]):
@@ -238,13 +241,16 @@ class Tokenizer:
             out.extend(got)
         return out
 
-    def _encode_matching(self, text: str, pat, plain=(), marks=None) -> list[int]:
+    def _encode_matching(self, text: str, pat, plain=(), marks: list | None = None) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
 
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts
         inside one of the `plain` (start, end) spans is left to the text around it (#537).
+
+        `marks`, when given, receives (end of the match in `text`, ids so far) for every match: the points where
+        the encoding of a longer text with the same beginning can resume (PromptEncoder).
         """
         if pat is None:
             return self._encode_plain(text)
@@ -289,11 +295,10 @@ class Tokenizer:
         """
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 
-    def encode_marked(self, text: str, parse_special: bool = False):
-        """Token IDs and (character end, token count) at each special-token boundary."""
-        marks = []
-        ids = self._encode_matching(text, self._special_re if parse_special else self._always_re, marks=marks)
-        return ids, marks
+    def encode_marked(self, text: str, parse_special: bool = False, plain=()) -> tuple[list[int], list[tuple[int, int]]]:
+        """encode() and its resume points: (end offset in `text`, ids so far) after every special-token match."""
+        marks: list[tuple[int, int]] = []
+        return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain, marks), marks
 
     def token_bytes(self, i: int) -> bytes:
         """The raw bytes of one token (a multi-byte character can be split across tokens)."""
@@ -315,18 +320,19 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
+# ------------------------------------------------------------------ incremental prompts (#567)
 def common_prefix_len(a: str, b: str) -> int:
-    """Find a common character prefix using bounded slices rather than a Python loop."""
+    """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""
     n = min(len(a), len(b))
     lo, step = 0, 4096
-    while lo < n:
+    while lo < n:                                       # whole chunks first, doubling
         hi = min(n, lo + step)
         if a[lo:hi] != b[lo:hi]:
             break
         lo, step = hi, min(step * 2, 1 << 20)
     else:
         return n
-    while hi - lo > 1:
+    while hi - lo > 1:                                  # the first difference is in [lo, hi): bisect it
         mid = (lo + hi) // 2
         if a[lo:mid] == b[lo:mid]:
             lo = mid
@@ -335,108 +341,88 @@ def common_prefix_len(a: str, b: str) -> int:
     return lo
 
 
-class PromptEncoder:
-    """Reuse exact prompt IDs only across a shared special-token boundary.
+def plain_agree_until(a, b, limit: int) -> int:
+    """The first position below `limit` where the `plain` spans (#537) of two texts differ - a position inside a
+    span in one and not in the other - or `limit`.  Spans are (start, end), sorted and disjoint."""
+    def clip(spans):
+        return [(x, min(y, limit)) for x, y in spans if x < limit and y > x]
+    ca, cb = clip(a), clip(b)
+    for (xa, ya), (xb, yb) in zip(ca, cb):
+        if (xa, ya) != (xb, yb):
+            return min(xa, xb) if xa != xb else min(ya, yb)
+    if len(ca) != len(cb):
+        return (ca if len(ca) > len(cb) else cb)[min(len(ca), len(cb))][0]
+    return limit
 
-    BPE never crosses a special match. The margin of max_special_len - 1 makes
-    every earlier literal decision identical even when special strings overlap.
-    Ordinary text without a safe boundary takes the full encoder. Entries are
-    immutable snapshots; callers receive a fresh ID list, before image expansion.
-    The cache retains at most four 256K-character / 64K-token prompts by default.
-    It is local to one service and independent of engine KV or cancellation.
+
+class PromptEncoder:
+    """`tok.encode(text, parse_special=True, plain=...)` for chat prompts, reusing the ids of an earlier prompt.
+
+    A chat client sends the whole conversation every turn, and the rendered prompt of turn n+1 starts with most of
+    turn n's.  Running BPE over all of it again costs hundreds of milliseconds at 100K tokens, even when the engine
+    reuses the whole prefix.  So the ids up to a SPECIAL-TOKEN BOUNDARY both prompts share are taken as they were,
+    and only the rest is encoded.
+
+    WHY THAT IS EXACT.  Encoding splits the text at special-token matches and BPE-encodes each stretch between two
+    matches on its own (`_encode_matching`): nothing crosses a match.  Whether a match is taken at position q
+    depends only on text[q : q + max_special_len] and on whether q lies inside a `plain` span (#537: a </think>
+    quoted in a message is text).  So if the two texts agree up to L and their plain spans agree below L, every
+    decision the scan makes at a position before c = the end of some match, with c + max_special_len - 1 <= L, is
+    the same for both - the same matches, the same stretches, the same ids up to c - and from c the scan starts
+    afresh, exactly as it does on text[c:] with the spans shifted by c.  Hence encode(new) == ids_old[:ids at c] +
+    encode(new[c:]).  The margin matters only for a vocabulary where a literal overlaps another's end; it costs
+    re-encoding one short stretch.
+
+    A few recent prompts are kept (one per conversation: a prompt replaces the one it continues, that is, one whose
+    text it reuses for more than half; a prompt that shares only the template's head with every entry is a new
+    entry), so a second client does not evict the first.  `encode(..., store=False)` reads the kept prompts without
+    writing one (a token count is not a conversation's turn).  The tokenizer needs `encode_marked` and
+    `max_special_len`.
     """
 
-    # Limits raised from 256K characters / 64K tokens - an agent's prompt reaches 150K+ tokens, and those are
-    # the turns where re-reading a reply costs the most
-    def __init__(self, tok, keep: int = 4, max_chars: int = 1 << 20, max_tokens: int = 1 << 18):
-        self.tok = tok
-        self.keep, self.max_chars, self.max_tokens = keep, max_chars, max_tokens
-        if min(keep, max_chars, max_tokens) < 0:
-            raise ValueError('prompt cache limits must be nonnegative')
-        self.entries = []
+    def __init__(self, tok, keep: int = 4):
+        self.tok, self.keep = tok, keep
+        # (text, plain spans, ids, mark ends, mark counts)
+        self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
         self.lock = threading.Lock()
-        self.supported = callable(getattr(tok, 'encode_marked', None)) and hasattr(tok, 'max_special_len')
+        self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
 
-    def encode(self, text: str) -> list[int]:
-        if not self.keep or not self.supported or len(text) > self.max_chars:
-            return self.tok.encode(text, parse_special=True)
+    def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
+        plain = tuple(sorted(plain))
         with self.lock:
-            entries = self.entries
-        src, cut_k = None, -1
+            entries = self.entries                      # replaced, never changed in place
         margin = self.tok.max_special_len - 1
-        for entry in entries:
-            if text == entry[0]:
-                return list(entry[1])
-            cp = common_prefix_len(entry[0], text)
-            k = bisect.bisect_right(entry[2], cp - margin) - 1
-            # A reply's own token boundaries (entry[4]: where the reply starts) need no margin - the engine
-            # holds those ids, and the text from the cut on is encoded afresh - unless a tag could straddle the cut
-            if len(entry) > 4 and cp >= entry[4]:
-                k2 = bisect.bisect_right(entry[2], cp) - 1
-                if k2 > k and entry[2][k2] >= entry[4] and not self._straddles(text, entry[2][k2]):
-                    k = k2
-            if k >= 0 and (src is None or entry[2][k] > src[2][cut_k]):
-                src, cut_k = entry, k
+        src, cut_k = None, -1
+        for e in entries:
+            same = plain_agree_until(e[1], plain, common_prefix_len(e[0], text))
+            k = bisect.bisect_right(e[3], same - margin) - 1   # the last boundary c with c <= same - margin
+            if k >= 0 and (src is None or e[3][k] > src[3][cut_k]):
+                src, cut_k = e, k
         if src is None:
-            ids, marks = self.tok.encode_marked(text, parse_special=True)
-            ends, counts = tuple(m[0] for m in marks), tuple(m[1] for m in marks)
+            ids, marks = self.tok.encode_marked(text, parse_special=True, plain=plain)
+            ends, counts = [m[0] for m in marks], [m[1] for m in marks]
+            self.last_reused = 0
         else:
-            c, n = src[2][cut_k], src[3][cut_k]
-            tail, marks = self.tok.encode_marked(text[c:], parse_special=True)
-            ids = list(src[1][:n]) + tail
-            ends = src[2][:cut_k + 1] + tuple(c + m[0] for m in marks)
-            counts = src[3][:cut_k + 1] + tuple(n + m[1] for m in marks)
-        if len(ids) <= self.max_tokens:
-            entry = (text, tuple(ids), ends, counts)
-            with self.lock:
-                # Concurrent readers may have published meanwhile; discard stale
-                # duplicates, and never mutate the snapshot a reader is using.
-                self.entries = [entry] + [e for e in self.entries if e is not src and e[0] != text][:self.keep - 1]
-        return ids
-
-    def _straddles(self, text: str, c: int) -> bool:
-        """A special literal that starts before `c` and ends after it: a cut there would split the tag."""
-        specials = getattr(self.tok, "special_tokens", None) or {}
-        lo = max(0, c - self.tok.max_special_len + 1)
-        p = text.find("<", lo, c)
-        while p >= 0:
-            if any(len(s) > c - p and text.startswith(s, p) for s in specials):
-                return True
-            p = text.find("<", p + 1, c)
-        return False
-
-    def remember_reply(self, prompt_ids, gen_ids) -> bool:
-        """The engine's session after a request is the prompt plus the reply's OWN ids - which are not always
-        what the reply's text encodes to (a model writes `çğıöşü` or a number in pieces BPE would merge).  The next
-        turn's prompt renders that text again: encoded afresh, it left the engine's ids at the first such piece and
-        the engine read the whole reply again from the turn's start.  Kept as an entry whose cuts are every token
-        boundary of the reply, the next prompt takes the reply's own ids up to where its text really differs."""
-        if not self.keep or not self.supported or not gen_ids:
-            return False
-        prompt_ids = tuple(int(t) for t in prompt_ids)
+            c, n = src[3][cut_k], src[4][cut_k]
+            rest = tuple((max(x - c, 0), y - c) for x, y in plain if y > c)
+            tail, marks = self.tok.encode_marked(text[c:], parse_special=True, plain=rest)
+            ids = src[2][:n] + tail
+            ends = src[3][:cut_k + 1] + [c + m[0] for m in marks]
+            counts = src[4][:cut_k + 1] + [n + m[1] for m in marks]
+            self.last_reused = c
+        if not store:
+            return ids
+        # every rendered prompt starts with the template's header, so sharing a special boundary does not make two
+        # prompts one conversation: only the entry whose text is mostly reused is replaced
+        old = src if src is not None and 2 * src[3][cut_k] > len(src[0]) else None
         with self.lock:
-            entries = self.entries
-        base = next((e for e in entries if e[1] == prompt_ids), None)
-        if base is None:
-            return False
-        dec = codecs.getincrementaldecoder("utf-8")("replace")
-        chars, ends, counts = len(base[0]), list(base[2]), list(base[3])
-        pieces = []
-        for j, t in enumerate(gen_ids):
-            s = dec.decode(self.tok.token_bytes(int(t)))
-            pieces.append(s)
-            chars += len(s)
-            if not dec.getstate()[0]:                   # no character split across this boundary
-                ends.append(chars)
-                counts.append(len(prompt_ids) + j + 1)
-        text = base[0] + "".join(pieces)
-        ids = prompt_ids + tuple(int(t) for t in gen_ids)
-        if len(text) > self.max_chars or len(ids) > self.max_tokens:
-            return False
-        entry = (text, ids, tuple(ends), tuple(counts), len(base[0]))
+            self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
+        return list(ids)
+
+    def forget(self, ids: list[int]) -> None:
+        """The prompt with these ids was refused: it is not kept."""
         with self.lock:
-            self.entries = [entry] + [e for e in self.entries if e[0] != text][:self.keep - 1]
-        return True
+            self.entries = [e for e in self.entries if e[2] != ids]
 
 
 # ------------------------------------------------------------------ the pack's tokenizer/ directory

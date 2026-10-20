@@ -13,7 +13,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -128,13 +127,6 @@ void bench(ggml_type t, int64_t T) {
 
 int main(int argc, char** argv) {
     const bool do_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
-    // the scatter is opt-in in this tree: turn it on before the first call reads the switch, or the test would
-    // compare the gather with itself
-#if defined(_WIN32)
-    _putenv_s("STRATA_QUANT_GATHER", "0");
-#else
-    setenv("STRATA_QUANT_GATHER", "0", 1);
-#endif
     int fails = 0;
     try {
         const ggml_type types[] = {GGML_TYPE_Q2_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_1, GGML_TYPE_Q2_K};
