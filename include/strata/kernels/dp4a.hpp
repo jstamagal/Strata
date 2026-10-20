@@ -42,6 +42,27 @@ __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c
 #define STRATA_DP4A(a, b, c) __dp4a((a), (b), (c))
 #endif
 
+// Two integer forms that the AMDGPU backend compiles to v_mul_lo_u32, which runs at quarter rate on gfx10 (RDNA2):
+//
+//   * a per-byte mask: one bit per byte (b has bits only at 0x01010101) to 0x00 / 0xFF bytes.  (b << 8) - b and
+//     b * 255 both fold to a 32-bit multiply.  v_perm_b32 with selector byte 12 + bit gives 0x00 (12) or 0xFF
+//     (13) per byte - the same bits in one full-rate instruction.
+//   * a byte broadcast: v * 0x01010101 for an 8-bit v.  v_perm_b32 with selector 0 copies byte 0 to all four.
+//   * a scale multiply where both operands fit in 24 signed bits and the product fits in 32 (a q8 dot sum times a
+//     6-bit K-quant scale): __mul24 is v_mul_i32_i24, full rate, the same integer.
+//
+// Only the HIP device pass takes the new forms; CUDA and the host pass keep the original expressions, so their
+// code is unchanged.  Same integers everywhere, so the outputs are bitwise the old ones.
+#if defined(__HIP_DEVICE_COMPILE__)
+__device__ __forceinline__ uint32_t strata_bytemask(uint32_t b) { return __builtin_amdgcn_perm(0u, 0u, 0x0C0C0C0Cu + b); }
+__device__ __forceinline__ uint32_t strata_bytebcast(uint32_t v) { return __builtin_amdgcn_perm(v, v, 0u); }
+__device__ __forceinline__ int strata_smul(int a, int b) { return __mul24(a, b); }
+#else
+__device__ __forceinline__ uint32_t strata_bytemask(uint32_t b) { return (b << 8) - b; }
+__device__ __forceinline__ uint32_t strata_bytebcast(uint32_t v) { return v * 0x01010101u; }
+__device__ __forceinline__ int strata_smul(int a, int b) { return a * b; }
+#endif
+
 /// Yield the thread while a doorbell flag is being polled.  The length of the pause is a backoff hint, not a
 /// contract, and only pre-Volta CUDA has no `__nanosleep` at all.
 __device__ __forceinline__ void strata_spin_pause() {

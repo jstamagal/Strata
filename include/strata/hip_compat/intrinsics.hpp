@@ -75,6 +75,16 @@ __device__ __forceinline__ int vsub4(int a, int b) {
     return static_cast<int>(((ua | kHigh) - (ub & ~kHigh)) ^ ((ua ^ ~ub) & kHigh));
 }
 
+// One bit per byte (bits only at 0x01010101) to 0x00 / 0xff bytes.  bits * 0xff is v_mul_lo_u32, quarter rate on
+// gfx10; v_perm_b32 with selector byte 12 + bit gives 0x00 (12) or 0xff (13) per byte, the same bits at full rate.
+__device__ __forceinline__ uint32_t byte_mask01(uint32_t bits) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_perm(0u, 0u, 0x0C0C0C0Cu + bits);
+#else
+    return bits * 0xffu;
+#endif
+}
+
 // CUDA's packed signed-byte saturating subtract: the wrapping difference, and in each lane that overflowed (operand
 // signs differ and the result's sign differs from the minuend's) the bound on the minuend's side, 0x7f or 0x80.
 __device__ __forceinline__ int vsubss4(int a, int b) {
@@ -82,7 +92,7 @@ __device__ __forceinline__ int vsubss4(int a, int b) {
     const uint32_t ub = static_cast<uint32_t>(b);
     const uint32_t d = static_cast<uint32_t>(vsub4(a, b));
     const uint32_t overflow = (ua ^ ub) & (ua ^ d) & kHigh;
-    const uint32_t mask = (overflow >> 7) * 0xffu;
+    const uint32_t mask = byte_mask01(overflow >> 7);
     const uint32_t bound = 0x7f7f7f7fu + ((ua & kHigh) >> 7);
     return static_cast<int>((d & ~mask) | (bound & mask));
 }
@@ -92,7 +102,7 @@ __device__ __forceinline__ int vsubss4(int a, int b) {
 __device__ __forceinline__ int vcmpne4(int a, int b) {
     const uint32_t t = static_cast<uint32_t>(a) ^ static_cast<uint32_t>(b);
     const uint32_t nonzero = (((t & ~kHigh) + ~kHigh) | t) & kHigh;
-    return static_cast<int>((nonzero >> 7) * 0xffu);
+    return static_cast<int>(byte_mask01(nonzero >> 7));
 }
 
 // CUDA's mask argument describes participating lanes. The current kernel set uses full

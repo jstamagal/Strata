@@ -228,8 +228,8 @@ __device__ __forceinline__ float q5_q8_dot_impl(
         const int v1i = vl1i | vh1i;
         const int dot1 = STRATA_DP4A(v0i, u[2 * i], STRATA_DP4A(v1i, u[2 * i + 1], 0));
         const int dot2 = STRATA_DP4A(0x01010101, u[2 * i], STRATA_DP4A(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);
     }
     const float2 dm5f = __half22float2(dm5);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
@@ -409,7 +409,7 @@ __device__ __forceinline__ float q3_q8_dot_impl(int vl, int vh, const int* __res
         const int vil = (vl >> (2 * i)) & 0x03030303;
         const int vih = ((vh >> i) << 2) & 0x04040404;
         const int vi = __vsubss4(vil, vih);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * strata_smul(STRATA_DP4A(vi, u[i], 0), sc);
     }
     return d3 * sumf;
 }
@@ -519,7 +519,7 @@ __device__ __forceinline__ float iq4_xs_q8_dot(const IQ4XSBlock* __restrict__ w,
     }
     const int ls = ((w->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0f) |
                    (((w->scales_h >> (iqs / 2)) & 0x03) << 4);
-    sumi *= ls - 32;
+    sumi = strata_smul(sumi, ls - 32);
     const float d = __half2float(w->d) * __low2float(x[iqs / 4].ds);
     return d * sumi;
 }
@@ -576,8 +576,8 @@ __device__ __forceinline__ float q4_q8_dot_impl(
         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
         const int dot1 = STRATA_DP4A(v1i, u[2 * i + 1], STRATA_DP4A(v0i, u[2 * i], 0));
         const int dot2 = STRATA_DP4A(0x01010101, u[2 * i + 1], STRATA_DP4A(0x01010101, u[2 * i], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
@@ -672,7 +672,7 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = __vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * strata_smul(STRATA_DP4A(vi, u[i], 0), sc);
     }
     return d * sumf;
 }
@@ -1045,7 +1045,7 @@ struct IQ4XSTraits {
             sumi = STRATA_DP4A(r.v[j].x, u0, sumi);
             sumi = STRATA_DP4A(r.v[j].y, u1, sumi);
         }
-        sumi *= r.ls - 32;
+        sumi = strata_smul(sumi, r.ls - 32);
         const float d = r.dw * __low2float(x[iqs / 4].ds);
         return d * sumi;
     }
@@ -1372,7 +1372,7 @@ template<> struct B6X<Q6KTraits> {
             const int vil = (w.vl >> (4 * i)) & 0x0f0f0f0f;
             const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
             const int vi = __vsubss4(vil | vih, 0x20202020);
-            sumf += x.d8[i] * (STRATA_DP4A(vi, x.u[i], 0) * w.sc[i]);
+            sumf += x.d8[i] * strata_smul(STRATA_DP4A(vi, x.u[i], 0), w.sc[i]);
         }
         return w.d * sumf;
     }
@@ -1425,7 +1425,7 @@ template<> struct B6X<IQ4XSTraits> {
             sumi = STRATA_DP4A(w.v[j].x, x.u0[j], sumi);
             sumi = STRATA_DP4A(w.v[j].y, x.u1[j], sumi);
         }
-        sumi *= w.ls - 32;
+        sumi = strata_smul(sumi, w.ls - 32);
         const float d = w.dw * x.dx;
         return d * sumi;
     }
@@ -1577,7 +1577,7 @@ struct IlIQ4XS {
                 sumi = STRATA_DP4A(r.v[j].x, u0[j][c], sumi);
                 sumi = STRATA_DP4A(r.v[j].y, u1[j][c], sumi);
             }
-            sumi *= r.ls - 32;
+            sumi = strata_smul(sumi, r.ls - 32);
             const float d = r.dw * d8[c];
             out[c] = d * sumi;
         }
@@ -1658,13 +1658,13 @@ struct IlQ3K {
             const int sc_shift_high = 2 * (isc / 4);
             const int sc_high = ((r.scales[8 + isc_high] >> sc_shift_high) & 3) << 4;
             sc[i] = (sc_low | sc_high) - 32;
-            vi[i] = ((r.vl >> (2 * i)) & 0x03030303) | (((r.vh >> i) & 0x01010101) * 252);
+            vi[i] = ((r.vl >> (2 * i)) & 0x03030303) | (int) (strata_bytemask((r.vh >> i) & 0x01010101) & 0xFCFCFCFCu);
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             float sumf = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) sumf += d8[i][c] * (STRATA_DP4A(vi[i], u[i][c], 0) * sc[i]);
+            for (int i = 0; i < 4; ++i) sumf += d8[i][c] * strata_smul(STRATA_DP4A(vi[i], u[i][c], 0), sc[i]);
             out[c] = r.d * sumf;
         }
     }

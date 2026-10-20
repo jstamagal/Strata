@@ -175,8 +175,8 @@ __global__ void head_q6k_wide_kernel(const uint8_t* __restrict__ w, const Q81* _
 #pragma unroll
                 for (int j = 0; j < NC; ++j) {
                     float sumf = 0.0f;                                         // q6_q8_dot_impl's tail, verbatim
-                    sumf += e0[j][s] * (STRATA_DP4A(vi0, u0[j][s], 0) * sc0);
-                    sumf += e1[j][s] * (STRATA_DP4A(vi1, u1[j][s], 0) * sc1);
+                    sumf += e0[j][s] * strata_smul(STRATA_DP4A(vi0, u0[j][s], 0), sc0);
+                    sumf += e1[j][s] * strata_smul(STRATA_DP4A(vi1, u1[j][s], 0), sc1);
                     tmp[j] += d * sumf;
                 }
             }
@@ -294,8 +294,8 @@ __global__ void head_q6k_wide3_kernel(const uint8_t* __restrict__ w, const Q81* 
                 for (int j = 0; j < NC; ++j) {
                     const float e0 = et[j * XB + s * 32], e1 = et[j * XB + s * 32 + 2];
                     float sumf = 0.0f;                                         // q6_q8_dot_impl's tail, verbatim
-                    sumf += e0 * (STRATA_DP4A(vi0, u0[j][s], 0) * sc0);
-                    sumf += e1 * (STRATA_DP4A(vi1, u1[j][s], 0) * sc1);
+                    sumf += e0 * strata_smul(STRATA_DP4A(vi0, u0[j][s], 0), sc0);
+                    sumf += e1 * strata_smul(STRATA_DP4A(vi1, u1[j][s], 0), sc1);
                     tmp[j] += d * sumf;
                 }
             }

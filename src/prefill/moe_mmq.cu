@@ -331,9 +331,18 @@ __global__ void __launch_bounds__(256) q51_sload_kernel(ArgsQ51 a) {
 // The IQ2_S, IQ3_XXS and IQ3_S grids have positive, nonzero bytes.
 // Expand four sign bits to byte ones. Complement and add one independently
 // in each negative byte; no byte can overflow, so integer addition is safe.
+// bits * 255 is v_mul_lo_u32 (quarter rate on gfx10); v_perm_b32 with selector byte 12 + bit gives the same 0x00 /
+// 0xFF bytes at full rate (strata_bytemask in dp4a.hpp, which this llama.cpp-side TU does not include).
+__device__ __forceinline__ unsigned iq_sign_mask(unsigned bits) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_perm(0u, 0u, 0x0C0C0C0Cu + bits);
+#else
+    return bits * 255u;
+#endif
+}
 __device__ __forceinline__ int iq_grid_sign(unsigned grid, unsigned signs) {
     const unsigned bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
-    return (grid ^ (bits * 255u)) + bits;
+    return (grid ^ iq_sign_mask(bits)) + bits;
 }
 
 // IQ2_S uses the exact signed grid bytes and 16-value scales of MMQ's loader.

@@ -50,7 +50,7 @@ __device__ __forceinline__ int get_int_b4(const void* x, const int& i32) { retur
 __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
-    return s * 0x01010101;
+    return strata_bytebcast(s);
 }
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
 #if defined(STRATA_HIP_GFX906)
@@ -125,7 +125,7 @@ __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(const void* __restrict__ v
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
     const int ls = aux32 >> 27 | 1;
-    sumi = sumi * ls / 8;
+    sumi = strata_smul(sumi, ls) / 8;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -156,7 +156,7 @@ __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(const void* __restrict__ vb
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const int sumi = (strata_smul(sumi0, ls0) + strata_smul(sumi1, ls1) + (sumi0 + sumi1) / 2) / 4;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -189,7 +189,7 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
             sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
         }
     }
-    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const int sumi = (strata_smul(sumi0, ls0) + strata_smul(sumi1, ls1) + (sumi0 + sumi1) / 2) / 4;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -215,7 +215,7 @@ __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(const void* __restrict__ v
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
     const int ls = aux32 >> 28;
-    sumi = (ls * sumi + sumi / 2) / 2;
+    sumi = (strata_smul(ls, sumi) + sumi / 2) / 2;
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -242,7 +242,7 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
-    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi = strata_smul(sumi, 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F));
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 }
@@ -313,7 +313,7 @@ __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(const void* __restrict__ vb
         sumi = ggml_cuda_dp4a(v.y, u1, sumi);
     }
     const int ls = ((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4);
-    sumi *= ls - 32;
+    sumi = strata_smul(sumi, ls - 32);
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs / 4].ds);
     return d * sumi;
 }
@@ -335,8 +335,8 @@ __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(const int* __restri
         const int v1i = (v[1] >> (4 * i)) & 0x0F0F0F0F;
         const int dot1 = ggml_cuda_dp4a(v1i, u[2 * i + 1], ggml_cuda_dp4a(v0i, u[2 * i + 0], 0));
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2 * i + 1], ggml_cuda_dp4a(0x01010101, u[2 * i + 0], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);   // the min times the sum of the QUANTIZED activations
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);   // the min times the sum of the QUANTIZED activations
     }
     const float2 dm4f = __half22float2(dm4);
     return dm4f.x * sumf_d - dm4f.y * sumf_m;
@@ -357,8 +357,8 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(const int* __restri
         const int v1i = vl1i | vh1i;
         const int dot1 = ggml_cuda_dp4a(v0i, u[2 * i + 0], ggml_cuda_dp4a(v1i, u[2 * i + 1], 0));
         const int dot2 = ggml_cuda_dp4a(0x01010101, u[2 * i + 0], ggml_cuda_dp4a(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        sumf_d += d8[i] * strata_smul(dot1, sc[i]);
+        sumf_m += d8[i] * strata_smul(dot2, m[i]);
     }
     const float2 dm5f = __half22float2(dm5);
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
@@ -472,7 +472,7 @@ __device__ __forceinline__ int q4_0_centred(const int v) {
     // Unsigned: (b & 0x08080808) * 0x1E reaches 0xF0F0F0F0, which overflows a signed int - undefined behaviour the
     // sm_60 build (no __dp4a, strata_dp4a fallback) optimised into a wrong value (native_expert_parity gpu rel 1.7e4).
     const uint32_t b = (uint32_t) v ^ 0x08080808u;   // per byte: 0..15 -> (q - 8) as a 4-bit two's complement value
-    return (int) (b | ((b & 0x08080808u) * 0x1Eu));  // sign-extend each nibble into its byte (0x08 * 0x1E = 0xF0)
+    return (int) (b | (strata_bytemask((b >> 3) & 0x01010101u) & 0xF0F0F0F0u));  // sign-extend each nibble into its byte (0x08 * 0x1E = 0xF0)
 }
 __device__ __forceinline__ float vec_dot_q4_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                    const int& kbx, const int& iqs) {
@@ -544,7 +544,7 @@ __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(const int vl, const
         const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = __vsubss4(vil | vih, 0x20202020);   // vi = (vil | vih) - 32
-        sumf += d8[i] * (STRATA_DP4A(vi, u[i], 0) * sc);
+        sumf += d8[i] * strata_smul(STRATA_DP4A(vi, u[i], 0), sc);
     }
     return d * sumf;
 }
@@ -845,7 +845,7 @@ template<> struct Split<16> {   // IQ2_XXS
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi);
-        sumi = sumi * r.ls / 8;
+        sumi = strata_smul(sumi, r.ls) / 8;
         const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
         return d * sumi;
     }
@@ -855,7 +855,7 @@ template<> struct Split<16> {   // IQ2_XXS
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
-        sumi = sumi * r.ls / 8;
+        sumi = strata_smul(sumi, r.ls) / 8;
         const float d = r.dw * d8;
         return d * sumi;
     }
@@ -869,7 +869,7 @@ struct SplitLs2 {
         for (int j = 0; j < 4; ++j) sumi0 = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi0);
 #pragma unroll
         for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi1);
-        const int sumi = (sumi0 * r.ls0 + sumi1 * r.ls1 + (sumi0 + sumi1) / 2) / 4;
+        const int sumi = (strata_smul(sumi0, r.ls0) + strata_smul(sumi1, r.ls1) + (sumi0 + sumi1) / 2) / 4;
         const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
         return d * sumi;
     }
@@ -879,7 +879,7 @@ struct SplitLs2 {
         for (int j = 0; j < 4; ++j) sumi0 = ggml_cuda_dp4a(r.g[j], u[j], sumi0);
 #pragma unroll
         for (int j = 4; j < 8; ++j) sumi1 = ggml_cuda_dp4a(r.g[j], u[j], sumi1);
-        const int sumi = (sumi0 * r.ls0 + sumi1 * r.ls1 + (sumi0 + sumi1) / 2) / 4;
+        const int sumi = (strata_smul(sumi0, r.ls0) + strata_smul(sumi1, r.ls1) + (sumi0 + sumi1) / 2) / 4;
         const float d = r.dw * d8;
         return d * sumi;
     }
@@ -975,7 +975,7 @@ template<> struct Split<18> {   // IQ3_XXS
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi);
-        sumi = (r.ls * sumi + sumi / 2) / 2;
+        sumi = (strata_smul(r.ls, sumi) + sumi / 2) / 2;
         const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
         return d * sumi;
     }
@@ -983,7 +983,7 @@ template<> struct Split<18> {   // IQ3_XXS
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
-        sumi = (r.ls * sumi + sumi / 2) / 2;
+        sumi = (strata_smul(r.ls, sumi) + sumi / 2) / 2;
         const float d = r.dw * d8;
         return d * sumi;
     }
@@ -1026,7 +1026,7 @@ template<> struct Split<21> {   // IQ3_S
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], get_int_b4(bq8_1[iqs / 2].qs, j), sumi);
-        sumi *= r.ls;
+        sumi = strata_smul(sumi, r.ls);
         const float d = r.dw * __low2float(bq8_1[iqs / 2].ds);
         return d * sumi;
     }
@@ -1034,7 +1034,7 @@ template<> struct Split<21> {   // IQ3_S
         int sumi = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = ggml_cuda_dp4a(r.g[j], u[j], sumi);
-        sumi *= r.ls;
+        sumi = strata_smul(sumi, r.ls);
         const float d = r.dw * d8;
         return d * sumi;
     }
@@ -1142,7 +1142,7 @@ template<> struct Split<23> {   // IQ4_XS
             sumi = ggml_cuda_dp4a(r.v[j].x, u0, sumi);
             sumi = ggml_cuda_dp4a(r.v[j].y, u1, sumi);
         }
-        sumi *= r.ls - 32;
+        sumi = strata_smul(sumi, r.ls - 32);
         const float d = r.dw * __low2float(bq8_1[iqs / 4].ds);
         return d * sumi;
     }
@@ -4349,7 +4349,7 @@ template<> struct GridOf<23> { using T = uint32_t; static constexpr int N = 1; _
 // dp4a(g ^ m, u) - dp4a(m, u) = sum(s g u) exactly - the same integers, the same floats.
 __device__ __forceinline__ int nib_mask(uint32_t n) {
     const uint32_t b = __umul24(n & 0xFu, 0x204081u) & 0x01010101u;
-    return (int) ((b << 8) - b);
+    return (int) strata_bytemask(b);
 }
 template<int TY, int SG> struct DotG;
 template<int SG> struct DotG<22, SG> { __device__ static __forceinline__ float f(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs,
@@ -4383,7 +4383,7 @@ template<int SG> struct DotG<22, SG> { __device__ static __forceinline__ float f
             acc = ggml_cuda_dp4a(grid_h, u1, acc);
         }
     }
-    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    const int sumi = (strata_smul(sumi0, ls0) + strata_smul(sumi1, ls1) + (sumi0 + sumi1) / 2) / 4;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 } };
@@ -4415,7 +4415,7 @@ template<int SG> struct DotG<18, SG> { __device__ static __forceinline__ float f
         }
     }
     const int ls = aux32 >> 28;
-    sumi = (ls * sumi + sumi / 2) / 2;
+    sumi = (strata_smul(ls, sumi) + sumi / 2) / 2;
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 } };
@@ -4448,7 +4448,7 @@ template<int SG> struct DotG<21, SG> { __device__ static __forceinline__ float f
             sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
         }
     }
-    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    sumi = strata_smul(sumi, 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F));
     const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 } };
@@ -4481,7 +4481,7 @@ template<int SG> struct DotG<16, SG> { __device__ static __forceinline__ float f
         }
     }
     const int ls = aux32 >> 27 | 1;
-    sumi = sumi * ls / 8;
+    sumi = strata_smul(sumi, ls) / 8;
     const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
     return d * sumi;
 } };
