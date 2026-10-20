@@ -9,6 +9,8 @@
 //     (h, gate, beta, y, q8_1, the state left as it was).
 //  4. copy_from_mapped (the indexer tail's snapshot) + native_qsa_indexer_append_steps against the append with `snap`
 //     (the snapshot, tail, dead, pooled keys and block position), windows of 1-8 steps from several positions.
+//  5. STRATA_HC_WIDE8: the hyper-connection read with STRATA_HC_WIDE=3 (7-8 tokens: the row kernel's down in one
+//     launch) against the default read, 1-8 tokens, with and without the pending write (every output).
 #include <hip/hip_runtime.h>
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -297,6 +299,68 @@ int main() {
         hipFree(d_gamma);
         std::printf("indexer tail snapshot inside the append: %d cases, %s\n", cases, sbad ? "DIFFERENT" : "bitwise equal");
         bad += sbad;
+    }
+    // ---- 5. STRATA_HC_WIDE8: 7-8 token reads with the row kernel's down in one launch, against the default read
+    // (STRATA_HC_WIDE off: the staged down in chunks)
+    {
+        const int N = 2560, HC = 4, LR = 320, D = N * HC;
+        auto w_norm = normal(D, 0.3f, 1.0f);
+        auto w_down = normal_bf16((size_t) LR * D, 0.02f), w_up = normal_bf16((size_t) D * LR, 0.05f),
+             w_inj = normal_bf16((size_t) HC * D, 0.02f);
+        float* d_norm = dev(w_norm);
+        uint16_t *d_down = dev(w_down), *d_up = dev(w_up), *d_inj = dev(w_inj);
+        int cases = 0, wbad = 0;
+        for (int rep = 0; rep < 3; ++rep)
+            for (int T = 1; T <= kFusedGrMaxT; ++T)
+                for (int apply = 0; apply < 2; ++apply) {
+                    auto R = normal((size_t) T * D, 1.0f), bo = normal((size_t) T * N, 0.5f), inj = normal((size_t) T * HC, 1.0f);
+                    float* d_bo = dev(bo);
+                    float* d_inj_prev = dev(inj);
+                    struct Arm { float *R, *lo, *rs, *io, *mixed, *xn; uint8_t* q8; unsigned* cnt; } arm[2];
+                    for (auto& a : arm) {
+                        a.R = dev(R);
+                        a.lo = (float*) dev_fill((size_t) T * LR * 4, 0);
+                        a.rs = (float*) dev_fill((size_t) T * HC * 4, 0);
+                        a.io = (float*) dev_fill((size_t) T * HC * 4, 0);
+                        a.mixed = (float*) dev_fill((size_t) T * N * 4, 0);
+                        a.xn = (float*) dev_fill((size_t) T * D * 4, 0);
+                        a.q8 = (uint8_t*) dev_fill((size_t) T * (N / 32) * 36, 0x33);
+                        a.cnt = (unsigned*) dev_fill((size_t) (N / 32) * 4, 0);
+                    }
+                    for (int k = 0; k < 2; ++k) {
+                        Arm& a = arm[k];
+                        FusedGrArgs fa[kFusedGrMaxT];
+                        for (int t = 0; t < T; ++t) {
+                            FusedGrArgs& x = fa[t];
+                            x.R = a.R + (size_t) t * D; x.R_out = a.R + (size_t) t * D; x.apply = apply != 0;
+                            x.bo_prev = d_bo + (size_t) t * N; x.inj_prev = d_inj_prev + t * HC;
+                            x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = d_inj;
+                            x.eps = 1e-6f; x.lo = a.lo + t * LR; x.rs = a.rs + t * HC; x.inject_out = a.io + t * HC;
+                            x.mixed = a.mixed + (size_t) t * N;
+                            x.q8_cnt = a.cnt; x.q8_mixed = a.q8 + (size_t) t * (N / 32) * 36;
+                        }
+                        fused_gr_set_wide(k == 0 ? 0 : 3);
+                        fused_gr_set_wide8(k);
+                        fused_gr_read_multi(fa, T, a.xn, st);
+                        CHECK(hipStreamSynchronize(st));
+                    }
+                    ++cases;
+                    const char* what = back(arm[0].lo, (size_t) T * LR * 4) != back(arm[1].lo, (size_t) T * LR * 4) ? "lo"
+                                     : back(arm[0].io, (size_t) T * HC * 4) != back(arm[1].io, (size_t) T * HC * 4) ? "inject"
+                                     : back(arm[0].R, (size_t) T * D * 4) != back(arm[1].R, (size_t) T * D * 4) ? "R"
+                                     : back(arm[0].rs, (size_t) T * HC * 4) != back(arm[1].rs, (size_t) T * HC * 4) ? "rs"
+                                     : back(arm[0].mixed, (size_t) T * N * 4) != back(arm[1].mixed, (size_t) T * N * 4) ? "mixed"
+                                     : back(arm[0].q8, (size_t) T * (N / 32) * 36) != back(arm[1].q8, (size_t) T * (N / 32) * 36) ? "q8_1" : nullptr;
+                    if (what && wbad++ < 8) std::printf("  wide read, %d tokens%s: %s DIFFERENT\n", T, apply ? " (pending write)" : "", what);
+                    for (auto& a : arm) { hipFree(a.R); hipFree(a.lo); hipFree(a.rs); hipFree(a.io); hipFree(a.mixed); hipFree(a.xn); hipFree(a.q8); hipFree(a.cnt); }
+                    hipFree(d_bo); hipFree(d_inj_prev);
+                }
+        fused_gr_set_wide(-1);
+        fused_gr_set_wide8(-1);
+        hipFree(d_norm); hipFree(d_down); hipFree(d_up); hipFree(d_inj);
+        std::printf("hyper-connection read, STRATA_HC_WIDE=3 + STRATA_HC_WIDE8 against the default read: %d cases, %s\n", cases,
+                    wbad ? "DIFFERENT" : "bitwise equal");
+        bad += wbad;
     }
     std::printf(bad ? "FAILED\n" : "all bitwise equal\n");
     return bad ? 1 : 0;

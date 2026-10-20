@@ -1297,6 +1297,11 @@ bool qfuse_hc_local() {
 // every call, us per stage with its stamp kernel (default -> wide): down 30.0 / 40.8 / 51.8 -> 20.8 / 25.2 / 28.7
 // at 1 / 4 / 6 tokens, up 24.2 / 41.7 / 52.6 -> 21.0 / 30.8 / 35.2 at 2 / 4 / 5 tokens.
 int g_hc_wide = -1;   // fused_gr_set_wide (the bench); -1 = STRATA_HC_WIDE
+int g_hc_wide8 = -1;  // fused_gr_set_wide8 (tests); -1 = STRATA_HC_WIDE8
+bool hc_wide8() {
+    static const bool env = [] { const char* v = std::getenv("STRATA_HC_WIDE8"); return v != nullptr && std::atoi(v) != 0; }();
+    return g_hc_wide8 >= 0 ? g_hc_wide8 != 0 : env;
+}
 int hc_wide() {
     static const int env = [] { const char* v = std::getenv("STRATA_HC_WIDE"); return v != nullptr ? std::atoi(v) & 3 : 0; }();
     return g_hc_wide >= 0 ? g_hc_wide : env;
@@ -1516,7 +1521,15 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         return no != nullptr && no[0] != '\0' && no[0] != '0';
     }();
     const bool exact_t = !no_multi_gr;
-    for (int c0 = 0; c0 < n_tok; c0 += chunk_tok) {
+    // STRATA_HC_WIDE8=1 (opt-in, with STRATA_HC_WIDE's down bit): windows wider than the staged kernel's chunk (7-8
+    // tokens on a 64 KB LDS card) take the one-block-per-row kernel's token loop in ONE launch instead of the staged
+    // kernel in two; each token's sums are the row kernel's (fused_gr_bench / hip_node_fuse_parity: bitwise)
+    const bool wide8 = !q8w && n_tok > chunk_tok && n_tok <= kFusedGrMaxT && (hc_wide() & 1) != 0 && hc_wide8();
+    if (wide8) {
+        const unsigned rows = (unsigned) (LR + (m.a[0].w_inject != nullptr ? HC : 0));
+        gr_down_rows_kernel<kFusedGrMaxT, false, true><<<rows, THREADS, 0, st>>>(m);
+    }
+    for (int c0 = wide8 ? n_tok : 0; c0 < n_tok; c0 += chunk_tok) {
         const int ct = n_tok - c0 < chunk_tok ? n_tok - c0 : chunk_tok;
         GrMulti c{};
         if (ct == n_tok) {
@@ -2472,6 +2485,7 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 void fused_gr_set_wide(int mask) { g_hc_wide = mask < 0 ? -1 : (mask & 3); }
+void fused_gr_set_wide8(int on) { g_hc_wide8 = on < 0 ? -1 : (on != 0); }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
