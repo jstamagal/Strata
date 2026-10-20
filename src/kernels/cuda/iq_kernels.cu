@@ -3432,6 +3432,77 @@ __global__ void __launch_bounds__(256) s26_down_l_kernel(const unsigned long lon
 }
 
 
+#if defined(__HIPCC__)
+// Q2_0 has eight contiguous two-bit values per 16-bit word.  A 256-entry table
+// expands four values into signed bytes, replacing the generic byte-permute chain.
+struct DecodeDownQ2 {
+    __device__ static Split<42>::W load(const uint8_t* row, int kbx, int iqs, const uint32_t* grid) {
+        const block_q2_0* b = (const block_q2_0*) row + kbx;
+        Split<42>::W w;
+        w.d2 = b->d;
+        const uint16_t* qs = (const uint16_t*) b->qs + iqs * 4;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q = qs[j];
+            w.qx[j] = grid[q & 255];
+            w.qy[j] = grid[q >> 8];
+        }
+        return w;
+    }
+};
+// Four Q2_0 values per table lookup. Each lane still owns k = lane, lane + 32, ...
+// and uses the same Split<42>::apply and transposed xor butterfly as DOWN_L.
+template<int RPW>
+__global__ void __launch_bounds__(256) decode_down_q2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_dst,
+                                                            const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                            float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ uint32_t qgrid[256];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    uint32_t word = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) word |= (uint32_t) (uint8_t) (((tid >> (2 * j)) & 3) - 1) << (8 * j);
+    qgrid[tid] = word;
+    __syncthreads();
+    const int r0 = blockIdx.x * 8 * RPW + warp;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr[RPW];
+#pragma unroll
+    for (int q = 0; q < RPW; ++q) wr[q] = blob + L.down_off + (size_t) (r0 + 8 * q) * L.d_row;
+    const int hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        float sums[RPW][GRP_NC] = {};
+        for (int k = lane; k < hb; k += 32) {
+            Split<42>::W w[RPW];
+#pragma unroll
+            for (int q = 0; q < RPW; ++q) w[q] = DecodeDownQ2::load(wr[q], k / 2, k % 2, qgrid);
+#pragma unroll
+            for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c)
+                    if (c < n) sums[q][c] += Split<42>::apply(w[q], hq + (size_t) (e + c) * hb + 2 * (k / 2), k % 2);
+        }
+        constexpr int P = RPW * GRP_NC;
+        static_assert(P == 16 || P == 32);
+        float v[P];
+#pragma unroll
+        for (int j = 0; j < P; ++j) v[j] = sums[j / GRP_NC][j % GRP_NC];
+        const float sum = s26ts::tsum<P>(v, lane);
+        const int j = s26ts::tsum_token<P>(lane);
+        const int q = j / GRP_NC, c = j % GRP_NC;
+        if (lane == s26ts::tsum_lane<P>(j) && c < n)
+            out[(size_t) ent_dst[e + c] * L.n_embd + r0 + 8 * q] = sum;
+    }
+}
+
+#endif
+
 // S26: swiglu_entries_kernel + quantize_q8_1_kernel in one launch (the same h expression, then the same block quantizer,
 // contraction off so the product cannot fuse into the first sum); h is still written (it is the scratch the old pair used)
 __global__ void s26_swiglu_q8_1_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
@@ -5057,7 +5128,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
 #if defined(__HIPCC__)
         static const bool iq2s = [] { const char* v = std::getenv("STRATA_EXP_IQ2S"); return v && v[0] == '1'; }();
-        if (iq2s && (L.gu_type == 22 || L.gu_type == 18 || L.gu_type == 21)) {
+        // Small entry sets favor the original IQ3 kernel on gfx1030.  Capacity is an entry
+        // count, not a token count; the measured ten-expert pack uses 10 entries/token.
+        const bool small_iq3 = L.gu_type == 18 ? cap_entries <= 10 : L.gu_type == 21 && cap_entries <= 20;
+        if (iq2s && !small_iq3 && (L.gu_type == 22 || L.gu_type == 18 || L.gu_type == 21)) {
             switch (L.gu_type) {
                 case 18: native_gu_iq2s_kernel<18><<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
                 case 21: native_gu_iq2s_kernel<21><<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
@@ -5159,6 +5233,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/swiglu");
     }
     if (g_exp_phase == 1) return;
+#if defined(__HIPCC__)
+    static const bool exp_down = [] { const char* v = std::getenv("STRATA_EXP_DOWN"); return v && v[0] == '1'; }();
+    if (exp_down && L.d_type == 42 && L.n_embd == 2560 && L.n_ff == 640 &&
+        !(grid_groups > 0 && grid_groups < cap_groups)) {
+        const dim3 gdq((unsigned) (L.n_embd / 64), (unsigned) cap_groups);
+        decode_down_q2_kernel<8><<<gdq, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        check("native_expert_grouped/down q2");
+        return;
+    }
+#endif
     // STRATA_EXPERT_DOWN_L=1 (opt-in, kernel agent G): the IQ4_NL down rows on STRATA_EXPERT_V2's down kernel (4 rows
     // interleaved per warp, the chunk's h rows in LDS, 5 items a lane; with STRATA_TSUM its transposed butterfly) behind
     // ANY gate/up format - V2 itself only takes the IQ3_S gate/up layers, 9 of the IQ3_S pack's 39 IQ4_NL-down layers -

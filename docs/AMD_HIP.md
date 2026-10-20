@@ -690,10 +690,22 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   permutation forms the signed weights. IQ3 uses a small sign-mask table. Activations are read from global
   memory. Unset or `0` keeps the original kernel. Set it before starting the engine. On one PRO V620 (gfx1030),
   Linux, the 24-layer lab at 4 tokens x 10 experts gave gate/up per layer (IQ4_NL-down pair): IQ2_S
-  84.4 -> 73.0 us, IQ3_XXS 87.6 -> 77.1, IQ3_S 89.7 -> 84.0. IQ3_S at 1 token was slower: 40.1 -> 42.3 us.
+  84.4 -> 73.0 us, IQ3_XXS 87.6 -> 77.1, IQ3_S 89.7 -> 84.0. Small IQ3 calls now keep the original
+  kernel: IQ3_XXS with up to 10 entries and IQ3_S with up to 20 entries. This pack uses ten entries per token.
+  That restores IQ3_S at 1 token from 42.3 to 40.1 us, and at 2 tokens from 60.5 to 60.4 us.
   All 240 cases at 1–8 tokens match both the original q8_1 intermediate and final output bit for bit.
   [Before/after timings, two-GPU probe rows and limits](../bench/results/2026-10-20-gfx1030-iq2s-decode/README.md).
   Other HIP cards, Windows, CUDA and SYCL were not tested.
+
+- **Decode Q2_0 expert down (`STRATA_EXP_DOWN=1`, opt-in, HIP):** for the 2560-by-640 expert shape.
+  A small shared lookup table expands packed weights into signed bytes. The kernel reads activations directly
+  from global memory and processes eight rows per warp. Unset or `0` keeps the existing down path.
+  On one PRO V620 (gfx1030), Linux, the 24-layer lab behind IQ2_S gate/up gave down per layer:
+  T=1 20.1 -> 12.8 us, T=4 44.8 -> 40.7 us, T=8 74.8 -> 66.3 us. All Q2_0 rows at T=1–8 improved.
+  The measured base uses `STRATA_EXP_MODE=8`, `STRATA_EXP_IQ2S=1`, `STRATA_EXPERT_DOWN_L=1`, and `STRATA_TSUM=1`.
+  All 240 hash cases match the original q8 intermediate and final output bit for bit.
+  [Part 2 timings, probe rows and limits](../bench/results/2026-10-20-gfx1030-iq2s-decode-part2/README.md).
+  Other cards, shapes and model packs were not tested.
 
 - **IQ prompt expert tiles (`STRATA_PF_IQ2S=1`, `STRATA_PF_IQ3=1`, opt-in, gfx103x):** 256 weight rows by
   16 token rows, scalar activation loads and packed signs. The switches cover IQ2_S and IQ3_XXS / IQ3_S,
