@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int cold_sets = argc > 4 ? std::atoi(argv[4]) : 0;
     const int wide = argc > 5 ? std::atoi(argv[5]) & 3 : 0;
-    const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
+    const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = 12;
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);
     auto fill = [&](std::vector<float>& v, float sc) { for (auto& x : v) x = sc * nd(rng); };

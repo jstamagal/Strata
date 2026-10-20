@@ -1136,6 +1136,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(mmvf_rows_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME mmvf_rows_parity COMMAND mmvf_rows_parity)
   set_tests_properties(mmvf_rows_parity PROPERTIES ENVIRONMENT "STRATA_MMVF_ROWS=1" TIMEOUT 120)
+  add_test(NAME mmvf_plain_parity COMMAND mmvf_rows_parity)
+  set_tests_properties(mmvf_plain_parity PROPERTIES ENVIRONMENT "STRATA_MMVF_ROWS=0" TIMEOUT 120)
   if(STRATA_HIP_GFX906)
     add_test(NAME native_grouped_fused_parity COMMAND native_grouped_parity)
     set_tests_properties(native_grouped_fused_parity PROPERTIES

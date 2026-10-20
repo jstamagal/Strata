@@ -35,6 +35,13 @@ public:
     /// only part of the suffix being matched and may be read back as part of a periodic continuation.
     int propose_after(const int32_t* extra, int n_extra, int max_k, int32_t* out);
 
+    /// Re-anchor a recently verified copy near its expected source position. Require two matching
+    /// suffix tokens, search at most +/- 4 tokens (small insertions/deletions), and read only
+    /// source positions before source_limit. Extra tokens are speculative and never indexed.
+    int propose_near(const int32_t* extra, int n_extra, int64_t expected_end,
+                     size_t source_limit, int max_k, int32_t* out);
+    int64_t last_end() const { return last_end_; }
+
     /// Length of the match behind the last proposal (0 if none).
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }
@@ -54,6 +61,7 @@ private:
     std::vector<Slot> table_;
     size_t mask_ = 0;
     int last_match_ = 0;
+    int64_t last_end_ = -1;
 };
 
 }  // namespace strata::spec

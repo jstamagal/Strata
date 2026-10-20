@@ -486,6 +486,25 @@ without it (102.1-105.0 greedy, 102.5-106.1 sampled; 105.2-106.3 and 105.5-107.4
 between those two runs of one setting, so only the edit's text could be compared there (the same in all four). Not
 measured: other cards, three or more stages, NVIDIA.
 
+**Experimental recovery and longer copies.** `STRATA_PL_LOOKUP_RESYNC=1` remembers the source position when a
+copy run breaks. After at least 24 accepted lookup tokens, a mismatch opens a recovery interval of 32 tokens.
+Two matching suffix tokens near the old source position can restart lookup, including tokens proposed by the
+fresh draft layer. Every proposed token still goes through verification.
+
+`STRATA_PL_LOOKUP_MAX_T=9` through `12` allows longer lookup windows in the pipelined suffix path with native
+experts. Fresh windows stay at eight tokens or fewer. Longer windows require 24 accepted lookup tokens and a
+source match of at least 32 tokens. The draft layer keeps its usual window size. Both switches are off by default;
+`STRATA_PL_LOOKUP_STREAK` must also be enabled to continue lookup guesses. Either switch also limits the last
+lookup window to the requested output length and avoids starting guesses past that length. These switches are
+experimental.
+
+On 2x Radeon PRO V620 (gfx1030), the supplied IQ3_S config with a 24/24 layer split, `--spec 8 --mtp-max-t 3`
+and `STRATA_PL_LOOKUP_STREAK=12`, two alternating warm probe runs measured 346.20 tok/s on the copied edit
+without resync and 353.65 with it (+2.15%). Greedy/sampled chat was 126.77/115.77 and 126.80/115.77 tok/s;
+all text hashes matched. Twelve-row lookup reached 351.10 tok/s in two runs, but its mean chat rate was about
+0.2% lower than its paired baseline. Eight-row resync was faster on the copy. See the [measurement report](../cx/report.md)
+for raw results, the prompt-speed discrepancy and controlled checks, failed approaches, and untested backends.
+
 `STRATA_PL_FRESH_T` / `STRATA_PL_FRESH_MIN_P` and `STRATA_PL_GUESS_T` / `STRATA_PL_GUESS_MIN_P` (opt-in) give the
 window built after a verdict and the guessed window their own size cap and draft threshold (unset: `--spec` and
 `--spec-min-p` for both). On the same box and probe none beat `--spec 3 --spec-min-p 0.7` for both: guesses capped at

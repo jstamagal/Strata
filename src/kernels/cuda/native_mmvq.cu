@@ -2720,12 +2720,12 @@ void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_stream(stream);
@@ -2760,7 +2760,7 @@ bool native_gate_quantize_q8_1(const float* attn, const float* q_full, float* ou
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_shape(n_in, ncols > 8 && ncols <= 12 ? 8 : ncols);
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);
@@ -3214,6 +3214,15 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
+    // Extended lookup windows reuse the exact <=8-column kernels. Quantized columns
+    // are contiguous; splitting here does not change a row's reduction order.
+    if (ncols > 8 && ncols <= 12) {
+        const auto* x = static_cast<const Q81Block*>(x_q8_1);
+        native_mmvq(ggml_type, weights, x, y, n_in, n_out, 8, stream);
+        native_mmvq(ggml_type, weights, x + (size_t) 8 * (n_in / Q8K), y + (size_t) 8 * n_out,
+                    n_in, n_out, ncols - 8, stream);
+        return;
+    }
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

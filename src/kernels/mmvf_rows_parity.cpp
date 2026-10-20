@@ -1,5 +1,5 @@
 // Exact multi-row BF16/F32 GEMV checks against independent single-row calls.
-// Run with STRATA_MMVF_ROWS=1; synthetic data, no model or private prompts.
+// Run with STRATA_MMVF_ROWS=0 or 1; synthetic data, no model or private prompts.
 #include "strata/kernels/bf16_gemv.hpp"
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -18,12 +18,13 @@ template<class T> static T* alloc(size_t n) {
 }
 int main() {
     const char* flag = std::getenv("STRATA_MMVF_ROWS");
-    if (!flag || flag[0] != '1') { std::fprintf(stderr, "set STRATA_MMVF_ROWS=1\n"); return 2; }
+    if (!flag || (flag[0] != '0' && flag[0] != '1')) { std::fprintf(stderr, "set STRATA_MMVF_ROWS=0 or 1\n"); return 2; }
+    const bool rows = flag[0] == '1';
     cudaStream_t s; ck(cudaStreamCreate(&s));
     const int shapes[][2] = {{64,64},{192,67},{512,65},{640,128},{2560,48},
                              {2560,128},{2560,512},{2560,2560},{10240,320}};
     size_t cases = 0, values = 0, mismatches = 0;
-    for (const auto& shape : shapes) for (int nt = 1; nt <= 8; ++nt)
+    for (const auto& shape : shapes) for (int nt = 1; nt <= 12; ++nt)
     for (int pad : {0,2}) for (int range : {0,1,2}) {
         const int ni = shape[0], no = shape[1], ldx = ni + pad, ldy = no + pad + 1;
         std::mt19937 rng(1234 + nt * 17 + pad * 31 + range * 53 + ni + no);
@@ -65,7 +66,7 @@ int main() {
         const bool fused = k::bf16_gemv_fp32_mmvf_multi_aux(dx,ldx,dw,got,ldy,ni,no,nt,
                                                           dw+(size_t)no*ni,aux,3,s);
         if (fused) { ck(cudaStreamSynchronize(s)); compare(ref,got,count); compare(aref,aux,(size_t)nt*3); }
-        if (fused != (nt >= 2 && no >= 64)) { std::printf("FAIL eligibility\n"); ++mismatches; }
+        if (fused != (rows && nt >= 2 && nt <= 8 && no >= 64)) { std::printf("FAIL eligibility\n"); ++mismatches; }
         ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph));
         ck(cudaFree(dx)); ck(cudaFree(dw)); ck(cudaFree(ref)); ck(cudaFree(got)); ck(cudaFree(aux)); ck(cudaFree(aref));
         ++cases;

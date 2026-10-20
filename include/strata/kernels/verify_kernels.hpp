@@ -19,6 +19,8 @@
 namespace strata::kernels {
 
 inline constexpr int kVerifyMaxT = 8;
+// Opt-in pipelined lookup capacity; ordinary windows retain the eight-row limit.
+inline constexpr int kLookupMaxT = 12;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
 /// `history` is NOT written, but with `commit` (one token): it then keeps the token, as gdn_conv_commit.  Bitwise

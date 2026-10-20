@@ -128,6 +128,45 @@ void unit_tests() {
         check(d.propose(3, out) == 0, "propose after propose_after");
         check(d.propose_after(nullptr, 0, 3, out) == d.propose(3, out), "propose_after with no drafts == propose");
     }
+    {
+        SuffixDrafter d(3, 32, 256);
+        const int32_t source[] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+        d.append(source, 10);
+        const int32_t copy[] = {10, 11, 99, 13, 14};
+        d.append(copy, 5);
+        int32_t out[16] = {};
+        check(d.propose_near(nullptr, 0, 4, 10, 16, out) == 5 && out[0] == 15 && out[4] == 19,
+              "resync after renamed token uses two following tokens and respects source limit");
+        check(d.last_end() == 4 && d.last_match() == 2, "resync reports source and actual match length");
+        check(d.propose_near(nullptr, 0, 6, 10, 2, out) == 2 && out[0] == 15,
+              "resync tolerates a small insertion/deletion");
+        const int32_t extra[] = {15, 16};
+        check(d.propose_near(extra, 2, 6, 10, 16, out) == 3 && out[0] == 17,
+              "resync after speculative tokens");
+        check(d.size() == 15, "resync does not append speculative tokens");
+        const int32_t miss[] = {88, 89};
+        check(d.propose_near(miss, 2, 6, 10, 16, out) == 0 && d.last_end() == -1,
+              "resync rejects an unrelated suffix");
+        check(d.propose_near(nullptr, 0, 100, 10, 16, out) == 0, "resync search is bounded");
+        check(d.propose_near(nullptr, 0, -100, 10, 16, out) == 0, "resync handles negative expected positions");
+        check(d.propose_near(nullptr, 0, 4, 10, 0, out) == 0, "resync respects zero output capacity");
+        d.reset();
+        check(d.last_end() == -1 && d.propose_near(nullptr, 0, 0, 0, 16, out) == 0,
+              "reset clears source position");
+    }
+    {
+        SuffixDrafter d(3, 32, 256);
+        const int32_t source[] = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+        const int32_t renamed[] = {10, 11, 99};
+        const int32_t drafts[] = {13, 14};
+        d.append(source, 10);
+        d.append(renamed, 3);
+        int32_t out[8] = {};
+        check(d.propose_near(drafts, 2, 4, 10, 8, out) == 5 && out[0] == 15 && out[4] == 19,
+              "fresh MTP prefix re-anchors immediately after the renamed token");
+        check(d.last_end() == 4 && d.last_match() == 2 && d.size() == 13,
+              "MTP-prefix resync preserves source alignment and history");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

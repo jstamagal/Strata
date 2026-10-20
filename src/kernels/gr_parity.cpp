@@ -276,9 +276,10 @@ int scalar_activation_contract() {
 }
 
 int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
-                           const uint16_t* d_inject, float eps) {
+                           const uint16_t* d_inject, float eps, int T) {
     using namespace strata::kernels;
-    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
+    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC;
+    std::printf("  fused GR multi parity: %d rows\n", T);
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
     std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
@@ -811,7 +812,7 @@ int main(int argc, char** argv) {
                         activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
-        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
+        for (int width : {8, 9, 12}) bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps, width);
         select_activation_mode(0);
         cudaFree(rws_raw);
         cudaFree(dR); cudaFree(dN); cudaFree(dD); cudaFree(dU); cudaFree(dJ); cudaFree(dM); cudaFree(dI);

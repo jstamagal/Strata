@@ -28,6 +28,7 @@ void SuffixDrafter::reset() {
     hist_.clear();
     std::fill(table_.begin(), table_.end(), Slot{});
     last_match_ = 0;
+    last_end_ = -1;
 }
 
 uint64_t SuffixDrafter::key_at(size_t end) const {
@@ -63,6 +64,7 @@ void SuffixDrafter::append(const int32_t* tokens, size_t n) {
 
 int SuffixDrafter::propose(int max_k, int32_t* out) {
     last_match_ = 0;
+    last_end_ = -1;
     const size_t n = hist_.size();
     if (n < 4 || max_k <= 0) return 0;
     const size_t cur = n - 1;
@@ -79,6 +81,7 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     }
     if (best_len < min_match_) return 0;
     last_match_ = best_len;
+    last_end_ = (int64_t) best_end;
     int k = 0;
     // The continuation may run into the current suffix (periodic text); reading history up to `cur` is valid.
     for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = hist_[q];
@@ -92,6 +95,30 @@ int SuffixDrafter::propose_after(const int32_t* extra, int n_extra, int max_k, i
     hist_.insert(hist_.end(), extra, extra + n_extra);
     const int k = propose(max_k, out);
     hist_.resize(n0);
+    return k;
+}
+
+int SuffixDrafter::propose_near(const int32_t* extra, int n_extra, int64_t expected_end,
+                              size_t source_limit, int max_k, int32_t* out) {
+    last_match_ = 0;
+    last_end_ = -1;
+    const size_t n = hist_.size() + (size_t) std::max(0, n_extra);
+    const size_t limit = std::min(source_limit, hist_.size());
+    if (n < 2 || limit < 2 || max_k <= 0) return 0;
+    auto token = [&](size_t i) { return i < hist_.size() ? hist_[i] : extra[i - hist_.size()]; };
+    // Nearest first; equal-length matches retain the closest source position.
+    for (int step = 0; step <= 8; ++step) {
+        const int delta = step == 0 ? 0 : (step % 2 ? (step + 1) / 2 : -step / 2);
+        const int64_t end = expected_end + delta;
+        if (end < 1 || end >= (int64_t) limit - 1) continue;
+        int len = 0;
+        while (len < max_match_ && len <= end && (size_t) len < n &&
+               hist_[(size_t) end - len] == token(n - 1 - len)) ++len;
+        if (len >= 2 && len > last_match_) { last_match_ = len; last_end_ = end; }
+    }
+    if (last_end_ < 0) return 0;
+    int k = 0;
+    for (size_t q = (size_t) last_end_ + 1; q < limit && k < max_k; ++q) out[k++] = hist_[q];
     return k;
 }
 

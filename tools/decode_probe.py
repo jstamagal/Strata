@@ -40,7 +40,9 @@ try:
     if not sb.wait_ready(base, "", proc, 900, log=lambda *x: None):
         err = "server did not come up"
     else:
-        sb.chat(base, "", [{"role": "user", "content": "Say hi."}], 16)
+        ready = sb.chat(base, "", [{"role": "user", "content": "Say hi."}], 16)
+        if sb.digest(ready)["err"]:
+            raise RuntimeError("probe warmup failed: " + str(sb.digest(ready)["err"]))
         if WARM:
             sb.chat(base, "", [{"role": "user", "content": "Explain how a hash table works, with one example."}], tokens)
         for label, temp, samp in (("T0", 0.0, {}), ("T1", 1.0, {"top_p": 0.95, "top_k": 20, "seed": 7})):
@@ -57,7 +59,8 @@ try:
         r = sb.chat(base, "", [{"role": "user", "content": "Print this file again exactly as it is, but rename every `PROMPTS` to `QUESTIONS`. Output only the file.\n\n```python\n" + src + "\n```"}], tokens)
         d = sb.digest(r)
         rows.append({"arm": "C", "q": "copy", "tps": d["decode_tps"], "gen": d["generated_tokens"], "offered": d["drafts_offered"],
-                     "accepted": d["drafts_accepted"], "err": d["err"]})
+                     "accepted": d["drafts_accepted"], "err": d["err"],
+                     "sha": hashlib.sha256((r.get("text") or "").encode()).hexdigest()[:12], "text": r.get("text") or ""})
         r = sb.chat(base, "", [{"role": "user", "content": long_prompt(3000)}], 24)
         d = sb.digest(r)
         rows.append({"arm": "P", "q": "4K", "tps": d["prompt_tps"], "gen": d["prompt_tokens"], "err": d["err"]})
@@ -88,7 +91,7 @@ cp = next((x for x in rows if x["arm"] == "C" and x.get("tps")), None)
 cps = f" | copy {cp['tps']:6.1f} gen {cp['gen']} kept {100 * (cp['accepted'] or 0) // max(1, cp['offered'] or 0)}%" if cp else " | copy FAILED"
 trouble = sorted({l[:120] for l in eng.splitlines() if re.search(r"error|fail|non-finite|falls back|not supported|is off \(|does not fit", l, re.I) and "no error" not in l})
 row = (f"{name:44s} | {arm('T0')} | {arm('T1')} | prompt {p['gen']} tok {p['tps']:7.1f}" if p else f"{name:44s} | {arm('T0')} | {arm('T1')} | prompt FAILED") \
-      + cps + f" | serial {'Y' if 'decodes serially' in eng else 'n'}" + (f" | TROUBLE {trouble[:2]}" if trouble else "")
+      + cps + (f" sha {cp['sha']}" if cp else "") + f" | serial {'Y' if 'decodes serially' in eng else 'n'}" + (f" | TROUBLE {trouble[:2]}" if trouble else "")
 print(row)
 with open(L / "probe-rows.txt", "a") as fh:
     fh.write(row + "\n")

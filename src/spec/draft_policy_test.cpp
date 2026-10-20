@@ -114,6 +114,16 @@ int main() {
               "chain: stale full size is re-probed despite a profitable shorter chain");
         check(probes > 0 && confident, "chain: stale re-probes retain the MTP confidence gate");
     }
+    {
+        DraftPolicy p(12);
+        for (int i = 0; i < 20; ++i) {
+            p.observe(false, 3, 1, 0, 15.0);
+            p.observe(true, 12, 11, 32, 25.0);
+        }
+        const auto k = p.choose(3, 23, 32);
+        check(k.lookup && k.t == 12, "extended lookup respects twelve-row cap");
+        check(p.cost_ms(12) == 25.0, "extended size records its own measured cost");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

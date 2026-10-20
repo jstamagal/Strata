@@ -3064,6 +3064,15 @@ int main(int argc, char** argv) {
         const int chain_base = o.spec;
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));  // kVerifyMaxT
     }
+    // Extended lookup windows are opt-in and require the pipelined suffix path. MTP's
+    // ordinary draft cap stays unchanged; its catch-up graphs must accept the wider rows.
+    if (const char* v = std::getenv("STRATA_PL_LOOKUP_MAX_T")) {
+        const int requested = std::atoi(v);
+        if (requested > 8 && o.pipeline_windows >= 2 && o.suffix_draft > 0 && o.spec >= 2) {
+            if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
+            o.spec = std::min(requested, strata::kernels::kLookupMaxT);
+        }
+    }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         try {
@@ -5307,7 +5316,7 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st && !mtp_first ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = o.pipeline_windows >= 2 ? std::max(o.spec, strata::kernels::kVerifyMaxT) : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
@@ -8674,7 +8683,7 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        const size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) std::max(o.spec, strata::kernels::kVerifyMaxT);
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -8763,7 +8772,7 @@ int main(int argc, char** argv) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
             const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
-                                                               : strata::kernels::kVerifyMaxT;
+                                                               : std::max(o.spec, strata::kernels::kVerifyMaxT);
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
             for (float*& h : hand) {
@@ -8855,7 +8864,7 @@ int main(int argc, char** argv) {
         // watchdog's verifier), and the drafter's own row buffer, which either parity's rows are copied into
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) std::max(o.spec, strata::kernels::kVerifyMaxT) *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand_b((size_t) n_stages - 1, nullptr);   // the odd windows' hand-off per boundary
             for (float*& h : hand_b) {
@@ -8868,11 +8877,13 @@ int main(int argc, char** argv) {
                 std::memset(hh, 0, hb);
             }
             ver_b.set_stage(0, split_at[0], nullptr, hand_b[0]);
+            if (o.spec > strata::kernels::kVerifyMaxT) ver_b.set_handoff_rows(o.spec);
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 const bool last = st + 1 == n_stages;
                 gs.ver_b.set_stage(split_at[(size_t) st - 1], last ? -1 : split_at[(size_t) st], hand_b[(size_t) st - 1],
                                    last ? nullptr : hand_b[(size_t) st]);
+                if (o.spec > strata::kernels::kVerifyMaxT) gs.ver_b.set_handoff_rows(o.spec);
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
                 vs.d_res = gs.d_res;
@@ -8887,7 +8898,7 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && !mtp_first && cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                if (last && !mtp_first && cudaMalloc((void**) &pl_mtp_R, (size_t) std::max(o.spec, strata::kernels::kVerifyMaxT) * (size_t) (g.hc * g.n_embd) *
                                                                sizeof(float)) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
@@ -8895,7 +8906,7 @@ int main(int argc, char** argv) {
             }
             if (mtp_first) {   // the drafter's row buffer on its own card (the first)
                 const strata::core::OnDevice on_m(mtp.device());
-                if (cudaMalloc((void**) &pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT * (size_t) (g.hc * g.n_embd) *
+                if (cudaMalloc((void**) &pl_mtp_R, (size_t) std::max(o.spec, strata::kernels::kVerifyMaxT) * (size_t) (g.hc * g.n_embd) *
                                                        sizeof(float)) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
@@ -14007,8 +14018,8 @@ int main(int argc, char** argv) {
                 struct PW {
                     int T = 0, seq = 0;
                     int64_t p = 0;
-                    int32_t tok[8] = {};
-                    float prob[8] = {};    // prob[i]: the drafter's probability of tok[i + 1]
+                    int32_t tok[strata::kernels::kLookupMaxT] = {};
+                    float prob[strata::kernels::kLookupMaxT] = {};    // prob[i]: the drafter's probability of tok[i + 1]
                     float p_on = 0.0f;     // the chain's estimate that the window before is accepted whole, tok[0] its bonus
                     // launched: on stage 0; finished: done on every front stage (all but the last); s1: on the last
                     bool ready = false, launched = false, finished = false, s1 = false, s1_done = false;
@@ -14021,6 +14032,7 @@ int main(int argc, char** argv) {
                     int sfx_match = 0;
                     bool lk = false;       // a guess made from the lookup (a lookup window's continuation), not the chain
                     int lk_match = 0;
+                    int64_t source = -1;   // lookup source position of row 0 (resync only)
                 };
                 // front stage `st`'s verifier of w's parity, and the last stage's
                 auto VF = [&](int st, const PW& w) -> strata::core::Verifier& { return stage_ver_p(st, w.seq & 1); };
@@ -14053,7 +14065,7 @@ int main(int argc, char** argv) {
                 bool b_done = false;     // B has been made from the chain in flight
                 int chain_n = 0;
                 int64_t pl_spec = 0, pl_on = 0, pl_undo = 0, pl_gate = 0, pl_fm = 0;
-                std::vector<int32_t> outp(8, 0);
+                std::vector<int32_t> outp((size_t) std::max(S, 8), 0);
                 bool ending = false;
                 // STRATA_PL_PLE_PREFETCH=1 (default off): the PLE rows a stage-0 window will be staged on are read into
                 // the row cache as soon as each token is known - row 0 at the verdict, each draft as the chain lands it,
@@ -14293,28 +14305,68 @@ int main(int argc, char** argv) {
                     const char* v = pipe_dbg_env("STRATA_PIPELINE_LOOKUP_PON");
                     return v ? (float) std::atof(v) : 0.75f;
                 }();
+                static const bool pl_resync = [] {
+                    const char* v = std::getenv("STRATA_PL_LOOKUP_RESYNC");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                // A long last window must not verify tokens the caller will discard. Keep
+                // the original scheduling when neither lookup experiment is enabled.
+                const bool lookup_budget = pl_resync || S > strata::kernels::kVerifyMaxT;
+                const int64_t lookup_end = p + (max_new - produced_n);
+                auto lookup_rows = [&](int64_t pos, int rows) {
+                    return lookup_budget ? (int) std::min<int64_t>(rows, std::max<int64_t>(0, lookup_end - pos)) : rows;
+                };
+                int64_t rs_offset = 0;
+                size_t rs_until = 0, rs_limit = 0;
+                int copy_kept = 0;
+                auto resync_lookup = [&](const int32_t* extra, int count, int max_k) {
+                    if (!pl_resync || sfx.size() >= rs_until) return 0;
+                    return sfx.propose_near(extra, count, (int64_t) sfx.size() + count - 1 + rs_offset,
+                                            rs_limit, max_k, pl_sbuf.data());
+                };
                 auto pick_lookup = [&](PW& w, const int32_t* chain0) {
                     if (o.suffix_draft <= 0 || w.seq == 0) return;
-                    const int k = sfx.propose(2 * S - 1, pl_sbuf.data());
+                    int k = resync_lookup(nullptr, 0, 2 * S - 1);
+                    bool resynced = k > 0;
+                    int prefix = 0;
+                    // After the renamed token, the fresh MTP drafts can already supply the
+                    // two matching tokens needed to re-anchor this same verifier window.
+                    if (!resynced && w.T >= 3) {
+                        const int n = w.T - 1;
+                        k = resync_lookup(w.tok + 1, n, 2 * S - 1 - n);
+                        if (k > 0) {
+                            std::move_backward(pl_sbuf.begin(), pl_sbuf.begin() + k, pl_sbuf.begin() + k + n);
+                            std::copy_n(w.tok + 1, n, pl_sbuf.begin());
+                            k += n;
+                            prefix = n;
+                            resynced = true;
+                        }
+                    }
+                    if (!resynced) k = sfx.propose(2 * S - 1, pl_sbuf.data());
                     const int match = sfx.last_match();
-                    if (k <= 0 || pl_sbuf[0] != chain0[0]) return;
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(w.T, std::min(k, S - 1), match);
-                    if (!pk.lookup) return;
-                    w.T = pk.t;
+                    if (k <= 0 || (!resynced && pl_sbuf[0] != chain0[0])) return;
+                    const strata::spec::DraftPolicy::Pick pk = policy.choose(w.T, std::min(k, std::min(S, 8) - 1), match);
+                    if (!pk.lookup && !resynced) return;
+                    const int rows = lookup_rows(w.p, resynced ? std::min(std::min(S, 8), k + 1) : pk.t);
+                    if (rows <= 0) return;
+                    w.T = rows;
+                    if (pl_resync) w.source = sfx.last_end() - prefix;
                     for (int i = 1; i < w.T; ++i) {
                         w.tok[i] = pl_sbuf[(size_t) i - 1];
                         w.prob[i - 1] = 1.0f;
                     }
                     w.sfx = true;
                     w.sfx_match = match;
+                    if (resynced) tre(prefix ? "RP" : "RS", w.seq, match, w.T);
                     const int rest = k - (w.T - 1);   // lookup tokens past w: B's row 0 (w's bonus guess) and its drafts
                     bool lookup_b = false;
-                    if (&w == &A && rest >= 1 && pl_lookup_pon > 0.0f && !b_done) {
+                    const int next_rows = lookup_rows(w.p + w.T, std::min(std::min(S, 8), rest));
+                    if (&w == &A && next_rows >= 1 && pl_lookup_pon > 0.0f && !b_done) {
                         lookup_b = true;
                         B = PW{};
                         B.seq = A.seq + 1;
                         B.p = A.p + A.T;
-                        B.T = std::min(S, rest);
+                        B.T = next_rows;
                         for (int i = 0; i < B.T; ++i) B.tok[i] = pl_sbuf[(size_t) (A.T - 1 + i)];
                         for (int i = 1; i < B.T; ++i) B.prob[i - 1] = 1.0f;
                         B.p_on = pl_lookup_pon;
@@ -14322,6 +14374,7 @@ int main(int argc, char** argv) {
                         B.made = true;
                         B.lk = true;
                         B.lk_match = match;
+                        if (pl_resync) B.source = w.source + w.T;
                         b_done = true;   // the chain in flight makes no B for this A
                         tre("CD", A.seq + 1, 3, (int) (1000.0f * B.p_on));
                     }
@@ -14529,7 +14582,8 @@ int main(int argc, char** argv) {
                         const char* v = pipe_dbg_env("STRATA_PIPELINE_SPEC_DEPTH");
                         return v ? std::max(1, std::atoi(v)) : 1 << 20;
                     }();
-                    if (B.ready && !B.fl && B.fr < pl_nf && B.fr < pl_spec_depth && A.fr > B.fr && !doomed) {
+                    if (B.ready && !B.fl && B.fr < pl_nf && B.fr < pl_spec_depth && A.fr > B.fr && !doomed &&
+                        (!lookup_budget || B.p < lookup_end)) {
                         const int st = B.fr;
                         if (st > 0 || (B.p_on >= theta && B.p + B.T <= o.max_context)) {
                             if (ajob && st == 0) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
@@ -14618,31 +14672,50 @@ int main(int argc, char** argv) {
                     // this verdict's tokens are appended (outp[0..a]; outp[a] is B's row 0 on the path), then B's
                     // drafts, in flight.  Made before the chain's launch: with a lookup guess the chain only catches
                     // the drafter up on A's cells (one output, nothing forced), its guess is not waited for.
+                    // Keep the source alignment for a short recovery interval after an actual lookup
+                    // mismatch. No relaxed lookup is enabled for ordinary MTP/chat windows.
+                    const int copy_now = (pl_resync || S > 8) && (A.sfx || A.lk)
+                                             ? std::min(32, copy_kept + a + 1) : 0;
+                    if (pl_resync && copy_now >= 24 && !nf && A.source >= 0 && (A.sfx || A.lk) &&
+                        (a < A.T - 1 || (B.lk && B.tok[0] != outp[(size_t) a]))) {
+                        rs_offset = A.source + a + 1 - ((int64_t) sfx.size() + a);
+                        rs_limit = sfx.size();
+                        rs_until = sfx.size() + a + 33;
+                    }
+                    copy_kept = on_v && a == A.T - 1 ? copy_now : 0;
                     int sk_n = 0, sk_match = 0;
-                    int32_t sk_tok[8] = {};
+                    int64_t sk_source = -1;
+                    int32_t sk_tok[strata::kernels::kLookupMaxT] = {};
                     if (on_v && pl_streak > 0 && o.suffix_draft > 0 && pl_lookup_pon > 0.0f && (B.lk || pl_streak >= 2) &&
                         B.p + B.T < o.max_context) {
-                        int32_t ex[16];
+                        int32_t ex[2 * strata::kernels::kLookupMaxT];
                         int n_ex = 0;
-                        for (int i = 0; i <= a && n_ex < 16; ++i) ex[n_ex++] = outp[(size_t) i];
-                        for (int i = 1; i < B.T && n_ex < 16; ++i) ex[n_ex++] = B.tok[i];
-                        const int k = sfx.propose_after(ex, n_ex, std::min(S, 8), pl_sbuf.data());
+                        for (int i = 0; i <= a && n_ex < 2 * strata::kernels::kLookupMaxT; ++i) ex[n_ex++] = outp[(size_t) i];
+                        for (int i = 1; i < B.T && n_ex < 2 * strata::kernels::kLookupMaxT; ++i) ex[n_ex++] = B.tok[i];
+                        int k = resync_lookup(ex, n_ex, S);
+                        const bool resynced = k > 0;
+                        if (!resynced) k = sfx.propose_after(ex, n_ex, S, pl_sbuf.data());
                         const int match = sfx.last_match();
-                        if (k >= 1 && B.lk) {
-                            sk_n = k;   // the stretch goes on: B, a lookup window, is about to be accepted whole
+                        // Extend only a verified copy run; short repeats retain the original widths.
+                        const int lookup_cap = copy_kept >= 24 && B.lk && match >= 32 ? S : std::min(S, 8);
+                        if (k >= 1 && (B.lk || resynced)) {
+                            sk_n = std::min(k, lookup_cap);   // the stretch goes on: B, a lookup window, is about to be accepted whole
                         } else if (k >= 2 && match >= pl_streak) {
                             // behind a window of the drafter's: where the policy's rates say a lookup window beats the
                             // drafter's (as a fresh window's lookup is chosen; the drafter's guess is not known yet)
-                            const strata::spec::DraftPolicy::Pick pk = policy.choose(S_mtp, std::min(k - 1, S - 1), match);
+                            const strata::spec::DraftPolicy::Pick pk = policy.choose(S_mtp, std::min(k - 1, lookup_cap - 1), match);
                             if (pk.lookup) sk_n = std::min(pk.t, k);
                         }
+                        sk_n = lookup_rows(B.p + B.T, sk_n);
                         if (sk_n > 0) {
                             sk_match = match;
+                            if (pl_resync) sk_source = sfx.last_end() + 1;
+                            if (resynced) tre("RS", B.seq + 1, match, sk_n);
                             for (int i = 0; i < sk_n; ++i) sk_tok[i] = pl_sbuf[(size_t) i];
                         }
                     }
                     static const bool pl_streak_full_chain = pipe_dbg_env("STRATA_PIPELINE_STREAK_FULL_CHAIN") != nullptr;
-                    const bool sk_short = sk_n > 0 && !pl_streak_full_chain;
+                    const bool sk_short = (sk_n > 0 && !pl_streak_full_chain) || B.T > strata::kernels::kVerifyMaxT;
                     if (pl_early_chain) {
                         bool e_eos = false;
                         int n_emit = 0;
@@ -14766,6 +14839,7 @@ int main(int argc, char** argv) {
                             B.made = true;
                             B.lk = true;
                             B.lk_match = sk_match;
+                            B.source = sk_source;
                             b_done = true;   // the chain in flight makes no B for this A
                             ++pl_streak_n;
                             tre("CD", B.seq, 3, (int) (1000.0f * B.p_on));

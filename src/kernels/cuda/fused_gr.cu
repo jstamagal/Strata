@@ -2489,6 +2489,13 @@ void fused_gr_set_wide8(int on) { g_hc_wide8 = on < 0 ? -1 : (on != 0); }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
+    // Wider lookup windows keep each kernel's existing argument layout and arithmetic.
+    if (n_tok > kFusedGrMaxT && n_tok <= kLookupMaxT && xn_scratch != nullptr) {
+        const bool first = fused_gr_read_multi(a, kFusedGrMaxT, xn_scratch, stream, stamp_buf, stamp_i0);
+        const bool rest = fused_gr_read_multi(a + kFusedGrMaxT, n_tok - kFusedGrMaxT,
+                                              xn_scratch + (size_t) kFusedGrMaxT * D, stream);
+        return first && rest;
+    }
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
