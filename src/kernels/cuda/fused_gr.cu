@@ -1444,7 +1444,12 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32e_kernel(GrMulti m) {
 // warp_sum's) instead of T butterflies: 9 cross-lane moves a row at 5-8 tokens instead of 25-40.  P = the token count
 // rounded up to a power of two; the padding tokens' dots are zeros and their sums are not stored.  The dots, the
 // epilogue and the mix are gr_up_q32e_kernel's.
-template <int P>
+// REG (STRATA_HC_UP_REG=1, with STRATA_HC_UP_TSUM, 7-8 tokens): every token's 8 activations of the lane's first chunk are read from
+// LDS once and kept in registers for all of the warp's rows (they are the same for every row); the lanes' second
+// chunk (lanes 0-7) still from LDS.  dot8u on the same two float4 as dot8u_ptr loads: the same FMAs in the same order.
+// fused_gr_bench, cold weights, up incl. a stamp, 5 / 6 / 7 / 8 tokens: 30.9 / 35.8 / 38.7 / 42.6 -> 32.9 / 35.0 / 37.2 /
+// 38.4 us, so it runs from 7 tokens.
+template <int P, bool REG = false>
 __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     __shared__ __align__(16) float lo[P][LR];
     __shared__ float g[P][HC][Q32_COLS];
@@ -1456,6 +1461,15 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     __syncthreads();
     const int tk = s26ts::tsum_token<P>(lane);
     const bool owner = lane == s26ts::tsum_lane<P>(tk) && tk < T;
+    float4 xr[REG ? P : 1][2];
+    if constexpr (REG) {
+#pragma unroll
+        for (int k = 0; k < P; ++k) {
+            const float4* x4 = reinterpret_cast<const float4*>(lo[k] + lane * 8);
+            xr[k][0] = k < T ? x4[0] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            xr[k][1] = k < T ? x4[1] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
     for (int r = warp; r < HC * Q32_COLS; r += Q32_WARPS) {
         const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
         const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
@@ -1466,7 +1480,8 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
         for (int k = 0; k < P; ++k) {
             acc[k] = 0.0f;
             if (k < T) {
-                acc[k] = dot8u_ptr(wa, lo[k] + lane * 8);
+                if constexpr (REG) acc[k] = dot8u(wa, xr[k][0], xr[k][1]);
+                else acc[k] = dot8u_ptr(wa, lo[k] + lane * 8);
                 if (lane < LR / 8 - 32) acc[k] += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
             }
         }
@@ -1477,6 +1492,11 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32t_kernel(GrMulti m) {
     gr_up_epilogue<P>(m, T, d0, g);
     __syncthreads();
     gr_up_mix<P>(m, T, d0, g, mixed_s);
+}
+int g_hc_up_reg = -1;   // fused_gr_set_up_reg (tests); -1 = STRATA_HC_UP_REG
+bool hc_up_reg() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_UP_REG"); return v != nullptr && std::atoi(v) != 0; }();
+    return g_hc_up_reg >= 0 ? g_hc_up_reg != 0 : on;
 }
 int g_hc_up_tsum = -1;   // fused_gr_set_up_tsum (tests); -1 = STRATA_HC_UP_TSUM
 bool hc_up_tsum() {
@@ -1644,6 +1664,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // 35.9 / 38.8 / 42.6 us; at 2 and 3 tokens the exact-T kernels below stay faster: 21.0 / 22.4 against 22.4 / 24.4)
         if (hc_up_tsum() && n_tok >= 4 && !no_multi_gr) {
             if (n_tok == 4) gr_up_q32t_kernel<4><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
+            else if (hc_up_reg() && n_tok >= 7) gr_up_q32t_kernel<8, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
             else gr_up_q32t_kernel<8><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m);
             return;
         }
@@ -2540,6 +2561,7 @@ void fused_gr_set_fast(int on) { g_gr_fast = on; }
 void fused_gr_set_wide(int mask) { g_hc_wide = mask < 0 ? -1 : (mask & 3); }
 void fused_gr_set_wide8(int on) { g_hc_wide8 = on < 0 ? -1 : (on != 0); }
 void fused_gr_set_up_tsum(int on) { g_hc_up_tsum = on < 0 ? -1 : (on != 0); }
+void fused_gr_set_up_reg(int on) { g_hc_up_reg = on < 0 ? -1 : (on != 0); }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {

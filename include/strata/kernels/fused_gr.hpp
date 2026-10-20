@@ -87,6 +87,8 @@ void fused_gr_set_wide(int mask);
 void fused_gr_set_wide8(int on);
 /// Tests: STRATA_HC_UP_TSUM on (1) or off (0) whatever the environment says; -1 = the environment again.
 void fused_gr_set_up_tsum(int on);
+/// Tests: STRATA_HC_UP_REG on (1) or off (0) whatever the environment says; -1 = the environment again.
+void fused_gr_set_up_reg(int on);
 /// The multi read's variants (#315; not main's opt-in STRATA_GR_V3 read, which sums in another order), all computing
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
