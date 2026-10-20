@@ -245,9 +245,11 @@ class ModelStep(Base):
 
     def test_a_model_that_does_not_fit_can_still_be_chosen(self):
         async def case(app, pilot, ctx):
-            await press(pilot, "enter", "end", "enter")
-            last = ctx.rows[-1]
-            self.assertEqual(last.verdict, "no")                      # the last row does not fit a 12 GB card
+            # the last row that does not fit a 12 GB card (this tree lists its community builds after it, and they fit)
+            at = max(i for i, r in enumerate(ctx.rows) if r.verdict == "no")
+            await press(pilot, "enter", "end", *(["up"] * (len(ctx.rows) - 1 - at)), "enter")
+            last = ctx.rows[at]
+            self.assertEqual(last.verdict, "no")
             self.assertEqual((ctx.settings.family, ctx.settings.model), (last.family, last.model))
             self.assertIn("Where should the model files be stored?", text_of(app))
             self.assertTrue(any("does not fit" in n for n in ctx.notes))
