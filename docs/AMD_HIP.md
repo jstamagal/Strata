@@ -903,6 +903,53 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   1,861 and 1,727 -> 1,858 tok/s (+7.4%), 32K +0.8%; decode is not affected (the text changes with the scores' order,
   so its speed is not compared). Measurements:
   [bench/results/2026-10-07-rdna2-qsa-select-simt](../bench/results/2026-10-07-rdna2-qsa-select-simt/README.md).
+- **The prompt's small kernels on a second stream (`STRATA_PF_SIDE_STREAM=1`, opt-in), and prompt chunks for the
+  two-card pipeline (`STRATA_PREFILL_PIPE=283`).** Where a 16,051-token prompt's time goes on 2x Radeon PRO V620
+  (IQ3_S abliterated pack, layer split 24, every expert in VRAM, `STRATA_PF_IQ2S=1 STRATA_PF_IQ3=1`), GPU ms of stage 0
+  by `STRATA_PREFILL_TIMING=1` (stage 1 within 2% on every line): expert gate/up 1067, GDN input projections 820,
+  hyper-connection read 669, QSA attention 584, expert down 547, QSA projections 435, GDN out projection 317,
+  router + shared expert 264, GDN recurrence 256, of 5,697. A kernel trace (rocprofv3) of the same prompt: 5.43 s of
+  kernels in a 6.07 s span on stage 0, of which the FP16 GEMMs of rocBLAS are 2.0 s at 31-35 TFLOP/s (the card's
+  FP16 peak is 40.5), the expert tiles 1.9 s and the attention 0.58 s; the card stood idle 0.22 s in ~6 us gaps between
+  dependent kernels and 0.14 s in gaps of 0.05-2 ms, most of them while the host grouped a layer's routed ids after
+  the per-layer sync. The two stages run 2,048-token chunks in step (740 ms a chunk each, 6 and 12 ms of it the
+  hand-off copy), so only shorter kernels or fewer gaps make the 16K prompt faster.
+  `STRATA_PF_SIDE_STREAM=1` gives the prompt path a second stream with its own rocBLAS handle and dequantization
+  scratch (62 MiB per card, made at the first chunk of 1,024 tokens or more; without the room it says so and
+  everything stays on one stream) and runs there what does not depend on the big product beside it: the MoE half's
+  shared expert beside the router, the host's grouping and the routed experts; the GDN alpha / beta beside qkv and the
+  gate z beside the conv and the recurrence (whose 96 blocks leave most of the card free; only the norm after it reads
+  z, and it waits for z by an event, `gdn_set_z_ready`); the QSA k / v / indexer projections, K's norm and RoPE, the
+  indexer's appends and the selection beside the q projection, the K/V append and q's norm and RoPE. The same kernels
+  on the same inputs, joined by events before any reader: the final residuals of a 3,000- and a 9,000-word prompt
+  (`STRATA_PREFILL_DUMP_R`) hash the same as with the switch off, and so do the greedy answers.
+  `STRATA_PF_DEFER_SHARED=1` is the small step without a second stream: the shared expert is queued right after the
+  routing sync (as the routed-only walk already did) and fills part of the grouping gap; the same bits.
+  The chunks: with `--prefill-pipe` (`STRATA_PREFILL_PIPE`) 1 a 4K prompt reads as two 2,048-token chunks, and the
+  second card waits for the first chunk and the first card for the last one: a chunk costs about 87 ms plus 0.31 ms a
+  token on each card here (from the timed 1,021- and 2,048-token chunks), b/a = 283 tokens, and with that ratio the
+  planner takes four 1,024-token chunks at 4K, 1,024-1,280-token chunks for 2.7-3.5K, 768 for 1.5K and keeps 2,048
+  at 16K (the best count there). The chunk geometry changes the rounding (as every `--prefill-pipe` value does):
+  a 3,190-token prompt read in 1,280-token chunks ends in other residuals and a greedy answer that begins the same and
+  then differs; no quality measurement was made.
+  Prompt tok/s, `tools/strata_bench.py --runs 1 --temperature 1.0 --top-p 0.95 --top-k 20`, the agent row the median
+  first-token time of its five follow-up turns (1.5-3.5K new tokens each):
+
+  | arm | 4K | 16K | agent turn |
+  |---|---|---|---|
+  | without (7 runs) | 1949 (1939-1957) | 2568 (2564-2571) | 1.91-2.37 s |
+  | `STRATA_PF_DEFER_SHARED=1` (2) | 1958, 1956 | 2578, 2578 | 1.92, 1.97 s |
+  | `STRATA_PF_SIDE_STREAM=1`, the shared expert only (2) | 1996, 2000 | 2632, 2637 | 1.88, 1.91 s |
+  | `STRATA_PF_SIDE_STREAM=1`, all of it (2) | 2022, 2023 | 2675, 2673 | 1.86, 2.55 s |
+  | `STRATA_PREFILL_PIPE=283` (2) | 2183, 2175 | 2564, 2563 | 1.68, 1.69 s |
+  | both (2) | 2232, 2238 | 2676, 2675 | 1.60, 1.62 s |
+
+  That is +14.6% at 4K and +4.2% at 16K with both. The agent turns are noisy at one run: a run with a turn of
+  3-3.5 s appeared with the switches off (2.37) and on (2.55). Tried in the same series and not faster: `ROC_ACTIVE_WAIT_TIMEOUT=50000`
+  (the host spins on the per-layer sync instead of sleeping) and `HIP_FORCE_DEV_KERNARG=1` (1947 / 2563).
+  Not measured: one card, other packs, other cards than gfx1030 (the switches are not gfx-specific; `STRATA_PREFILL_PIPE=283`
+  is this rig's ratio, not a default for others), prompts past 16K, decode (the switches are prompt-only), CUDA and
+  SYCL builds (not built).
 - **Decode: the hyper-connection read on the whole card (`STRATA_HC_WIDE=3`, opt-in).** A verify window reads the
   hyper-connection weights twice per layer (four BF16 matrices of 6.5 MB); on a two-card split of 2x Radeon PRO V620
   that was about a quarter of a window's GPU time (`STRATA_VERIFY_PROFILE=1`: 4.3 of 16.7 ms per window on the first
