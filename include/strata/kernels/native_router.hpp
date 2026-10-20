@@ -25,3 +25,11 @@ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok, float margin,
                            int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
 }
+
+namespace strata::kernels {
+// HIP wave32, ONE token: native_router_top10 + moe_group_resident(ids, 10, 10, ...).
+// Same IDs, float weights and defined plan entries; no process-wide switch or allocation.
+bool native_router_top10_grouped(const float* logits, int32_t* ids, float* weights, const uint8_t* base,
+                                  int64_t blob, unsigned long long* grp_ptr, int32_t* grp_start,
+                                  int32_t* counts, int32_t* ent_dst, int32_t* ent_tok, void* stream);
+}

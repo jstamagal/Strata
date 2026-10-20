@@ -372,6 +372,49 @@ __global__ void head_pick_kernel(const HeadCand* __restrict__ cand, int grid, in
     }
 }
 
+// The draft also needs the chosen token's probability. Merge candidates first,
+// then copy row_top_prob_kernel's arithmetic and geometry verbatim.
+__launch_bounds__(1024)
+__global__ void head_pick_prob_kernel(const HeadCand* __restrict__ cand, int grid, int n_out,
+                                      const float* __restrict__ logits, int32_t* __restrict__ out,
+                                      float* __restrict__ probability) {
+    float bv = __int_as_float(0xff800000);
+    int best = n_out;
+    for (int g = int(threadIdx.x); g < grid; g += int(blockDim.x)) {
+        const HeadCand c = cand[g];
+        if (c.v > bv || (c.v == bv && c.i < best)) { bv = c.v; best = c.i; }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, off, 32);
+        const int oi = __shfl_xor_sync(0xffffffffu, best, off, 32);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    __shared__ float sv[32], part[32];
+    __shared__ int si[32], pick;
+    const int wave = int(threadIdx.x >> 5), lane = int(threadIdx.x & 31);
+    if (lane == 0) { sv[wave] = bv; si[wave] = best; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int k = 1; k < 32; ++k)
+            if (sv[k] > bv || (sv[k] == bv && si[k] < best)) { bv = sv[k]; best = si[k]; }
+        pick = best < n_out ? best : 0;
+        *out = pick;
+    }
+    __syncthreads();
+    const float m = logits[pick];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n_out; i += blockDim.x) s += __expf(logits[i] - m);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.0f;
+        for (int w = 0; w < (int) (blockDim.x >> 5); ++w) tot += part[w];
+        *probability = 1.0f / tot;
+    }
+}
+
 int head_variant() {
     if (g_variant_override > 0) return g_variant_override;
     static const int v = [] {
@@ -440,6 +483,21 @@ void head_wide(const void* weights, const void* x_q8_1, float* logits, int n_in,
         head_pick_kernel<<<unsigned(ncols), 256, 0, s>>>(cand, grid, ncols, n_out, out, nf_flags);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("head_wide launch: ") + cudaGetErrorString(e));
+#endif
+}
+
+void head_wide_draft(const void* weights, const void* x_q8_1, float* logits, int n_in, int n_out, void* scratch,
+                     int32_t* out, float* probability, void* stream) {
+    if (!head_wide_supported(14, n_in, n_out, 1) || !weights || !x_q8_1 || !logits || !scratch || !out || !probability || !stream)
+        throw std::invalid_argument("head_wide_draft: needs one Q6_K column and device buffers");
+#if defined(__HIPCC__)
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* cand = static_cast<HeadCand*>(scratch);
+    const int grid = n_out < head_grid() ? n_out : head_grid();
+    launch_head<1>(weights, x_q8_1, logits, n_out, grid, cand, s);
+    head_pick_prob_kernel<<<1, 1024, 0, s>>>(cand, grid, n_out, logits, out, probability);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("head_wide_draft launch: ") + cudaGetErrorString(e));
 #endif
 }
 

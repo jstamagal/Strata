@@ -51,4 +51,8 @@ bool native_norm_rope_usable(int head_dim, int n_rot);
 // multiply-adds (STRATA_NORM_ROPE=1), 1 the expression as native_rope_apply writes it (=2), 2 with contraction off
 // (=3); -1 = the environment again.
 void native_norm_rope_tune(int form);
+// HIP gfx1030: the apply-expression form (=2), selected per call without changing other graphs.
+void native_qsa_rms_norm_rope_exact(const float* x, int in_stride, const float* gamma, float* out,
+                                   int rows, int head_dim, int n_rot, float epsilon,
+                                   const RopeScaling& scaling, const int* positions, void* stream);
 }

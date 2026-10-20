@@ -63,9 +63,9 @@ int main(int argc, char** argv) {
                     native_norm_rope_tune(form);
                     if (inplace) {
                         CHECK(hipMemcpy(d_fus, packed.data(), packed.size() * 4, hipMemcpyHostToDevice));
-                        native_qsa_rms_norm_rope(d_fus, hd, d_g, d_fus, rows, hd, n_rot, 1e-6f, *scalings[si], d_pos, stream);
+                        (form == 1 ? native_qsa_rms_norm_rope_exact : native_qsa_rms_norm_rope)(d_fus, hd, d_g, d_fus, rows, hd, n_rot, 1e-6f, *scalings[si], d_pos, stream);
                     } else {
-                        native_qsa_rms_norm_rope(d_xs, 2 * hd, d_g, d_fus, rows, hd, n_rot, 1e-6f, *scalings[si], d_pos, stream);
+                        (form == 1 ? native_qsa_rms_norm_rope_exact : native_qsa_rms_norm_rope)(d_xs, 2 * hd, d_g, d_fus, rows, hd, n_rot, 1e-6f, *scalings[si], d_pos, stream);
                     }
                     native_norm_rope_tune(-1);
                     CHECK(hipStreamSynchronize(stream));

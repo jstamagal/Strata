@@ -31,18 +31,19 @@ int main(int argc, char** argv) {
     std::mt19937_64 rng(20261013);
     const size_t wb = native_mmvq_weight_bytes(14, N, big);
     std::vector<uint8_t> hw(wb);
-    void *w, *xq, *scratch; float *x, *ya, *yb; int *oa, *ob; uint32_t *fa, *fb;
+    void *w, *xq, *scratch; float *x, *ya, *yb, *qa, *qb; int *oa, *ob; uint32_t *fa, *fb;
     ck(cudaMalloc(&w, wb), "w");
     ck(cudaMalloc(&xq, native_q8_1_bytes(N, MAXT)), "xq");
     ck(cudaMalloc(&scratch, head_wide_scratch_bytes()), "scratch");
     ck(cudaMalloc((void**) &x, (size_t) MAXT * N * 4), "x");
     ck(cudaMalloc((void**) &ya, (size_t) MAXT * big * 4), "ya"); ck(cudaMalloc((void**) &yb, (size_t) MAXT * big * 4), "yb");
     ck(cudaMalloc((void**) &oa, MAXT * 4), "oa"); ck(cudaMalloc((void**) &ob, MAXT * 4), "ob");
+    ck(cudaMalloc((void**) &qa, 4), "qa"); ck(cudaMalloc((void**) &qb, 4), "qb");
     ck(cudaMalloc((void**) &fa, MAXT * kNonfiniteBlocks * 4), "fa"); ck(cudaMalloc((void**) &fb, MAXT * kNonfiniteBlocks * 4), "fb");
     std::vector<float> ha((size_t) MAXT * big), hb((size_t) MAXT * big), hx((size_t) MAXT * N);
     std::vector<int> pa(MAXT), pb(MAXT);
     std::vector<uint32_t> na(MAXT * kNonfiniteBlocks), nb(MAXT * kNonfiniteBlocks);
-    long long cases = 0, bad = 0, nonfinite_cols = 0, ties = 0;
+    long long cases = 0, bad = 0, nonfinite_cols = 0, ties = 0, draft_cases = 0;
     for (int pass = 0; pass < 2; ++pass) {
         for (size_t i = 0; i + 8 <= wb; i += 8) { const uint64_t r = rng(); std::memcpy(&hw[i], &r, 8); }
         for (size_t b = 0; b < wb / 210; ++b) {
@@ -112,10 +113,29 @@ int main(int argc, char** argv) {
                                     first / (size_t) n_out, first % (size_t) n_out, same ? 0.0 : (double) ha[first],
                                     same ? 0.0 : (double) hb[first], pick ? "equal" : "DIFFERS", flag ? "equal" : "DIFFERS");
                     }
+                    if (T == 1) {
+                        // STRATA_MTP_FUSE: head + greedy merge + probability in two launches.
+                        row_top_prob(ya, 1, n_out, oa, qa, s);
+                        head_wide_draft(w, xq, yb, N, n_out, scratch, ob, qb, s);
+                        ck(cudaStreamSynchronize(s), "draft head");
+                        ck(cudaMemcpy(hb.data(), yb, (size_t) n_out * 4, cudaMemcpyDeviceToHost), "draft logits");
+                        ck(cudaMemcpy(pb.data(), ob, 4, cudaMemcpyDeviceToHost), "draft pick");
+                        float pra, prb;
+                        ck(cudaMemcpy(&pra, qa, 4, cudaMemcpyDeviceToHost), "reference probability");
+                        ck(cudaMemcpy(&prb, qb, 4, cudaMemcpyDeviceToHost), "draft probability");
+                        ++draft_cases;
+                        if (std::memcmp(ha.data(), hb.data(), (size_t) n_out * 4) != 0 || pa[0] != pb[0] ||
+                            std::memcmp(&pra, &prb, 4) != 0) {
+                            ++bad;
+                            std::printf("MISMATCH draft head variant %d pass %d n_out %d grid %d: pick %d/%d probability %a/%a\n",
+                                gv < 4 ? 2 : 3, pass, n_out, grid, pa[0], pb[0], (double) pra, (double) prb);
+                        }
+                    }
                 }
             }
         }
     }
+    std::printf("draft head: %lld cases, logits/pick/probability checked bit for bit\n", draft_cases);
     // ---- sample_tokens_staged (STRATA_HEAD_SAMPLE) against sample_tokens: the same token for the same parameters,
     // read from device memory instead of baked; a staged greedy request leaves `out` alone
     long long scases = 0, sbad = 0;

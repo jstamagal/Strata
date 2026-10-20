@@ -69,6 +69,9 @@ These are choices per model and per PC; they go in the model's config.
 - `--pipeline-windows 2` on two cards: decode +12% greedy, +9% sampled, +24% on copy-heavy text.
 - `--spec 8 --mtp-max-t 3 --spec-min-p 0.7`: MTP drafts three deep, copied text up to eight. Depth 3 measured best
   for ordinary text (IQ3_S greedy, by depth 2 to 8: 110.6, 114.6, 109.5, 105.0, 100.2, 94.2, 91.6 tok/s).
+- `STRATA_MTP_FUSE=1` (gfx1030 only): fewer draft launches. On two V620s with IQ3_S, captured steps used 50 kernels
+  instead of 57; each round lost 12. Text hashes and draft counts matched. Speed changes were small; see the
+  [measurements and limits](MTP_FUSE_GFX1030.md).
 - Leave `STRATA_SPEC_COUPLED` off: with it a sampled request decodes serially (-7% to -11%).
 - `--prefill auto:16384`, `STRATA_SPLIT_OWN=1`, `STRATA_PREFILL_HELP=1` on a layer split: prompts +18% to +34%.
 - An even layer split with `--trim-stage-weights` (`"layer_split": "24"`). With the second card on a x4 link, 26 was

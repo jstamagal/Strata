@@ -170,11 +170,12 @@ public:
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
-    /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
-    bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
+    /// hyper-connection read (R_, inj_, mixed_) and the K/V appended. project_q also leaves Q ready for a one-row rest.
+    bool record_front(int T, int row0, cudaStream_t cs, std::string& err, bool project_q = false);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
-    /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, cudaStream_t cs, std::string& err);
+    /// the head, the draft and its probability. Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
+    /// q_ready reuses record_front's one-row projection instead of projecting Q again.
+    bool record_rest(int step_row, cudaStream_t cs, std::string& err, bool q_ready = false);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
@@ -208,6 +209,8 @@ private:
     int max_drafts_ = 1 << 30;
     bool hnorm_stream_ = false;
     bool q4_ = false, q4_head_ = false;
+    bool fuse_ = false;   ///< STRATA_MTP_FUSE=1, gfx1030 only; selected before graph capture
+    void* head_wide_scratch_ = nullptr;   ///< carved only for the opt-in draft head
     uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
     std::vector<std::pair<std::string, uint64_t>> q4_off_;
     int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)

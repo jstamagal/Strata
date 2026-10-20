@@ -278,9 +278,9 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 
-void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
+static void norm_rope_impl(const float* x, int in_stride, const float* gamma, float* out,
                               int rows, int head_dim, int n_rot, float epsilon,
-                              const RopeScaling& scaling, const int* positions, void* stream) {
+                              const RopeScaling& scaling, const int* positions, void* stream, int form) {
     if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
         (head_dim != 128 && head_dim != 256) || in_stride < head_dim || n_rot != 64 ||
         !std::isfinite(epsilon) || epsilon < 0.0f ||
@@ -296,7 +296,6 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
     norm_rope_kernel<TAB_, FORM_><<<unsigned(rows), 256, 0, static_cast<cudaStream_t>(stream)>>>( \
         x, in_stride, gamma, out, head_dim, n_rot, epsilon, theta_scale, \
         k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, positions, mrope_table(), rt)
-    const int form = norm_rope_form();
     if (rt.cos != nullptr) {
         if (form == 1) STRATA_NR_GO(true, 1); else if (form == 2) STRATA_NR_GO(true, 2); else STRATA_NR_GO(true, 0);
     } else {
@@ -340,5 +339,15 @@ bool native_qsa_rms_norm_rope_multi(const NormRopeItems& its, int n_rot, float e
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     return true;
+}
+void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
+                              int rows, int head_dim, int n_rot, float epsilon,
+                              const RopeScaling& scaling, const int* positions, void* stream) {
+    norm_rope_impl(x, in_stride, gamma, out, rows, head_dim, n_rot, epsilon, scaling, positions, stream, norm_rope_form());
+}
+void native_qsa_rms_norm_rope_exact(const float* x, int in_stride, const float* gamma, float* out,
+                                   int rows, int head_dim, int n_rot, float epsilon,
+                                   const RopeScaling& scaling, const int* positions, void* stream) {
+    norm_rope_impl(x, in_stride, gamma, out, rows, head_dim, n_rot, epsilon, scaling, positions, stream, 1);
 }
 }

@@ -434,6 +434,20 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
 }
 
 #if defined(__HIPCC__)   // AMD keeps one copy a launch
+struct MtpMappedCopies { MappedCopy c[8]; };
+__global__ void mtp_mapped_copies_kernel(MtpMappedCopies a) {
+    const MappedCopy c = a.c[blockIdx.x];
+    const volatile int32_t* src = (const volatile int32_t*) c.src;
+    for (int64_t i = threadIdx.x; i < c.words; i += blockDim.x) ((int32_t*) c.dst)[i] = src[i];
+}
+void copy_from_mapped_fused(const MappedCopy* copies, int n, void* stream) {
+    if (n <= 0) return;
+    if (n > 8) { std::fprintf(stderr, "copy_from_mapped_fused: at most 8 copies\n"); std::exit(1); }
+    MtpMappedCopies a{};
+    for (int i = 0; i < n; ++i) a.c[i] = copies[i];
+    mtp_mapped_copies_kernel<<<n, 128, 0, (cudaStream_t) stream>>>(a);
+    check_launch("copy_from_mapped_fused");
+}
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     for (int i = 0; i < n; ++i)
         copy_i32_from_mapped((int32_t*) copies[i].dst, (const int32_t*) copies[i].src, copies[i].words, stream);

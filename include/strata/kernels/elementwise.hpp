@@ -154,5 +154,7 @@ struct MappedCopy {
     int64_t words = 0;
 };
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream);
+// HIP: same volatile 32-bit loads as copy_i32_from_mapped, one workgroup per copy.
+void copy_from_mapped_fused(const MappedCopy* copies, int n, void* stream);
 
 }  // namespace strata::kernels

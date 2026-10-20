@@ -27,6 +27,10 @@ std::size_t head_wide_scratch_bytes();
 // `nf_flags` may be mapped host memory); capturable.  Throws std::invalid_argument where head_wide_supported is false.
 void head_wide(const void* weights, const void* x_q8_1, float* logits, int n_in, int n_out, int ncols, void* scratch,
                int32_t* out, uint32_t* nf_flags, void* stream);
+// One draft column: the same head, then greedy merge + row_top_prob in one launch.
+// The probability uses row_top_prob's 1024-thread sum and exactly the same adds.
+void head_wide_draft(const void* weights, const void* x_q8_1, float* logits, int n_in, int n_out, void* scratch,
+                     int32_t* out, float* probability, void* stream);
 
 // The lab's knobs: workgroups of the persistent launch (0: the default, STRATA_HEAD_WIDE_GRID).
 void head_wide_set_grid(int grid);

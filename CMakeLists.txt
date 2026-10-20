@@ -821,6 +821,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # STRATA_NORM_ROPE: the fused RMSNorm + RoPE launch against the two launches, each form of the rotation
     add_executable(hip_norm_rope_parity tests/hip/norm_rope_parity.cpp)
     target_link_libraries(hip_norm_rope_parity PRIVATE strata_kernels strata_hip_runtime)
+    # STRATA_MTP_FUSE: grouped routing, mapped staging and explicit projection sets, bit for bit
+    add_executable(hip_mtp_fuse_parity tests/hip/mtp_fuse_parity.cpp)
+    target_link_libraries(hip_mtp_fuse_parity PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME hip_mtp_fuse_parity COMMAND hip_mtp_fuse_parity)
+    add_test(NAME hip_mtp_fuse_parity_tsum COMMAND hip_mtp_fuse_parity)
+    set_tests_properties(hip_mtp_fuse_parity_tsum PROPERTIES ENVIRONMENT "STRATA_TSUM=1")
+    set_tests_properties(hip_mtp_fuse_parity hip_mtp_fuse_parity_tsum PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_mtp_fuse_parity)
     # STRATA_QSA_GATE_Q8 / STRATA_IDX_PAIR: two fused launches of a QSA layer's window against the launches they replace
     add_executable(hip_qsa_fuse_parity tests/hip/qsa_fuse_parity.cpp)
     target_link_libraries(hip_qsa_fuse_parity PRIVATE strata_kernels strata_hip_runtime)

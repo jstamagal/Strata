@@ -2667,10 +2667,10 @@ void native_mmvq_set_tune(int on) {
     (void) on;
 #endif
 }
-bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream) {
+static bool mmvq_set_impl(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream, bool explicit_on) {
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     static const bool env = [] { const char* v = std::getenv("STRATA_MMVQ_SET"); return v != nullptr && std::atoi(v) != 0; }();
-    if (!(g_row_set >= 0 ? g_row_set != 0 : env)) return false;
+    if (!explicit_on && !(g_row_set >= 0 ? g_row_set != 0 : env)) return false;
     if (items == nullptr || n_items < 2 || n_items > 3 || ncols < 1 || ncols > MAX_NCOLS || n_in <= 0 || n_in % QK != 0 ||
         x_q8_1 == nullptr || stream == nullptr || !g_multi_exact)
         return false;
@@ -2704,9 +2704,15 @@ bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_
     launch_check();
     return true;
 #else
-    (void) items; (void) n_items; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream;
+    (void) items; (void) n_items; (void) x_q8_1; (void) n_in; (void) ncols; (void) stream; (void) explicit_on;
     return false;
 #endif
+}
+bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    return mmvq_set_impl(items, n_items, x_q8_1, n_in, ncols, stream, false);
+}
+bool native_mmvq_set_explicit(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream) {
+    return mmvq_set_impl(items, n_items, x_q8_1, n_in, ncols, stream, true);
 }
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
