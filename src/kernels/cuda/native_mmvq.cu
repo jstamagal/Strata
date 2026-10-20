@@ -169,6 +169,32 @@ __global__ void native_quantize_q8_1_kernel(const float* x_, Q81Block* y_, int n
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
 }
 
+// STRATA_QSA_GATE_Q8=1 (opt-in): a QSA layer's output gate (native_qsa.cu's `gate`: attn * sigmoid(the gate half of
+// the q|gate row)) and the q8_1 quantization of its result in one launch.  Thread i computes element i with `gate`'s
+// expression, stores it, and quantizes it with native_quantize_q8_1_kernel's statements; contraction is off in this
+// body so the product is rounded before the block sum reads it, as it is when it goes through memory.
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_gate_quantize_q8_1_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+                                                 float* __restrict__ out, Q81Block* __restrict__ y, int n_head,
+                                                 int head_dim) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_head * head_dim) return;   // a multiple of 32: only whole warps return
+    const int head = i / head_dim, channel = i % head_dim;
+    const float raw = q_full[std::size_t(head) * 2 * head_dim + head_dim + channel];
+    const float sigmoid = 1.0f / (1.0f + expf(-raw));
+    const float xi = attn[i] * sigmoid;
+    out[i] = xi;
+    const float amax = warp_max(fabsf(xi));
+    const float sum = warp_sum(xi);
+    const float d = q8_1_finite(amax / 127.0f);
+    const int8_t q = q8_1_quant(xi, d, amax);
+    y[i / Q8K].qs[i % Q8K] = q;
+    if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
+}
+
 __launch_bounds__(QUANT_THREADS, 1)
 __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gate,
                                                    const float* __restrict__ up,
@@ -2704,6 +2730,26 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
                static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();
+}
+
+bool native_gate_quantize_q8_1(const float* attn, const float* q_full, float* out, void* x_q8_1, int n_head,
+                               int head_dim, void* stream) {
+#if defined(__HIPCC__)
+    if (attn == nullptr || q_full == nullptr || out == nullptr || x_q8_1 == nullptr || stream == nullptr || n_head <= 0 ||
+        head_dim <= 0 || head_dim % Q8K != 0 || std::size_t(n_head) * head_dim > std::size_t(std::numeric_limits<int>::max()) ||
+        reinterpret_cast<std::uintptr_t>(attn) % 4 || reinterpret_cast<std::uintptr_t>(q_full) % 4 ||
+        reinterpret_cast<std::uintptr_t>(out) % 4 || reinterpret_cast<std::uintptr_t>(x_q8_1) % 4)
+        return false;
+    const int n_total = n_head * head_dim;
+    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+    native_gate_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+        attn, q_full, out, static_cast<Q81Block*>(x_q8_1), n_head, head_dim);
+    launch_check();
+    return true;
+#else
+    (void) attn; (void) q_full; (void) out; (void) x_q8_1; (void) n_head; (void) head_dim; (void) stream;
+    return false;
+#endif
 }
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,

@@ -177,5 +177,10 @@ struct NativeMmvqItem { int type; const void* weights; float* y; int n_out; };
 bool native_mmvq_set(const NativeMmvqItem* items, int n_items, const void* x_q8_1, int n_in, int ncols, void* stream);
 // Tests: 1 / 0 = on / off whatever the environment says, -1 = the environment again.
 void native_mmvq_set_tune(int on);
+// STRATA_QSA_GATE_Q8 (HIP): native_qsa_gate_apply(attn, q_full, out, n_head, head_dim) followed by
+// native_quantize_q8_1(out, x_q8_1, n_head * head_dim, 1) as one launch: the same floats in `out`, the same q8_1 bytes.
+// False (nothing launched) off HIP or for arguments the pair of calls would refuse.
+bool native_gate_quantize_q8_1(const float* attn, const float* q_full, float* out, void* x_q8_1, int n_head,
+                               int head_dim, void* stream);
 
 } // namespace strata::kernels
