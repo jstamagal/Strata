@@ -215,7 +215,7 @@ bool fused_swiglu_q81_enabled() {
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
-    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0;
+    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0, set = (lfuse & 4) != 0;
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
@@ -225,6 +225,11 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
     }
+    // STRATA_NODE_FUSE (set): gate and up through native_mmvq_set (STRATA_MMVQ_SET's kernel, each output bitwise its
+    // own native_mmvq call's); where it does not apply, as before
+    const NativeMmvqItem gu[2] = {{nw.gate_type, nw.gate_data, gate, (int) n_ff}, {nw.up_type, nw.up_data, up, (int) n_ff}};
+    if (set && native_mmvq_set(gu, 2, x_q8_1, (int) n_embd, n_tok, stream)) {
+    } else
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
     if (!(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {

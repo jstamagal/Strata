@@ -24,6 +24,25 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out,
                               int rows, int head_dim, int n_rot, float epsilon,
                               const RopeScaling& scaling, const int* positions, void* stream);
+/// STRATA_NODE_FUSE: up to three native_qsa_rms_norm_rope calls (each its own rows, strides, norm weights, output and
+/// positions; one n_rot, eps and scaling) in one launch, every row bitwise its own call's.  False: nothing launched
+/// (a geometry the single call would refuse, or native_norm_rope_usable false); the caller makes the single calls.
+constexpr int kNormRopeItems = 3;
+struct NormRopeItem {
+    const float* x = nullptr;
+    int in_stride = 0;
+    const float* gamma = nullptr;
+    float* out = nullptr;
+    int rows = 0;
+    int head_dim = 0;
+    const int* positions = nullptr;
+};
+struct NormRopeItems {
+    NormRopeItem it[kNormRopeItems];
+    int n = 0;
+};
+bool native_qsa_rms_norm_rope_multi(const NormRopeItems& its, int n_rot, float epsilon, const RopeScaling& scaling,
+                                    void* stream);
 /// Whether callers should take the fused kernel (and the in-place rope's 32-thread launch) for this geometry. On the
 /// CUDA build it is on unless STRATA_NO_NORM_ROPE=1; on the HIP build it is off until the AMD parity check passes there
 /// (rope_parity check 6) and only STRATA_NORM_ROPE=1 turns it on.

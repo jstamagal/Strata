@@ -48,6 +48,13 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
                                      const float* gamma, float epsilon,
                                      const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                      int64_t max_cells, const RopeScaling& scaling, void* stream);
+/// STRATA_NODE_FUSE: the same append, first copying the tail's (idx_block - 1) * idx_dim floats to `snap` as the
+/// window's snapshot (copy_from_mapped) did before it; snap 16-byte aligned and apart from the tail
+void native_qsa_indexer_append_steps_snap(const float* raw, const int32_t* relative_pos_device,
+                                          int pos_stride, int n_steps, int32_t pos_base,
+                                          const float* gamma, float epsilon,
+                                          const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
+                                          int64_t max_cells, const RopeScaling& scaling, void* stream, float* snap);
 
 // engine-latency: the commit's append of the same window rows into several QSA layers in one launch.  Layer i reads
 // raw0 + i * raw_stride and its own gamma/buffers; with tail_src[i] set its tail is first restored from there (the

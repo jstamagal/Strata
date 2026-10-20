@@ -33,6 +33,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/node_fuse.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1112,6 +1113,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
+    bool cmb_def_[2] = {false, false};    // per group: STRATA_NODE_FUSE, the next layer's first read makes the combine
     if (!batch_rec_) groups_[T] = G;
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
@@ -1268,7 +1270,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_DF_PLE");
                 return e != nullptr && std::atoi(e) != 0;
             }();
-            const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
+            const bool ple_post = ple_batch_kv &&
+                                  (ple_post_env || strata::kernels::node_fuse(strata::kernels::kNodeFusePle)) && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -1325,12 +1328,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
+                if (half == 0 && cmb_def_[grp]) {   // STRATA_NODE_FUSE: the previous layer's combine (post below)
+                    a.cmb_parts = parts_ + (size_t) t * K * N;
+                    a.cmb_w = w_ + t * K;
+                    a.cmb_shared = shared_ + t * N;
+                }
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
                     a.q8_cnt = qcnt_;
                     if (half == 0) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
+            if (half == 0) cmb_def_[grp] = false;
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
@@ -1446,6 +1455,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 set_done = !br && !side_proj && mm_set({{wqkv, {qkv + (size_t) tb * C, (int) C}}, {wg, {z_ + (size_t) tb * ZV, (int) ZV}}});
                 if (!side_proj && !set_done) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
+                // STRATA_NODE_FUSE: the conv, the gates and the recurrence in one launch (gdn_fused_step, bitwise the
+                // three) for a window's one group; the gate projection z, which only the recurrence reads, first
+                bool gdn_done = false, z_done = false;
+                if (strata::kernels::node_fuse(strata::kernels::kNodeFuseGdn) && G == 1 && tb == 0 && te == n &&
+                    !batch_rec_ && !self_commit && !br && !sidem && !side_proj && !prof_on_) {
+                    if (!set_done) {
+                        mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                        z_done = true;
+                    }
+                    gdn_done = strata::kernels::gdn_fused_step(state, conv, qkv, (const float*) wc->data, hb, (int) C, EPS, xm,
+                                                               (const uint16_t*) wa->data, (const uint16_t*) wb->data,
+                                                               (const float*) wdt->data, (const float*) wsa->data, gate, beta,
+                                                               (int) N, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                                               (int) HV, n, cs, g_qfuse() ? (void*) xq_ : nullptr);
+                }
+                if (gdn_done) {
+                } else
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -1472,12 +1498,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     join(0);
                     join(1);
                 } else {
-                if (!fuse_ab && !sidem)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
+                if (!fuse_ab && !sidem && !gdn_done)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj && !set_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !set_done && !z_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1493,6 +1519,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
                     return v != nullptr && std::atoi(v) != 0;
                 }();
+                if (gdn_done) {
+                } else
                 if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
@@ -1600,6 +1628,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // normalized and rotated where they were before
                 const bool want_pair = qb && !qbr && g_idx_pair() && !prof_on_ && !sidem;
                 bool idx_pair = false;
+                bool nr_done = false;   // STRATA_NODE_FUSE: q's and the indexer query's norm + RoPE ran with k's
                 auto norm_rope_s = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos, cudaStream_t ns) {
                     if (fuse_nr && native_norm_rope_usable(cols, (int) s.n_rot)) {
                         native_qsa_rms_norm_rope(data, cols, (const float*) norm->data, data, rows, cols, (int) s.n_rot, EPS,
@@ -1628,12 +1657,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
+                // STRATA_NODE_FUSE: group 0's snapshot of the indexer tail made by its append (in line on cs)
+                const bool snap_in_append = grp == 0 && !batch_rec_ && dec_batch && !g_no_batch_kv && !sidem && !prof_on_ &&
+                                            strata::kernels::node_fuse(strata::kernels::kNodeFuseIdxSnap);
                 auto idx_append = [&](cudaStream_t ns) {
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                        rope_scaling(), ns);
+                        native_qsa_indexer_append_steps_snap(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos,
+                                                             kStepCount, n, 0, (const float*) wikn->data, EPS, ib, s,
+                                                             st.max_cells, rope_scaling(), ns,
+                                                             snap_in_append ? tail_snap_ + (size_t) qi * TS : nullptr);
                     } else {
                         for (int t = tb; t < te; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -1649,7 +1682,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         if (!idx_pair)
                         bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                                   N, IQ * ID, n, ns);
-                        norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
+                        if (!nr_done) norm_rope_s(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, ns);
                     } else
                         for (int t = tb; t < te; ++t) {
                             float* qx = qidx_ + t * IQ * ID;
@@ -1676,6 +1709,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
+                    if (qb && nr_done) {
+                    } else
                     if (qb) {
                         if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
                             native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
@@ -1735,6 +1770,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 }
+                // STRATA_NODE_FUSE: k's, q's and the indexer query's norm + RoPE in one launch, all three as soon as
+                // their projections are done (q's and the indexer's were the in-line steps after the cell appends,
+                // which neither reads nor writes)
+                if (qb && fuse_nr && set_done && idx_pair && !qbr && !side_proj && !sidem && !st.kv_rot && !prof_on_ &&
+                    strata::kernels::node_fuse(strata::kernels::kNodeFuseNormRope)) {
+                    strata::kernels::NormRopeItems its;
+                    its.it[0] = {kcur_ + tb * NKV * HD, (int) HD, (const float*) wkn->data, kcur_ + tb * NKV * HD,
+                                 (int) (n * NKV), (int) HD, pos_k + tb * NKV};
+                    its.it[1] = {qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qcur_ + tb * NH * HD,
+                                 (int) (n * NH), (int) HD, pos_ + tb * NH};
+                    its.it[2] = {qidx_ + tb * IQ * ID, (int) ID, (const float*) wiqn->data, qidx_ + tb * IQ * ID,
+                                 (int) (n * IQ), (int) ID, pos_i + tb * IQ};
+                    its.n = 3;
+                    nr_done = strata::kernels::native_qsa_rms_norm_rope_multi(its, (int) s.n_rot, EPS, rope_scaling(), cs);
+                }
+                if (nr_done) {
+                } else
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1744,7 +1796,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
-                if (!sidem) idx_snap(cs);
+                if (!sidem && !snap_in_append) idx_snap(cs);
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
                 if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -2084,6 +2136,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // experts' q8_1 image of xm is made first and the shared expert's gate/up read it (quantize_q8_1_rows and
             // native_quantize_q8_1 write the same bytes)
             qdedup = g_qdedup() && !sh_fork && strata::kernels::cpu::expert_layout().native;
+            // STRATA_NODE_FUSE: the shared expert's gate/up read the MoE input's q8_1 image the FFN-side read wrote
+            // (STRATA_QFUSE: native_quantize_q8_1's bytes) instead of quantizing xm again - also on its forked stream,
+            // since nothing rewrites those rows before the join: not a Hadamard-folded layer, whose experts' image is
+            // rewritten from the rotated rows below
+            const bool sh_q8 = !qdedup && q8_ffn && strata::kernels::cpu::expert_layout().native &&
+                               !strata::kernels::cpu::expert_layout().fmt[(size_t) l].had_gu &&
+                               strata::kernels::node_fuse(strata::kernels::kNodeFuseShQ8);
             if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
@@ -2092,8 +2151,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
-                                    qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0));
+                                    qdedup || sh_q8 ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
+                                    (sg_ready ? 1 : 0) | (lfuse_on(n) && g_lfuse_pair() ? 2 : 0) |
+                                    (strata::kernels::node_fuse(strata::kernels::kNodeFuseShSet) ? 4 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -2230,6 +2290,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
+        // STRATA_NODE_FUSE: the combine made by the next layer's first hyper-connection read (its norm kernel), where
+        // that read is the next to read bo_ (not the stage's or the model's last layer, a control vector's layer, or
+        // layer 0 before the n-gram block's write) and the combine is the k = 10 float4 kernel
+        const auto al16 = [](const void* p) { return ((uintptr_t) p & 15u) == 0; };
+        cmb_def_[grp] = strata::kernels::node_fuse(strata::kernels::kNodeFuseCombine) && !prof_on_ && !sg_gated_[grp] &&
+                        !hits_in_combine && remote_opt_ == nullptr && native_moe_combine_enabled() && (n == 1 || dec_batch) &&
+                        K == 10 && (N & 3) == 0 && al16(parts_ + (size_t) tb * K * N) && al16(shared_ + tb * N) &&
+                        al16(bo_ + tb * N) && l + 1 < le_ && l + 1 < g.n_layers && !cvec().covers(l) &&
+                        !(l + 1 == 1 && ple_on);
+        if (cmb_def_[grp]) {
+        } else
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
                 native_moe_combine_multi_hits_gated(parts_out, w_ + tb * K, shared_ + tb * N, sh_g_ + tb, bo_ + tb * N, N, K, n, cs);
@@ -2295,6 +2366,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
+        // STRATA_NODE_FUSE: the window's head read as one launch set (STRATA_HEAD_MIX_MULTI's path), which with
+        // STRATA_QFUSE also writes the q8_1 image the head projection reads
+        const bool head_mix_fuse = strata::kernels::node_fuse(strata::kernels::kNodeFuseHeadMix);
+        const bool head_q8_fold = head_mix_fuse && qcnt_ != nullptr;
+        bool head_q8 = false;   // xq_ holds head_mixed_'s q8_1 image
         if (mix_q8) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -2325,7 +2401,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.mixed = head_mixed_ + t * N;
             }
             fused_gr_read_multi(fa, T, xn_, cs);
-        } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
+        } else if ((head_mix_multi_enabled() || head_mix_fuse) && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
             if (hn->kind != WeightKind::F32 || hd->kind != WeightKind::Bf16InF32 || hu->kind != WeightKind::Bf16InF32) {
@@ -2338,8 +2414,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+                if (head_q8_fold) {   // STRATA_NODE_FUSE: the head's q8_1 input written by the read (STRATA_QFUSE's bytes)
+                    fa[t].q8_cnt = qcnt_;
+                    fa[t].q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+                }
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            head_q8 = fused_gr_read_multi(fa, T, xn_, cs);
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;
@@ -2358,7 +2438,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                   strata::kernels::head_wide_supported(head_->type(), (int) N, (int) n_vocab_, T);
         if (head_wide_on) {
             try {
-                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                if (!head_q8) native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 strata::kernels::head_wide(head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T,
                                            head_wide_scratch_, m_out_, nan_guard_on() ? m_nf_ : nullptr, cs);
             } catch (const std::exception& e) {
@@ -2368,7 +2448,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else
         if (head_ != nullptr && head_->loaded()) {
             try {
-                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                if (!head_q8) native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,

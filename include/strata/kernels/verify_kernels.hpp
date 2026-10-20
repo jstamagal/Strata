@@ -55,6 +55,14 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// STRATA_NODE_FUSE: gdn_conv_l2_multi(history, qkv, conv_w, h, conv_channels, 2 h_k, eps_l2, n_tok, t_begin 0, no
+/// commit), gdn_ab_multi(x, ...) and gdn_step_norm_multi(state, h, ..., n_tok, no keep, t_out_begin 0, xq_out) in one
+/// launch, every output (h, gate, beta, y, the q8_1 image, the state untouched) bitwise the three calls'.  False:
+/// nothing launched (STRATA_GDN_SPLIT=1, whose recurrence is another kernel, or arguments it does not take).
+bool gdn_fused_step(float* state, const float* history, const float* qkv, const float* conv_w, float* h, int conv_channels,
+                    float eps_l2, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+                    const float* ssm_a, float* gate, float* beta, int n_embd, const float* z, const float* gamma, float eps,
+                    float* y, int h_k, int h_v, int n_tok, void* stream, void* xq_out = nullptr);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as

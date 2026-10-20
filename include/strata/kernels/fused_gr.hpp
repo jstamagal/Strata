@@ -49,6 +49,14 @@ struct FusedGrArgs {
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;
     const float* s_up = nullptr;
+    /// STRATA_NODE_FUSE (fused_gr_read_multi only, with apply): bo_prev is not read but made here first, as the MoE
+    /// combine native_moe_combine_multi would have written to it (its k = 10 float4 kernel: parts [10][n_embd] of this
+    /// token, its 10 routing weights, the shared expert's row), and stored to bo_prev for the read's later kernels.
+    /// All tokens set, or none; 16-byte aligned.  Inside the split read's register norm (STRATA_GR_NORM_FAST); any
+    /// other read launches the combine first (the same values, one node more).
+    const float* cmb_parts = nullptr;
+    const float* cmb_w = nullptr;
+    const float* cmb_shared = nullptr;
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);
@@ -69,7 +77,6 @@ constexpr int kFusedGrMaxT = 8;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
-
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);
 /// The bench only: STRATA_HC_WIDE's bit mask (1 = the one-block-per-row down, 2 = the 8-lanes-a-row up); -1 = the

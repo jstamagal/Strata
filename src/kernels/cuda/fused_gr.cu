@@ -909,6 +909,95 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) 
                 make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
 }
 
+// STRATA_NODE_FUSE: gr_norm_split_fast_kernel whose pending write's block output is first made from the previous
+// layer's MoE parts, as native_moe_combine_multi's combine_k10_vec4 makes it (the first product rounded, one fmaf per
+// expert in order, then the shared row added), and stored by the stream-0 block for the down and up kernels that
+// follow.  Every block of the token makes the same float4s; the rest is gr_norm_split_fast_kernel line for line.
+__device__ __forceinline__ float4 gr_cmb_k10(const FusedGrArgs& a, int d) {
+    const int64_t n4 = N / 4, c4 = d / 4;
+    const float4* parts4 = reinterpret_cast<const float4*>(a.cmb_parts);
+    const float w0 = __ldg(a.cmb_w + 0);
+    const float4 p0 = parts4[c4];
+    float4 sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+#pragma unroll
+    for (int expert = 1; expert < 10; ++expert) {
+        const float w = __ldg(a.cmb_w + expert);
+        const float4 p = parts4[int64_t(expert) * n4 + c4];
+        sum.x = fmaf(p.x, w, sum.x);
+        sum.y = fmaf(p.y, w, sum.y);
+        sum.z = fmaf(p.z, w, sum.z);
+        sum.w = fmaf(p.w, w, sum.w);
+    }
+    const float4 sh = reinterpret_cast<const float4*>(a.cmb_shared)[c4];
+    sum.x += sh.x;
+    sum.y += sh.y;
+    sum.z += sh.z;
+    sum.w += sh.w;
+    return sum;
+}
+__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_cmb_kernel(GrMulti m) {
+    __shared__ float part[WARPS];
+    __shared__ float s_rs;
+    const FusedGrArgs& a = m.a[blockIdx.x];
+    const int c = blockIdx.y;
+    float* xn = m.xn + (size_t) blockIdx.x * D;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    constexpr int KS = 3;
+    int k0 = (c * N - 4 * t + THREADS * 4 - 1) / (THREADS * 4);
+    if (k0 < 0) k0 = 0;
+    float4 r[KS], g[KS];
+    bool ok[KS];
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        const int i = t * 4 + (k0 + j) * THREADS * 4;
+        ok[j] = i < (c + 1) * N;
+        if (ok[j]) {
+            r[j] = *reinterpret_cast<const float4*>(a.R + i);
+            g[j] = *reinterpret_cast<const float4*>(a.w_norm + i);
+            if (a.apply) {
+                const float4 b = gr_cmb_k10(a, i - c * N);
+                if (c == 0) *reinterpret_cast<float4*>(const_cast<float*>(a.bo_prev) + (i - c * N)) = b;
+                r[j].x = fmaf(b.x, gw, r[j].x); r[j].y = fmaf(b.y, gw, r[j].y);
+                r[j].z = fmaf(b.z, gw, r[j].z); r[j].w = fmaf(b.w, gw, r[j].w);
+            }
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int j = 0; j < KS; ++j) {
+        if (ok[j]) {
+            const float sq = r[j].x * r[j].x + r[j].y * r[j].y + r[j].z * r[j].z + r[j].w * r[j].w;
+            ss += sq;
+            r[j] = make_float4(r[j].x * g[j].x, r[j].y * g[j].y, r[j].z * g[j].z, r[j].w * g[j].w);
+        }
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    __syncthreads();
+    if (t == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < WARPS; ++w) s += part[w];
+        s_rs = rsqrtf(s / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    __syncthreads();
+    const float rs = s_rs;
+#pragma unroll
+    for (int j = 0; j < KS; ++j)
+        if (ok[j])
+            *reinterpret_cast<float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
+                make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
+}
+
+// the same combine as its own launch (a read whose norm is not the one above): token blockIdx.y
+__global__ void gr_cmb_kernel(GrMulti m) {
+    const int c4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c4 >= N / 4) return;
+    const FusedGrArgs& a = m.a[blockIdx.y];
+    *reinterpret_cast<float4*>(const_cast<float*>(a.bo_prev) + c4 * 4) = gr_cmb_k10(a, c4 * 4);
+}
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)
 #define STRATA_GR_CP_ASYNC 1
 #endif
@@ -1404,13 +1493,15 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     // they replace (gr_parity checks the multi-token read against single-token calls bitwise)
     const bool fast = gr_fast();
     if (variant >= kHcSplit) {
-        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        if (norm_fast_on() && m.a[0].cmb_parts != nullptr) gr_norm_split_fast_cmb_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        else if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
         else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
     } else if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
     else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #else
     if (variant >= kHcSplit) {
-        if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        if (norm_fast_on() && m.a[0].cmb_parts != nullptr) gr_norm_split_fast_cmb_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
+        else if (norm_fast_on()) gr_norm_split_fast_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
         else gr_norm_split_kernel<<<dim3((unsigned) n_tok, HC), THREADS, 0, st>>>(m);
     } else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
 #endif
@@ -2400,6 +2491,17 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             std::exit(1);
         }
     }
+    // STRATA_NODE_FUSE: the previous layer's combine made by the read (every token, or none)
+    const bool cmb = a[0].cmb_parts != nullptr;
+    for (int t = 0; t < n_tok; ++t) {
+        const FusedGrArgs& x = a[t];
+        if ((x.cmb_parts != nullptr) != cmb ||
+            (cmb && (!x.apply || !x.cmb_w || !x.cmb_shared ||
+                     (((uintptr_t) x.cmb_parts | (uintptr_t) x.cmb_shared | (uintptr_t) x.bo_prev) & 15u) != 0))) {
+            std::fprintf(stderr, "fused_gr_read_multi: invalid combine arguments for token %d\n", t);
+            std::exit(1);
+        }
+    }
     // S26 STRATA_QFUSE: every token needs its q8_1 destination and token 0 the counters; otherwise none is written
     bool q8 = a[0].q8_cnt != nullptr;
     for (int t = 0; t < n_tok; ++t) q8 = q8 && a[t].q8_mixed != nullptr;
@@ -2408,7 +2510,15 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
+    // a read whose norm does not make the combine: the combine's own launch first, then the read as without it
+    const auto cmb_alone = [&] {
+        if (m.a[0].cmb_parts == nullptr) return;
+        gr_cmb_kernel<<<dim3((unsigned) ((N / 4 + 127) / 128), (unsigned) n_tok), 128, 0, st>>>(m);
+        for (int t = 0; t < n_tok; ++t) m.a[t].cmb_parts = m.a[t].cmb_w = m.a[t].cmb_shared = nullptr;
+    };
+    if (cmb && !(fused_gr_variant() >= kHcSplit && norm_fast_on())) cmb_alone();
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
+        cmb_alone();
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
         const cudaError_t eq = cudaGetLastError();
         if (eq != cudaSuccess) {
@@ -2454,6 +2564,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
     const int split = v3 && dev3 >= 0 && dev3 < 64 && a[0].s_down == nullptr && a[0].s_up == nullptr ? split3[dev3] : -1;
     if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
+        cmb_alone();
         float* part = xn_scratch;
         float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2
         const size_t sm = (size_t) n_tok * (N / split) * sizeof(float);
@@ -2489,6 +2600,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // contract); off by default for that reason.
     static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
     if (split_on && a[0].s_down == nullptr) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
+        cmb_alone();
         const bool fast = gr_fast();
         if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
         else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
@@ -3214,6 +3326,7 @@ bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
     const hcp::DevState& st = hcp::g_dev[dev];
     if (n_tok > st.max_t) return false;
     if (a[0].q8_down != nullptr || a[0].q8_up != nullptr) return false;    // STRATA_HC_Q8: the default read
+    if (a[0].cmb_parts != nullptr) return false;   // STRATA_NODE_FUSE's combine: the default read makes it
     for (int t = 0; t < n_tok; ++t)
         if (a[t].q8_mixed != nullptr) return false;                         // STRATA_QFUSE: the default read
     hcp::launch(a, n_tok, st, (cudaStream_t) stream, hcp::kTicksRun);

@@ -128,6 +128,23 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
     append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
                      theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
 }
+// STRATA_NODE_FUSE: the window's snapshot of the tail (copy_from_mapped's float4 copy of the same floats) made by the
+// append itself before it changes the tail
+template <bool TAB>
+__global__ void append_snap(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
+                            int pos_stride, int n_steps,
+                            int pos_base, const float* __restrict__ gamma, float epsilon,
+                            float* __restrict__ tail, float* __restrict__ dead,
+                            float* __restrict__ pooled, int32_t* __restrict__ block_pos,
+                            int max_cells, float theta_scale, float freq_scale, float corr_low,
+                            float corr_high, float ext_factor, float mscale,
+                            const int32_t* __restrict__ mtab, RopeTab rt, float4* __restrict__ snap) {
+    const float4* t4 = reinterpret_cast<const float4*>(tail);
+    for (int j = threadIdx.x; j < (R - 1) * D / 4; j += blockDim.x) snap[j] = t4[j];
+    __syncthreads();
+    append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
+                     theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+}
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
 template <bool TAB>
@@ -270,7 +287,18 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
                                      int pos_stride, int n_steps, int32_t pos_base,
                                      const float* gamma, float epsilon, const QsaIndexerBuffers& b,
                                      const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
-    if (n_steps <= 0) return;
+    native_qsa_indexer_append_steps_snap(raw, relative_pos_device, pos_stride, n_steps, pos_base, gamma, epsilon, b, s,
+                                         max_cells, scaling, stream, nullptr);
+}
+void native_qsa_indexer_append_steps_snap(const float* raw, const int32_t* relative_pos_device,
+                                          int pos_stride, int n_steps, int32_t pos_base,
+                                          const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                                          const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream,
+                                          float* snap) {
+    if (n_steps <= 0) {
+        if (snap != nullptr) throw std::invalid_argument("native QSA indexer: a snapshot needs an append");
+        return;
+    }
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
         int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
@@ -285,6 +313,19 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
+    if (snap != nullptr) {
+        if (reinterpret_cast<std::uintptr_t>(snap) % 16 || reinterpret_cast<std::uintptr_t>(b.tail) % 16 ||
+            overlaps({snap, (R - 1) * D * 4}, {b.tail, (R - 1) * D * 4}))
+            throw std::invalid_argument("native QSA indexer: the snapshot must be aligned and apart from the tail");
+        if (rt.cos != nullptr)
+            append_snap<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt,reinterpret_cast<float4*>(snap));
+        else
+            append_snap<false><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
+                b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt,reinterpret_cast<float4*>(snap));
+    } else
     if (rt.cos != nullptr)
         append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
