@@ -3322,6 +3322,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                     }
                 }
+                // STRATA_HC_UPMIX16=1 (opt-in, HIP gfx103x, the FP16 prompt path; FP16-rounding-level differences): the
+                // up projection with the mix as its epilogue (gr_upmix16): `gated` is not written, nor read back
+                static const bool hc_upmix16 = [] { const char* e = std::getenv("STRATA_HC_UPMIX16"); return e && e[0] == '1'; }();
+                if (!upmixed && hc_upmix16 && m.f16_io && T >= pf_switch_min_t() && wu->q8_scale == nullptr && !gr_unfused() && !m.lo16_lo &&
+                    !m.mixed_bf_lo && wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D)
+                    upmixed = gr_upmix16(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
+                                         m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                 // STRATA_HC_GATED16=1 (opt-in, HIP FP16 prompt path, the same bits): the up projection's output stays
                 // FP16 and gr_mix_r widens it as it reads - T x 10240 values are not widened in place and read back
                 static const bool hc_gated16 = [] { const char* e = std::getenv("STRATA_HC_GATED16"); return e && e[0] == '1'; }();

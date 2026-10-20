@@ -31,6 +31,11 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 /// epilogue - `gated` is never written.  gfx11 and CUDA sm_80+; false (nothing launched) elsewhere.
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
+/// STRATA_HC_UPMIX16 (opt-in, HIP gfx103x devices, the FP16 prompt path): gr_upmix with lo16 FP16 - the up projection
+/// on v_dot2 with gr_mix_r as its epilogue, each sum rounded to FP16 as the FP16-out GEMM stores it.  False (nothing
+/// launched) on other devices.
+bool gr_upmix16(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+                float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
                       int64_t ldx = 0, bool f16img = false);

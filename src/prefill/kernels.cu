@@ -316,6 +316,138 @@ __global__ void gr_silu_inj_sk_kernel(const float* __restrict__ P, int S, uint16
     if (k < HC) inj[t * HC + k] = at(LR + k);
 }
 #endif
+#if defined(__HIPCC__)
+// STRATA_HC_UPMIX16 (opt-in; written for and measured on gfx1030, the FP16 prompt path): the hyper-connection up
+// projection (lo16 FP16 [T, 320] . w_up BF16 [10240, 320]^T) on v_dot2_f32_f16 with gr_mix_r as its epilogue, so the
+// T x 10240 `gated` image is neither written nor read back.  A workgroup takes 128 tokens and 32 outputs d of each
+// of the 4 streams (128 rows of w_up: c * 2560 + d); a thread sums 8 tokens x 8 rows, which are 2 outputs d with
+// their 4 streams each, so it finishes gr_mix_r for them itself.  Each sum is rounded to FP16 as the FP16-out GEMM
+// stores it, then gr_mix_r_kernel's arithmetic follows in its order: the same bits wherever the FP32 sum rounds to
+// the same FP16 value.  The BF16 weight is converted per value as bf16_to_f16_rows does.
+typedef _Float16 um_h2 __attribute__((ext_vector_type(2)));
+typedef _Float16 um_h4 __attribute__((ext_vector_type(4)));
+typedef _Float16 um_h8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ _Float16 um_bf_to_h(uint32_t b16) {
+    const float f = __uint_as_float(b16 << 16);
+    return __builtin_bit_cast(_Float16, __half_as_ushort(__float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f))));
+}
+__device__ __forceinline__ float um_dot2(um_h2 a, um_h2 b, float c) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+#else   // other targets only so the file builds; gr_upmix16 runs on gfx103x devices alone
+    return fmaf((float) a[1], (float) b[1], fmaf((float) a[0], (float) b[0], c));
+#endif
+}
+constexpr int UM16_BM = 128, UM16_BD = 32, UM16_BN = 4 * UM16_BD, UM16_BK = 64, UM16_LD = UM16_BK + 4;
+__global__ __launch_bounds__(256) void gr_upmix16_kernel(const uint16_t* __restrict__ lo16,
+                                                         const uint16_t* __restrict__ w_up, const float* __restrict__ R,
+                                                         const float* __restrict__ rs, const float* __restrict__ w,
+                                                         float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                                         uint16_t* __restrict__ mixed_h, int64_t T) {
+    constexpr int TM = 8, TN = 8, GM = UM16_BM / TM, GN = UM16_BN / TN, C8 = UM16_BK / 8;   // 16 x 16 threads
+    constexpr int NA = UM16_BM * C8 / 256, NB = UM16_BN * C8 / 256;
+    __shared__ __attribute__((aligned(16))) _Float16 As[UM16_BM * UM16_LD];
+    __shared__ __attribute__((aligned(16))) _Float16 Bs[UM16_BN * UM16_LD];
+    const int tid = (int) threadIdx.x, tn = tid % GN, tm = tid / GN;
+    const int d0 = (int) blockIdx.x * UM16_BD;
+    const int64_t m0 = (int64_t) blockIdx.y * UM16_BM;
+    const _Float16* X = reinterpret_cast<const _Float16*>(lo16);
+    um_h8 ra[NA];
+    uint4 rb[NB];
+    auto gload = [&](int k0) {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * 256, row = c / C8, col = (c % C8) * 8;
+            um_h8 v = {};
+            if (m0 + row < T) v = *(const um_h8*) (X + (m0 + row) * LR + k0 + col);
+            ra[q] = v;
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {   // tile row n: stream n / 32, output d0 + n % 32
+            const int c = tid + q * 256, row = c / C8, col = (c % C8) * 8;
+            const int64_t wr = (int64_t) (row / UM16_BD) * N + d0 + row % UM16_BD;
+            rb[q] = *(const uint4*) (w_up + wr * LR + k0 + col);
+        }
+    };
+    auto st8 = [](_Float16* p, um_h8 v) {   // rows of 68 halves: 8-byte aligned
+        *(um_h4*) p = um_h4{v[0], v[1], v[2], v[3]};
+        *(um_h4*) (p + 4) = um_h4{v[4], v[5], v[6], v[7]};
+    };
+    auto sstore = [&]() {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * 256, row = c / C8, col = (c % C8) * 8;
+            st8(As + row * UM16_LD + col, ra[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {
+            const int c = tid + q * 256, row = c / C8, col = (c % C8) * 8;
+            const uint32_t wv[4] = {rb[q].x, rb[q].y, rb[q].z, rb[q].w};
+            um_h8 h;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                h[2 * e] = um_bf_to_h(wv[e] & 0xffffu);
+                h[2 * e + 1] = um_bf_to_h(wv[e] >> 16);
+            }
+            st8(Bs + row * UM16_LD + col, h);
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+    constexpr int nk = LR / UM16_BK;
+    gload(0);
+    for (int kt = 0; kt < nk; ++kt) {
+        __syncthreads();
+        sstore();
+        __syncthreads();
+        if (kt + 1 < nk) gload((kt + 1) * UM16_BK);
+#pragma unroll
+        for (int kk = 0; kk < UM16_BK / 4; ++kk) {
+            um_h4 a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a[i] = *(const um_h4*) (As + (tm + i * GM) * UM16_LD + kk * 4);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b[j] = *(const um_h4*) (Bs + (tn + j * GN) * UM16_LD + kk * 4);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    float sum = acc[i][j];
+                    sum = um_dot2(um_h2{a[i][0], a[i][1]}, um_h2{b[j][0], b[j][1]}, sum);
+                    sum = um_dot2(um_h2{a[i][2], a[i][3]}, um_h2{b[j][2], b[j][3]}, sum);
+                    acc[i][j] = sum;
+                }
+        }
+    }
+    // column j = 2c + h of this thread is tile row tn + 16 j: stream c = j / 2, output d0 + tn + 16 (j % 2)
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int64_t t = m0 + tm + i * GM;
+        if (t >= T) continue;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int d = d0 + tn + 16 * h;
+            float s = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                const int64_t jj = t * D + c * N + d;
+                const float x = R[jj] * rs[t * HC + c] * w[c * N + d];   // gr_mix_r_kernel's value, bit for bit
+                const float gv = __half2float(__float2half(acc[i][2 * c + h]));   // the FP16-out GEMM's output
+                s = fmaf(x, sigm(gv), s);
+            }
+            s /= (float) HC;
+            const int64_t o = t * N + d;
+            mixed[o] = s;
+            if (mixed16) mixed16[o] = act16(s);
+            if (mixed_h) mixed_h[o] = hf(s);
+        }
+    }
+}
+#endif
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
                               uint16_t* __restrict__ mixed16_lo) {
@@ -2616,6 +2748,28 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo, gated_f16 ? 1 : 0);
     check("gr_mix_r");
+}
+bool gr_upmix16(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+                float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
+#if defined(__HIPCC__)
+    static int arch[64] = {};   // per device: 0 not asked yet, 1 gfx103x, 2 another
+    int dev = 0;
+    if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
+    if (arch[dev] == 0) {
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        arch[dev] = std::strncmp(p.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
+    }
+    if (arch[dev] != 1 || (((uintptr_t) lo16 | (uintptr_t) w_up) & 15) != 0) return false;
+    gr_upmix16_kernel<<<dim3(N / UM16_BD, (unsigned) ((T + UM16_BM - 1) / UM16_BM)), 256, 0, (cudaStream_t) stream>>>(
+        lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
+    check("gr_upmix16");
+    return true;
+#else
+    (void) lo16; (void) w_up; (void) R; (void) rs; (void) w_norm; (void) mixed; (void) mixed16; (void) mixed_h; (void) T;
+    (void) stream;
+    return false;
+#endif
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
