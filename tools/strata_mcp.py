@@ -66,9 +66,6 @@ FALLBACK_MODELS = {
                            "less than ~80 GB of RAM part of its experts are read from the SSD",
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "vision": True},
-    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
-                      "RAM so far", "download_gb": 100.6,
-             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic): K-quant experts, between UD-IQ4_XS and UD-Q5_K_XL in quality",
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
                    "vision": True},                       # #967: images allowed (setup warns: untested with this file)
@@ -100,6 +97,9 @@ FALLBACK_MODELS = {
     "NVFP4-QAD": {"about": "NVIDIA's FP4, trained for FP4 - slightly faster on short prompts; a 102 GB download "
                            "that this PC turns into a Strata pack once; it reads pictures",
                   "download_gb": 102.2, "ram_gb": 80, "arena_gb": 68.0, "families": ("nvfp4",), "vision": True},
+    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
+                      "RAM so far", "download_gb": 100.6,
+             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -112,6 +112,13 @@ FALLBACK_FAMILIES = {
                                                                   "~80 GB (UD-IQ4_XS) to ~136 GB (Q8_0) of RAM, else "
                                                                   "part of them read from the SSD",
                 "tag": "unsloth-", "vision": True},
+    "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest "
+                                                              "sizes, for PCs with little memory; 58 and 92 GB "
+                                                              "downloads (the files include the n-gram table)",
+             "tag": "gyro-"},
+    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, "
+                                                              "~80 GB of RAM to keep every expert in RAM",
+              "tag": "nvfp4-"},
     # the community builds (setup.py's FAMILIES says where each comes from)
     "bartowski-swift": {"title": "Swift 1.5 (bartowski)", "about": "Q4_0: a 101 GB download with 68 GB of experts; "
                                                                    "run with 92 GB of RAM so far",
@@ -122,13 +129,6 @@ FALLBACK_FAMILIES = {
     "sc117-swift-abl": {"title": "Swift 1.5 abliterated (SC117)", "about": "Swift 1.5 with its refusals removed by "
                                                                            "SC117; IQ3_XXS only",
                         "tag": "sc117-swift-abl-"},
-    "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest "
-                                                              "sizes, for PCs with little memory; 58 and 92 GB "
-                                                              "downloads (the files include the n-gram table)",
-             "tag": "gyro-"},
-    "nvfp4": {"title": "Qwen3.8-Flash-Next (NVFP4)", "about": "4-bit NVFP4 experts, NVIDIA cards; a 128 GB download, "
-                                                              "~80 GB of RAM to keep every expert in RAM",
-              "tag": "nvfp4-"},
 }
 OWN_PATH_ENGINE = (0, 1, 45)   # the first engine that runs Qwen3.6-35B-A3B with pictures and parallel requests (setup.py MIN_ENGINE note)
 MEMORY_TIERS = ((62.0, "qwen", "IQ3_S"), (46.0, "qwen", "IQ3_XXS"), (38.0, "swift", "IQ2_XS"))   # as setup.py's: RAM + VRAM floors of the owner's 64 / 48 / 40 GB tiers

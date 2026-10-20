@@ -424,14 +424,6 @@ MODELS = {
                   "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
                   "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "engine": (0, 1, 38),
                   "vision": True},
-    # A community build: bartowski's Q4_0 of Swift 1.5 (llama.cpp's plain 4-bit; Q4_0 gate/up experts, Q4_1 downs in
-    # six layers), three shards.  download_gb: the Hub's sizes (100,599,253,536 bytes); arena_gb: the pack tool's
-    # total (68,262,297,600 bytes of experts).  ram_gb is an ESTIMATE: IQ3_S's room beside its experts (11.7 GB),
-    # not measured - it has run on one PC only (2x Radeon PRO V620, 92 GB of RAM, AMD/HIP), with all of its experts
-    # in RAM; the low-RAM mode and NVIDIA cards are untested with this file
-    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
-                      "RAM so far", "download_gb": 100.6,
-             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
     # Unsloth's 4-bit file (docs/UNSLOTH_Q4.md); experimental until MODEL-UPDATE Phase 2.  Its 77 GB of experts stay in
     # RAM from ~94 GB of RAM (unsloth_budget); on a 64 GB PC the engine keeps a RAM budget of them
     # (--resident-budget-gib, chosen below) and reads the rest from the GGUF on the SSD.  It runs on AMD too (R9700:
@@ -497,6 +489,15 @@ MODELS = {
                   "license": "NVIDIA Open Model Agreement (Licensed by NVIDIA Corporation under the NVIDIA Open Model "
                              "Agreement) with Qwen3.8-Flash-Next's Qwen Community License 1.0: "
                              "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-FP4-Local"},
+    # (last: the community builds follow the sizes above in the menu, FAMILIES below)
+    # A community build: bartowski's Q4_0 of Swift 1.5 (llama.cpp's plain 4-bit; Q4_0 gate/up experts, Q4_1 downs in
+    # six layers), three shards.  download_gb: the Hub's sizes (100,599,253,536 bytes); arena_gb: the pack tool's
+    # total (68,262,297,600 bytes of experts).  ram_gb is an ESTIMATE: IQ3_S's room beside its experts (11.7 GB),
+    # not measured - it has run on one PC only (2x Radeon PRO V620, 92 GB of RAM, AMD/HIP), with all of its experts
+    # in RAM; the low-RAM mode and NVIDIA cards are untested with this file
+    "Q4_0": {"about": "4-bit (llama.cpp Q4_0), a community build by bartowski; run on one AMD PC with 92 GB of "
+                      "RAM so far", "download_gb": 100.6,
+             "ram_gb": 80, "arena_gb": 68.3, "families": ("bartowski-swift",)},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (setup trusts no other model file by name and size alone either: check_shards reads their directories).
@@ -729,6 +730,20 @@ REPO_PINS = {
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": QWEN36_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
+    # the community builds: their shards (COMMUNITY_SHARDS) and image encoders (sizes and SHA-256: the Hub's LFS
+    # pointers at the pinned revisions, read 2026-10-20; SC117's two encoders are the same file)
+    "bartowski/ukisai_Swift-Qwen3.8-Flash-Next-GGUF": {
+        **{n: v for n, v in COMMUNITY_SHARDS.items() if n.startswith("ukisai_Swift-")},
+        "mmproj-ukisai_Swift-Qwen3.8-Flash-Next-f16.gguf":
+            (904004608, "d0edbe65317cd956d75c696b7c6ab65d55cad6401f8867bfe75e58c137e60171")},
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        **{n: v for n, v in COMMUNITY_SHARDS.items() if n.startswith("Qwen3.8-Flash-Next-GSQ-RCO-abliterated-")},
+        "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
+            (907542944, "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355")},
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        **{n: v for n, v in COMMUNITY_SHARDS.items() if n.startswith("Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-")},
+        "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
+            (907542944, "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355")},
 }
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 ESP_VECTOR = ROOT / "data" / "experimental-speed-projection" / "Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
