@@ -3262,8 +3262,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // On a Radeon PRO V620 the N 324 product takes what N 320 takes (0.72 ms at 2048 tokens) and the N 4
                 // one 0.19 ms more.  The output goes through `gated` (free until the up projection writes it).
                 static const bool hc_downinj = [] { const char* e = std::getenv("STRATA_HC_DOWNINJ"); return e && e[0] == '1'; }();
+                // STRATA_HC_DOWNSK=<S> (opt-in, HIP gfx103x, the FP16 prompt path; FP16-rounding-level differences):
+                // that [down; inject] product as Gemm::hc_down_sk's split-K kernel, K in S parts (S divides 10240 into
+                // 64-value steps: 1, 2, 4, 5, 8, 10, 16, 20; 8 measured best), the parts' FP32 sums in `gated` (S x 324
+                // of its 10240 floats a row) and added by gr_silu_inj_sk.  Where the kernel does not run, it falls back
+                // to STRATA_HC_DOWNINJ's product.
+                static const int hc_downsk = [] {
+                    const char* e = std::getenv("STRATA_HC_DOWNSK");
+                    const int s = e ? std::atoi(e) : 0;
+                    return s >= 1 && s <= 31 ? s : 0;
+                }();
                 bool downinj = false;
-                if (hc_downinj && m.f16_io && !xf16 && !hcd && !hdown && ldx == D && !m.xn16_lo && !m.lo16_lo &&
+                if (hc_downsk > 0 && m.f16_io && !xf16 && !hcd && !hdown && ldx == D && !m.xn16_lo && !m.lo16_lo &&
+                    wd->q8_scale == nullptr && wi->q8_scale == nullptr && wd->kind == core::WeightKind::Bf16InF32 &&
+                    wi->kind == core::WeightKind::Bf16InF32 && wd->data && wi->data && wd->ne0 == D && wd->ne1 == LR &&
+                    wi->ne0 == D && wi->ne1 == HC &&
+                    m.gemm.hc_down_sk(m.xn16, (const uint16_t*) wd->data, LR, (const uint16_t*) wi->data, HC, m.gated,
+                                      T, D, hc_downsk)) {
+                    gr_silu_inj_sk(m.gated, hc_downsk, m.lo16, m.inj, T, m.cs);
+                    downinj = true;
+                }
+                if (!downinj && (hc_downinj || hc_downsk > 0) && m.f16_io && !xf16 && !hcd && !hdown && ldx == D && !m.xn16_lo && !m.lo16_lo &&
                     wd->q8_scale == nullptr && wi->q8_scale == nullptr && wd->kind == core::WeightKind::Bf16InF32 &&
                     wi->kind == core::WeightKind::Bf16InF32 && wd->data && wi->data && wd->ne0 == D && wd->ne1 == LR &&
                     wi->ne0 == D && wi->ne1 == HC) {

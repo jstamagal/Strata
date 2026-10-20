@@ -44,6 +44,10 @@ void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t 
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
 /// STRATA_HC_DOWNINJ: gr_silu over lo[t, 0..320) of rows with stride `ld` (>= 324), and inj[t, c] = lo[t, 320 + c].
 void gr_silu_inj(const float* lo, int64_t ld, uint16_t* lo16, float* inj, int64_t T, void* stream);
+/// STRATA_HC_DOWNSK: gr_silu_inj over the S split-K parts of Gemm::hc_down_sk (P[s][T][324], dense): each output is
+/// the parts added in order s = 0 .. S-1, rounded to FP16 as the FP16-out GEMM rounds its outputs, then as gr_silu_inj.
+/// HIP only (a no-op elsewhere: hc_down_sk never runs there).
+void gr_silu_inj_sk(const float* P, int S, uint16_t* lo16, float* inj, int64_t T, void* stream);
 /// The BF16-weight GEMMs' activation image (gr_* kernels, to_bf16) in FP16 instead of BF16, on the current device.
 void set_act_f16(bool on);
 /// STRATA_F16_RANGE: count what the activation images convert to FP16 on this device (hf_sat): the largest |value| and

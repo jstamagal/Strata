@@ -295,6 +295,27 @@ __global__ void gr_silu_inj_kernel(const float* __restrict__ lo, int64_t ld, uin
     lo16[i] = act16(v);
     if (k < HC) inj[t * HC + k] = lo[t * ld + LR + k];
 }
+#if defined(__HIPCC__)
+// STRATA_HC_DOWNSK: gr_silu_inj_kernel over the S split-K parts of the [down; inject] product (P[s][T][LR + HC]); each
+// value is the parts added in s order and rounded to FP16 (what the FP16-out GEMM stores, widened back exactly)
+__global__ void gr_silu_inj_sk_kernel(const float* __restrict__ P, int S, uint16_t* __restrict__ lo16,
+                                      float* __restrict__ inj, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * LR) return;
+    constexpr int64_t ld = LR + HC;
+    const int64_t t = i / LR, k = i % LR, part = T * ld;
+    auto at = [&](int64_t c) {
+        const float* q = P + t * ld + c;
+        float s = q[0];
+        for (int j = 1; j < S; ++j) s += q[j * part];
+        return __half2float(__float2half(s));
+    };
+    const float x = at(k) / (float) HC;
+    const float v = x / (1.0f + __expf(-x));
+    lo16[i] = act16(v);
+    if (k < HC) inj[t * HC + k] = at(LR + k);
+}
+#endif
 __global__ void gr_mix_kernel(const float* __restrict__ xn, const float* __restrict__ g, float* __restrict__ mixed,
                               uint16_t* __restrict__ mixed16, int64_t T, uint16_t* __restrict__ mixed_h,
                               uint16_t* __restrict__ mixed16_lo) {
@@ -2648,6 +2669,14 @@ void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t*
 void gr_silu_inj(const float* lo, int64_t ld, uint16_t* lo16, float* inj, int64_t T, void* stream) {
     gr_silu_inj_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(lo, ld, lo16, inj, T);
     check("gr_silu_inj");
+}
+void gr_silu_inj_sk(const float* P, int S, uint16_t* lo16, float* inj, int64_t T, void* stream) {
+#if defined(__HIPCC__)
+    gr_silu_inj_sk_kernel<<<blocks_for(T * LR), 256, 0, (cudaStream_t) stream>>>(P, S, lo16, inj, T);
+    check("gr_silu_inj_sk");
+#else
+    (void) P; (void) S; (void) lo16; (void) inj; (void) T; (void) stream;
+#endif
 }
 void gr_mix(const float* xn, const float* gated, float* mixed, uint16_t* mixed16, int64_t T, void* stream,
             uint16_t* mixed_h, uint16_t* mixed16_lo) {

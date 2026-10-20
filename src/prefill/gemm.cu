@@ -1144,6 +1144,173 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
 }
 
+#if defined(__HIPCC__)
+// ---- STRATA_HC_DOWNSK (opt-in; written for and measured on gfx1030): the hyper-connection [down; inject] product
+// (N 320 + 4, K 10240) as a split-K FP16 GEMM on v_dot2_f32_f16.  rocBLAS's best kernel for this shape runs it at
+// 17 TFLOP/s on a Radeon PRO V620: at 2048 tokens its 128-wide tiles make about 48 workgroups for 72 compute units, so
+// most of the card waits.  Here K is cut in S parts (blockIdx.z), each workgroup sums its part of K for a BM x BN tile
+// in FP32 and writes the partial sums; gr_silu_inj_sk adds the S parts in order.  The BF16 weights are read as they
+// are and converted per value in the kernel exactly as bf16_to_f16_rows does (no conversion pass, no FP16 copy).
+// Every output is one fixed sequence of FP32 operations: the same bits run to run.
+namespace {
+typedef _Float16 hcd_h2 __attribute__((ext_vector_type(2)));
+typedef _Float16 hcd_h4 __attribute__((ext_vector_type(4)));
+typedef _Float16 hcd_h8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ _Float16 hcd_bf_to_h(uint32_t b16) {   // bf16_to_f16_rows's conversion of one value
+    const float f = __uint_as_float(b16 << 16);
+    return __builtin_bit_cast(_Float16, __half_as_ushort(__float2half(isnan(f) ? f : fminf(fmaxf(f, -65504.0f), 65504.0f))));
+}
+__device__ __forceinline__ float hcd_dot2(hcd_h2 a, hcd_h2 b, float c) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+#else   // compiled for other targets only so the file builds; Gemm::hc_down_sk runs on gfx103x devices alone
+    return fmaf((float) a[1], (float) b[1], fmaf((float) a[0], (float) b[0], c));
+#endif
+}
+// One BM x BN tile of P[z] = X[:, z Ks .. (z+1) Ks) . [W1; W2][:, same]^T.  A thread holds TM x TN sums: rows
+// tm + i GM, columns tn + j GN (interleaved).  Both tiles sit in LDS as rows of BK + 4 halves (an 8-byte read of 16
+// consecutive rows then falls on 16 distinct bank pairs); the inner loop reads 4 values of each row at a time.  The
+// next K step's tiles are loaded into registers while this one is summed.
+template <int BM, int BN, int TM, int TN, int BK>
+__global__ __launch_bounds__((BM / TM) * (BN / TN)) void hcd_sk_kernel(
+        const _Float16* __restrict__ X, const uint16_t* __restrict__ W1, int N1, const uint16_t* __restrict__ W2,
+        int N2, float* __restrict__ P, int T, int K, int Ks) {
+    constexpr int GM = BM / TM, GN = BN / TN, NT = GM * GN, LD = BK + 4, C8 = BK / 8;
+    constexpr int NA = (BM * C8 + NT - 1) / NT, NB = (BN * C8 + NT - 1) / NT;
+    __shared__ __attribute__((aligned(16))) _Float16 As[BM * LD];
+    __shared__ __attribute__((aligned(16))) _Float16 Bs[BN * LD];
+    const int tid = (int) threadIdx.x, tn = tid % GN, tm = tid / GN;
+    const int n0 = (int) blockIdx.x * BN, m0 = (int) blockIdx.y * BM, kb = (int) blockIdx.z * Ks, N = N1 + N2;
+    hcd_h8 ra[NA];
+    uint4 rb[NB];
+    auto gload = [&](int k0) {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            hcd_h8 v = {};
+            if ((NA * NT == BM * C8 || c < BM * C8) && m0 + row < T) v = *(const hcd_h8*) (X + (int64_t) (m0 + row) * K + k0 + col);
+            ra[q] = v;
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8, n = n0 + row;
+            uint4 v = make_uint4(0, 0, 0, 0);
+            if (NB * NT == BN * C8 || c < BN * C8) {
+                if (n < N1) v = *(const uint4*) (W1 + (int64_t) n * K + k0 + col);
+                else if (n < N) v = *(const uint4*) (W2 + (int64_t) (n - N1) * K + k0 + col);
+            }
+            rb[q] = v;
+        }
+    };
+    auto st8 = [](_Float16* p, hcd_h8 v) {   // rows of BK + 4 halves: 8-byte aligned
+        *(hcd_h4*) p = hcd_h4{v[0], v[1], v[2], v[3]};
+        *(hcd_h4*) (p + 4) = hcd_h4{v[4], v[5], v[6], v[7]};
+    };
+    auto sstore = [&]() {
+#pragma unroll
+        for (int q = 0; q < NA; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            if (NA * NT == BM * C8 || c < BM * C8) st8(As + row * LD + col, ra[q]);
+        }
+#pragma unroll
+        for (int q = 0; q < NB; ++q) {
+            const int c = tid + q * NT, row = c / C8, col = (c % C8) * 8;
+            if (NB * NT == BN * C8 || c < BN * C8) {
+                const uint32_t w[4] = {rb[q].x, rb[q].y, rb[q].z, rb[q].w};
+                hcd_h8 h;
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    h[2 * e] = hcd_bf_to_h(w[e] & 0xffffu);
+                    h[2 * e + 1] = hcd_bf_to_h(w[e] >> 16);
+                }
+                st8(Bs + row * LD + col, h);
+            }
+        }
+    };
+    float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+    const int nk = Ks / BK;
+    gload(kb);
+    for (int kt = 0; kt < nk; ++kt) {
+        __syncthreads();
+        sstore();
+        __syncthreads();
+        if (kt + 1 < nk) gload(kb + (kt + 1) * BK);
+#pragma unroll
+        for (int kk = 0; kk < BK / 4; ++kk) {
+            hcd_h4 a[TM], b[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a[i] = *(const hcd_h4*) (As + (tm + i * GM) * LD + kk * 4);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b[j] = *(const hcd_h4*) (Bs + (tn + j * GN) * LD + kk * 4);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    float s = acc[i][j];
+                    s = hcd_dot2(hcd_h2{a[i][0], a[i][1]}, hcd_h2{b[j][0], b[j][1]}, s);
+                    s = hcd_dot2(hcd_h2{a[i][2], a[i][3]}, hcd_h2{b[j][2], b[j][3]}, s);
+                    acc[i][j] = s;
+                }
+        }
+    }
+    float* p = P + (int64_t) blockIdx.z * T * N;
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int m = m0 + tm + i * GM;
+        if (m >= T) continue;
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + tn + j * GN;
+            if (n < N) p[(int64_t) m * N + n] = acc[i][j];
+        }
+    }
+}
+// 128 tokens x 112 outputs per workgroup of 128 threads (16 x 7 sums each), K in steps of 64.  Of the shapes tried on
+// a PRO V620 at 2048 tokens, K in 8 parts (0.53 ms) beat 128 x 112 with 8 x 7 sums (0.56-0.58), 64 x 112 (0.61),
+// 256 x 112 (0.60), 128 x 168 (0.68), 128 x 84 (0.70) and 16-byte LDS reads (0.58); padding the 20480-byte row
+// strides of X and W changed nothing (within 2%).
+constexpr int kHcdBM = 128, kHcdBN = 112, kHcdTM = 16, kHcdTN = 7, kHcdBK = 64;
+bool gfx103x_device() {
+    static std::atomic<int> arch[64] = {};   // per device: 0 not known, 1 gfx103x, 2 another architecture
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { (void) hipGetLastError(); return false; }
+    int v = arch[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+        v = std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 1 : 2;
+        arch[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+}  // namespace
+#endif
+
+bool Gemm::hc_down_sk(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* P,
+                      int64_t T, int64_t K, int S) {
+#if defined(__HIPCC__)
+    if (!f16_io_ || T <= 0 || N1 <= 0 || N2 < 0 || S < 1 || K % ((int64_t) S * kHcdBK) != 0 || T > INT_MAX / 2 ||
+        K > INT_MAX / 2 || N1 + N2 > 4096 || (((uintptr_t) X | (uintptr_t) W1 | (uintptr_t) W2) & 15) != 0 ||
+        !gfx103x_device())
+        return false;
+    tmark("other");
+    const dim3 grid((unsigned) ((N1 + N2 + kHcdBN - 1) / kHcdBN), (unsigned) ((T + kHcdBM - 1) / kHcdBM), (unsigned) S);
+    hcd_sk_kernel<kHcdBM, kHcdBN, kHcdTM, kHcdTN, kHcdBK>
+        <<<grid, (kHcdBM / kHcdTM) * (kHcdBN / kHcdTN), 0, (cudaStream_t) stream_>>>(
+            (const _Float16*) X, W1, (int) N1, W2, (int) N2, P, (int) T, (int) K, (int) (K / S));
+    tmark("gemm hcdsk", T, N1 + N2, K);
+    return true;
+#else
+    (void) X; (void) W1; (void) N1; (void) W2; (void) N2; (void) P; (void) T; (void) K; (void) S;
+    return false;
+#endif
+}
+
 bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* Y,
                      int64_t T, int64_t K, int64_t ldy) {
 #if defined(__HIPCC__)

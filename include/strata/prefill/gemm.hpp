@@ -48,6 +48,13 @@ public:
     bool bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* Y, int64_t T,
                    int64_t K, int64_t ldy);
 
+    /// STRATA_HC_DOWNSK (HIP, gfx103x devices, the FP16 path): the [W1; W2] product of bf16_pair with K split in S
+    /// parts - P[s][T][N1 + N2] (FP32, dense) = X[:, part s] . [W1; W2][:, part s]^T, X FP16 with row stride K, the
+    /// BF16 weights converted per value in the kernel as the FP16 path converts them.  The caller adds the S parts
+    /// (gr_silu_inj_sk).  False (nothing launched) on other devices or where S does not divide K into 64-value steps.
+    bool hc_down_sk(const uint16_t* X, const uint16_t* W1, int64_t N1, const uint16_t* W2, int64_t N2, float* P,
+                    int64_t T, int64_t K, int S);
+
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).
