@@ -1,7 +1,7 @@
 MTP draft-chain fusion on two Radeon PRO V620 cards.
 
 Measured on 2026-10-20. Both cards are gfx1030, wave32. ROCm 10.2.0, AMD Clang 24.0.0git (6da731510c23).
-Worktree: /home/ronald_rump/inbox/agents/strata-cx-mtp. Branch: cx/mtp-chain.
+Measured in a git worktree of branch cx/mtp-chain.
 Starting commit: e43d90f648620812a7e9ba17814424842428711d.
 
 The model was sc117-abl IQ3_S. Layer split 24, pipeline windows 2, spec 8, MTP depth cap 3, draft min-p 0.7.
@@ -135,7 +135,7 @@ fuse-2                                       | T0  166.5  105.6  104.7 pooled  1
 The probe commands were:
 
 ```sh
-cd /home/ronald_rump/inbox/agents/strata-cx-mtp
+cd "$W"   # the measuring worktree
 STRATA_VERIFY_NODES=1 flock /tmp/strata-gpu.lock timeout -k 10 -s INT 550 python3 tools/decode_probe.py cx/base.json base-1 --warm --out cx/probe
 STRATA_VERIFY_NODES=1 flock /tmp/strata-gpu.lock timeout -k 10 -s INT 550 python3 tools/decode_probe.py cx/fuse.json fuse-1 --warm --out cx/probe
 STRATA_VERIFY_NODES=1 flock /tmp/strata-gpu.lock timeout -k 10 -s INT 550 python3 tools/decode_probe.py cx/base.json base-2 --warm --out cx/probe
@@ -147,4 +147,4 @@ Packed heads, Q4 draft heads, resident-tail rerouting, coupled sampling and RoPE
 The supplied copy arm records no text hash. Its token and draft counts matched.
 A sustained speed gain, especially for greedy decode, needs more measurements. The launch reduction and the recorded parity checks are established for this box and configuration.
 
-Raw probe JSON and engine logs remain in cx/probe. Capture counts are in cx/node-counts.json. Parity output is in cx/parity-suite-expanded.log.
+Raw probe JSON and engine logs, capture counts and parity output stayed in the measuring worktree (cx/probe, cx/node-counts.json, cx/parity-suite-expanded.log); they are not part of this repository.
