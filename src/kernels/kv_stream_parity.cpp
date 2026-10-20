@@ -17,6 +17,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 
 #include <cuda_runtime.h>
 
@@ -120,7 +121,12 @@ bool run(int fmt) {
     const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
     k::QsaShapes s = k::qsa_real_shapes();
     const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
-    const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
+    const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);
+#if defined(STRATA_USE_HIP)
+    constexpr int64_t NQ = 32;
+#else
+    constexpr int64_t NQ = 8;
+#endif
     const int64_t H = s.n_head_kv, D = s.head_dim, NH = s.n_head;
     std::mt19937 rng(7 + 4 * fmt);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -168,7 +174,7 @@ bool run(int fmt) {
         append(slots, m.page_table, step, kc, vc, s, fmt, &host.p);
         if (pos % 131 != 130 && pos != N - 1) continue;
         // a batch: n_q queries at the last n_q positions (as a verify window), each with its own selection
-        const int n_q = 1 + (int) (rng() % NQ);
+        const int n_q = 1 + (int) (rng() % 8);
         std::vector<int32_t> hids((size_t) NQ * cap, 0), hst(NQ * 4, 0);
         for (int t = 0; t < n_q; ++t) {
             const int64_t p = std::max<int64_t>(0, pos - (n_q - 1 - t)), n_kv = p + 1;
@@ -255,6 +261,48 @@ bool run(int fmt) {
                 name, range_calls, range_checked, range_ahead);
     if (c.overflow || c.calls != (uint64_t) (batches + range_calls) || c.misses == 0 || c.misses >= c.lookups) ++bad;
     if (range_checked == 0 || range_ahead == 0) ++bad;
+
+#if defined(STRATA_USE_HIP)
+    // 6. A prompt larger than the slot pool: full-batch identity attention versus bounded
+    // groups resolved through slots, including a short final group and repeated evictions.
+    {
+        k::kv_stream_reset(m, nullptr);
+        std::vector<int32_t> hids((size_t) NQ * cap), hst(NQ * k::kStepCount);
+        for (int64_t t = 0; t < NQ; ++t) {
+            const auto sel = selection(N - NQ + t + 1, cap, rng);
+            std::copy(sel.begin(), sel.end(), hids.begin() + t * cap);
+            hst[t * 4] = (int32_t) (N - NQ + t);
+            hst[t * 4 + 1] = hst[t * 4] + 1;
+            hst[t * 4 + 2] = hst[t * 4 + 1] / 4;
+            hst[t * 4 + 3] = (int32_t) cap;
+        }
+        ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "prompt ids");
+        ck(cudaMemcpy(steps, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice), "prompt steps");
+        if (!k::qsa_prompt_attn_batch(q, ref.attn(ident), ids, steps, cap, s, out_ref, NQ, nullptr))
+            k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, NQ, nullptr);
+        const int64_t batch = n_slots / (cap / s.page_size + 2);
+        for (int64_t t = 0; t < NQ; t += batch) {
+            const int64_t nb = std::min(batch, NQ - t);
+            k::kv_stream_resolve(m, slots.attn(m.page_table), host.p, fmt, ids + t * cap,
+                                 steps + t * k::kStepCount, nb, cap, s, nullptr);
+            if (!k::qsa_prompt_attn_batch(q + t * NH * D, slots.attn(m.page_table), ids + t * cap,
+                                         steps + t * k::kStepCount, cap, s, out_str + t * NH * D, nb, nullptr))
+                k::qsa_decode_attn_batch(q + t * NH * D, slots.attn(m.page_table), ids + t * cap,
+                                         steps + t * k::kStepCount, cap, s, scratch, out_str + t * NH * D, nb, nullptr);
+        }
+        ck(cudaDeviceSynchronize(), "prompt groups");
+        ck(cudaMemcpy(a.data(), out_ref, (size_t) NQ * NH * D * 4, cudaMemcpyDeviceToHost), "prompt ref");
+        ck(cudaMemcpy(b2.data(), out_str, (size_t) NQ * NH * D * 4, cudaMemcpyDeviceToHost), "prompt slots");
+        const bool same = std::memcmp(a.data(), b2.data(), (size_t) NQ * NH * D * 4) == 0;
+        const auto pc = k::kv_stream_counters(m);
+        const bool ok = same && !pc.overflow && pc.misses > (uint64_t) n_slots;
+        std::printf("  %s prompt groups: %lld queries, batch %lld, %llu misses, overflow %d: %s\n", name,
+                    (long long) NQ, (long long) batch, (unsigned long long) pc.misses, (int) pc.overflow,
+                    ok ? "identical with eviction" : "FAIL");
+        if (!ok) ++bad;
+    }
+
+#endif
 
     // 4. a ring over the same host copy: blocks [b1 - R, b1) restored, read through `b % R`
     {

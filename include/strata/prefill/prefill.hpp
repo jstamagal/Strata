@@ -130,6 +130,14 @@ public:
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
 
+    /// HIP, STRATA_KV_PF_SLOTS=1 together with PF_RESIDENT: no staging pool; size owned
+    /// prompt buffers exactly so the fixed reserve does not strand the released memory.
+#if defined(STRATA_USE_HIP)
+    static bool kv_slots_enabled();
+#else
+    static bool kv_slots_enabled() { return false; }
+#endif
+
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,

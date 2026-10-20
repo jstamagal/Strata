@@ -4399,7 +4399,22 @@ int main(int argc, char** argv) {
         if (const cudaError_t e = cudaMemGetInfo(&fb, &tb); e != cudaSuccess)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          cudaGetErrorString(e));
-        const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
+        int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
+        if (!search && pf > 0 && strata::prefill::Prefill::kv_slots_enabled()) {
+            // Sessions exist at cache allocation time. Price the actual buffers (including
+            // allocation granules and the expert ring), rather than keeping the old staging
+            // allowance after PF_SLOTS removed it. The placement search stays conservative.
+            const strata::core::SessionState* ses = &ss;
+            for (const auto& st : stages) if (st->dev == dev) { ses = &st->ss; break; }
+            if (ses->qsa_states && ses->qsa_states[ses->qsa_primary()].kv_mode == 1) {
+                const int64_t exact = (int64_t) ((strata::prefill::Prefill::bytes_needed_owned(
+                    g, *ses, o.prefill_chunk) + (1ull << 20) - 1) >> 20) + 64;
+                std::fprintf(stderr, "strata generate: STRATA_KV_PF_SLOTS: CUDA%d owned prompt reserve "
+                                     "%lld -> %lld MiB (actual buffers + 64 MiB margin)\n",
+                             dev, (long long) pf, (long long) exact);
+                pf = exact;
+            }
+        }
         const int64_t base_reserve =
             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
         const int64_t reserve = (base_reserve + pf + (later ? kWindowMib : kPipeSnapMib) +
@@ -5794,9 +5809,13 @@ int main(int argc, char** argv) {
     auto owned_prefill_mib = [&]() -> int64_t {
         if (!(o.prefill_chunk > 0 && !pf_borrow)) return 0;
         static const bool exact = [] { const char* v = std::getenv("STRATA_OWNED_PRICE"); return v != nullptr && std::string(v) == "exact"; }();
-        if (!exact) return 160 + (o.prefill_chunk * 680) / 1024;
+        const bool slots_budget = strata::prefill::Prefill::kv_slots_enabled() &&
+            ss.qsa_states[ss.qsa_primary()].kv_mode == 1;
+        if (!exact && !slots_budget) return 160 + (o.prefill_chunk * 680) / 1024;
         const int64_t mib = ((int64_t) strata::prefill::Prefill::bytes_needed_owned(g, ss, o.prefill_chunk, srcp != nullptr) + (1 << 20) - 1) >> 20;
-        std::fprintf(stderr, "strata generate: STRATA_OWNED_PRICE=exact: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n",
+        std::fprintf(stderr, slots_budget
+                         ? "strata generate: STRATA_KV_PF_SLOTS: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n"
+                         : "strata generate: STRATA_OWNED_PRICE=exact: the prompt path's own buffers for a %lld-token chunk: %lld MiB (the 0.1.39 rule: %lld MiB)\n",
                      (long long) o.prefill_chunk, (long long) mib, (long long) (160 + (o.prefill_chunk * 680) / 1024));
         return mib + 64;   // a margin for the allocator
     };
