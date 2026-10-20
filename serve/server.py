@@ -7876,7 +7876,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
-                  fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
+                  # this tree: a request too long for the room left answers 400 unless --fit-max-tokens or
+                  # "fit_max_tokens": true asks for the clamp (upstream made the clamp the default)
+                  fit_max_tokens=(a.fit_max_tokens or cfg.get("fit_max_tokens") is True) and not a.no_fit_max_tokens)
     svc.launch_attestation = launch_attestation
     svc.offline = a.offline
     svc.max_queue = max_queue
