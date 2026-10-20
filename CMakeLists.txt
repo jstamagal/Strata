@@ -802,6 +802,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_hc_upmix16_parity COMMAND hip_hc_upmix16_parity)
     set_tests_properties(hip_hc_upmix16_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     list(APPEND _strata_hip_tests hip_hc_upmix16_parity)
+    # STRATA_PF_NOWIDEN: the readers of unwidened FP16 GEMM outputs against the same readers on the widened rows,
+    # bit for bit; exit 77 off the FP16 prompt path
+    add_executable(hip_pf_nowiden_parity tests/hip/pf_nowiden_parity.cpp)
+    target_link_libraries(hip_pf_nowiden_parity PRIVATE strata_prefill strata_hip_runtime)
+    add_test(NAME hip_pf_nowiden_parity COMMAND hip_pf_nowiden_parity)
+    set_tests_properties(hip_pf_nowiden_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    list(APPEND _strata_hip_tests hip_pf_nowiden_parity)
     # the output head in isolation: the Q6_K vocabulary projection, the pick and the sampled chain, timed per window size;
     # hip_head_parity checks STRATA_HEAD_* kernels bit for bit against native_mmvq and the sampler
     add_executable(hip_head_lab tests/hip/head_lab.cpp)

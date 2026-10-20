@@ -1330,6 +1330,9 @@ bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, int64_t N1, const ui
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
+    const bool want_f16 = keep_f16_;   // STRATA_PF_NOWIDEN (via native): only the FP16-out call below honours it
+    keep_f16_ = false;
+    kept_f16_ = false;
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #ifdef STRATA_USE_HIP
@@ -1344,7 +1347,11 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     }
 #endif
 #if defined(__HIPCC__)
-    if (f16_io_ && beta == 0.0f) { f16_inplace(X, W, Y, T, N, K, ldy); return; }
+    if (f16_io_ && beta == 0.0f) {
+        kept_f16_ = want_f16 && std::getenv("STRATA_DBG_NAN") == nullptr;
+        f16_inplace(X, W, Y, T, N, K, ldy, kept_f16_);
+        return;
+    }
 #endif
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
@@ -1517,6 +1524,9 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
+    const bool want_f16 = keep_f16_;   // keep_f16_next(): passed on only to the single f16() call at the end
+    keep_f16_ = false;
+    kept_f16_ = false;
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
@@ -1570,6 +1580,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     tmark("other");
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     tmark("dequant", T, N, K);
+    keep_f16_ = want_f16;
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 

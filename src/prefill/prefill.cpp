@@ -485,6 +485,14 @@ inline bool pf_pad() {
 }
 constexpr int64_t ZV_PAD = 64;
 
+// STRATA_PF_NOWIDEN=1 (opt-in, HIP FP16 prompt path, the same bits): the FP16 outputs of the GDN qkv / gate, the QSA
+// q, both attention out projections and the shared expert's gate / up are not widened in place; their readers
+// (gdn_conv, the recurrence's out norm, split_q, gate_attn, gr_write_norm_rs, swiglu_pair) widen each value as they
+// read it (Gemm::keep_f16_next / kept_f16; any other reader gets the rows widened first)
+inline bool pf_nowiden() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_PF_NOWIDEN"); return e && e[0] == '1'; }();
+    return v;
+}
 // F-1: STRATA_GR_UNFUSED=1 keeps the FP32 copy of the normalized rows (gr_norm + gr_mix), the A/B arm
 inline bool gr_unfused() {
     static const bool v = [] { const char* e = std::getenv("STRATA_GR_UNFUSED"); return e && e[0] == '1'; }();
@@ -3215,6 +3223,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 stats_.ms_ple += ms_since(tp);
             }
             for (int half = 0; half < 2; ++half) {
+                bool bo16 = false;   // STRATA_PF_NOWIDEN: bo holds the attention out projection's FP16 output
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -3361,19 +3370,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
+                    const bool qkv16 = pf_nowiden() && m.gemm.kept_f16();
+                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    const bool z16 = pf_nowiden() && m.gemm.kept_f16();
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs, qkv16);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                                   ld_y, z16);
                     pt.mark(kPfGdnOut, cs);
+                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
+                    bo16 = pf_nowiden() && m.gemm.kept_f16();
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
@@ -3389,7 +3404,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfQsa, cs);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    const bool q16 = pf_nowiden() && m.gemm.kept_f16();
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
@@ -3472,7 +3489,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
                     if (streamed) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
-                    split_q(m.Qf, m.q, T, m.cs);
+                    split_q(m.Qf, m.q, T, m.cs, q16);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
@@ -3649,8 +3666,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
+                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a, q16);
+                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err, 0, ld_a)) return false;
+                    bo16 = pf_nowiden() && m.gemm.kept_f16();
                     ++qsa_index;
                     if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                 } else {
@@ -3726,9 +3745,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
+                        if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        const bool g16 = pf_nowiden() && m.gemm.kept_f16();
+                        if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                         if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs);
+                        const bool u16 = pf_nowiden() && m.gemm.kept_f16();
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs, g16, u16);
                         if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                         m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
@@ -5097,6 +5120,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
                     if (!wnn) return false;
                 }
+                // STRATA_PF_NOWIDEN: only gr_write_norm_rs reads bo's halves; every other write-back widens them first
+                if (bo16 && !(wnn && !cv_fused)) { widen16_rows(m.bo, N, N, T, m.cs); bo16 = false; }
                 if (wnn && cv_fused) {
                     // STRATA_CVEC_FUSE_CHECK=N: on the first N fused writes, also run the three-kernel path on a copy
                     // of R and report whether R, the row scales and the BF16 image are bit-identical
@@ -5137,7 +5162,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else if (wnn) {
                     if (!moe_wrote)
                         gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.grs, m.xn16, T, m.cs,
-                                         m.xn16_lo, ldx, xf16);
+                                         m.xn16_lo, ldx, xf16, bo16);
+                    bo16 = false;
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);

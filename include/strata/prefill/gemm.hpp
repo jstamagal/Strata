@@ -75,7 +75,8 @@ public:
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
     /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
     void set_f16_io(bool on) { f16_io_ = on; }
-    /// STRATA_HC_GATED16: the next bf16() on the FP16 path leaves its output as the GEMM wrote it - FP16 at the start
+    /// STRATA_HC_GATED16: the next bf16() on the FP16 path (STRATA_PF_NOWIDEN: also the next native() / f16(), when the
+    /// weight fits the scratch in one piece and the product is rocBLAS's FP16-out call) leaves its output as the GEMM wrote it - FP16 at the start
     /// of each FP32 row of Y (row t's N halves at Y + t * ldy) - and does not widen it, for a reader that takes the
     /// halves itself (gr_mix_r).  kept_f16() says whether that call did so (not off the FP16 path, nor when the weight
     /// went through the scratch in row slices); the request never outlives one bf16() call.
