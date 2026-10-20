@@ -84,6 +84,9 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                     int64_t ld16 = 0,    // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
                     bool z_f16 = false);  // z as FP16 at the start of each FP32 row (STRATA_PF_NOWIDEN; as gdn_conv)
+/// STRATA_PF_SIDE_STREAM: z of the next gdn_recurrence on this thread is written on another stream; that call's stream
+/// waits for `event` (a cudaEvent_t) right before its first kernel that reads z.  Consumed by that call.
+void gdn_set_z_ready(void* event);
 /// The kernels behind gdn_recurrence, for the parity test: 0 = the column-split kernels + the norm kernel (or the
 /// one-block-per-head kernel under STRATA_GDN_REC_HEADS), 1 = four lanes per column (no barrier per token) + the grid-stride norm, 2 = the
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.  On HIP, 0 and 1 run the opt-in

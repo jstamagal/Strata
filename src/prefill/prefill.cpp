@@ -996,6 +996,12 @@ struct Prefill::Impl {
     int32_t* ident_table = nullptr;
     cudaStream_t kv_copy = nullptr;
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
+    // STRATA_PF_SIDE_STREAM=1: the second stream, its GEMM handle and its events (made at first use; sh_state -1: could
+    // not be made, everything stays on the compute stream)
+    cudaStream_t sh_s = nullptr;
+    cudaEvent_t sh_fork = nullptr, sh_join = nullptr, sh_fork2 = nullptr, sh_join2 = nullptr;
+    Gemm gemm_sh;
+    int sh_state = 0;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
@@ -1099,6 +1105,7 @@ void Prefill::release() {
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+    if (impl_->sh_s) cudaStreamSynchronize(impl_->sh_s);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1115,6 +1122,10 @@ void Prefill::release() {
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
+    if (impl_->sh_fork) cudaEventDestroy(impl_->sh_fork);
+    if (impl_->sh_join) cudaEventDestroy(impl_->sh_join);
+    if (impl_->sh_fork2) cudaEventDestroy(impl_->sh_fork2);
+    if (impl_->sh_join2) cudaEventDestroy(impl_->sh_join2);
     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
     impl_->steps_up.release();
     impl_->tok_up.release();
@@ -1693,7 +1704,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         return false;
     }
     if (cudaStreamSynchronize(m.cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess ||
-        (m.kv_copy && cudaStreamSynchronize(m.kv_copy) != cudaSuccess)) {
+        (m.kv_copy && cudaStreamSynchronize(m.kv_copy) != cudaSuccess) ||
+        (m.sh_s && cudaStreamSynchronize(m.sh_s) != cudaSuccess)) {
         err = "prefill: relayout: the stream failed";
         return false;
     }
@@ -2627,6 +2639,39 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ~KvDrain() { if (stream) cudaStreamSynchronize(stream); }
     } kv_drain{kv_prefetch ? m.kv_copy : nullptr};
     int64_t kv_prefetches = 0;
+    // STRATA_PF_SIDE_STREAM=1 (opt-in): a second stream with its own GEMM handle and dequantization scratch for the
+    // projections of a layer that do not depend on the big one beside them (the MoE half's shared expert, the GDN
+    // alpha / beta and gate, the QSA k / v / indexer projections), in chunks of stream_all_min() tokens and more.  Made
+    // at the first use (a 32 MiB workspace and a 30 MiB scratch on the card); when it cannot be made everything stays on
+    // the compute stream.
+    auto side_ready = [&]() -> bool {
+        static const bool on = [] { const char* e = std::getenv("STRATA_PF_SIDE_STREAM"); return e && e[0] == '1'; }();
+        if (!on) return false;
+        if (m.sh_state == 0) {
+            m.sh_state = -1;
+            std::string e2;
+            if (cudaStreamCreateWithFlags(&m.sh_s, cudaStreamNonBlocking) == cudaSuccess &&
+                cudaEventCreateWithFlags(&m.sh_fork, cudaEventDisableTiming) == cudaSuccess &&
+                cudaEventCreateWithFlags(&m.sh_join, cudaEventDisableTiming) == cudaSuccess &&
+                cudaEventCreateWithFlags(&m.sh_fork2, cudaEventDisableTiming) == cudaSuccess &&
+                cudaEventCreateWithFlags(&m.sh_join2, cudaEventDisableTiming) == cudaSuccess &&
+                m.gemm_sh.init(m.sh_s, (int64_t) 6144 * 2560, e2)) {
+                m.gemm_sh.set_f16_io(m.f16_io);
+                m.sh_state = 1;
+                std::fprintf(stderr, "strata prefill: STRATA_PF_SIDE_STREAM: the shared expert and the small projections "
+                                     "on a second stream (device %d)\n", m.device);
+            } else {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata prefill: STRATA_PF_SIDE_STREAM: no second stream (%s); everything stays on "
+                                     "the compute stream\n", e2.empty() ? "stream or events" : e2.c_str());
+            }
+        }
+        return m.sh_state == 1;
+    };
+    auto side_fork = [&]() {   // the side stream starts after everything the compute stream has queued so far
+        cudaEventRecord(m.sh_fork, m.cs);
+        cudaStreamWaitEvent(m.sh_s, m.sh_fork, 0);
+    };
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
@@ -3370,15 +3415,38 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    // STRATA_PF_SIDE_STREAM: alpha and beta (N 48 each) on the second stream beside qkv; then the
+                    // gate z (N 6144), which only the output norm after the recurrence reads, on the second stream
+                    // once qkv is done - beside the conv and the recurrence (96 blocks: most of the card is free)
+                    static const bool z_ok = [] {   // the recurrences whose kernels read z only in the norm launch
+                        const char* c = std::getenv("STRATA_GDN_CHUNKED");
+                        return std::getenv("STRATA_GDN_REC_HEADS") == nullptr && !(c && std::atoi(c) != 0);
+                    }();
+                    const bool g_side = T >= stream_all_min() && side_ready();
+                    const bool z_side = g_side && z_ok;
+                    Gemm& gab = g_side ? m.gemm_sh : m.gemm;
+                    if (g_side) side_fork();
+                    if (g_side && !bf16_proj(gab, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    if (g_side && !bf16_proj(gab, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    if (g_side) cudaEventRecord(m.sh_join, m.sh_s);
                     if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     const bool qkv16 = pf_nowiden() && m.gemm.kept_f16();
-                    if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
-                    const bool z16 = pf_nowiden() && m.gemm.kept_f16();
-                    if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    // STRATA_PF_NOWIDEN with the side stream: z keeps its FP16 halves on whichever Gemm wrote it
+                    Gemm& gz = z_side ? m.gemm_sh : m.gemm;
+                    if (z_side) {
+                        cudaEventRecord(m.sh_fork2, m.cs);
+                        cudaStreamWaitEvent(m.sh_s, m.sh_fork2, 0);
+                    }
+                    if (pf_nowiden() && m.f16_io) gz.keep_f16_next();
+                    if (!native_proj(gz, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    const bool z16 = pf_nowiden() && gz.kept_f16();
+                    if (z_side) cudaEventRecord(m.sh_join2, m.sh_s);
+                    if (!g_side && !bf16_proj(gab, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
+                    if (!g_side && !bf16_proj(gab, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
+                    if (g_side) cudaStreamWaitEvent(m.cs, m.sh_join, 0);
+                    if (z_side) gdn_set_z_ready(m.sh_join2);   // the recurrence's norm waits for z
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs, qkv16);
                     pt.mark(kPfGdnRec, cs);
@@ -3402,6 +3470,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wikn = need(v, "indexer.k_norm.weight", err);
                     if (!wq || !wk || !wv || !wo || !wik || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
                     pt.mark(kPfQsa, cs);
+                    // STRATA_PF_SIDE_STREAM: k, v and the indexer's projections (N 512 / 128) and K's norm and RoPE
+                    // on the second stream beside the q projection (N 12288); joined before anything reads them
+                    const bool q_side = T >= stream_all_min() && side_ready();
+                    if (q_side) {
+                        side_fork();
+                        if (!native_proj(m.gemm_sh, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
+                        if (!native_proj(m.gemm_sh, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
+                        if (!bf16_proj(m.gemm_sh, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        if (!bf16_proj(m.gemm_sh, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                        rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.sh_s);
+                        rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.sh_s);
+                        cudaEventRecord(m.sh_join, m.sh_s);
+                        if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        cudaStreamWaitEvent(m.cs, m.sh_join, 0);
+                    } else {
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
@@ -3411,6 +3494,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    }
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                     // STRATA_KV_PF_RESIDENT=1 (opt-in): while the layer's blocks [0, p0 + T) fit its VRAM slots they are
@@ -3681,6 +3765,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsd = need(v, "ffn_down_shexp.weight", err);
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
+                    // STRATA_PF_SIDE_STREAM=1 (opt-in): in the streamed walk (chunks of stream_all_min() tokens and
+                    // more) the shared expert runs on its own stream with its own GEMM handle and dequantization
+                    // scratch, beside the router, the host's grouping and the routed experts; the combine waits for it.
+                    // The same kernels on the same inputs (mixed_h / mixed_bf, written before this point and next
+                    // written after the combine): the same bits.
+                    const bool sh_side = stream_all && side_ready();
+                    if (sh_side) side_fork();
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err, 0, m.mixed_bf_lo)) return false;
                     route(m.logits, m.ids, m.w, T, m.g->n_expert, m.cs);
                     // RESEARCH HOOK (141-research, opt-in, never on by default): STRATA_DBG_FEAT=<file> dumps, per MoE layer and chunk,
@@ -3744,24 +3835,35 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     // the shared expert and its scalar gate
-                    auto shared_expert = [&]() -> bool {
-                        if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
-                        if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
-                        const bool g16 = pf_nowiden() && m.gemm.kept_f16();
-                        if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
-                        if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
-                        const bool u16 = pf_nowiden() && m.gemm.kept_f16();
-                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, m.cs, g16, u16);
-                        if (!native_proj(m.gemm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
+                    auto shared_expert_on = [&](Gemm& gm, cudaStream_t st) -> bool {
+                        if (pf_nowiden() && m.f16_io) gm.keep_f16_next();
+                        if (!native_proj(gm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
+                        const bool g16 = pf_nowiden() && gm.kept_f16();
+                        if (pf_nowiden() && m.f16_io) gm.keep_f16_next();
+                        if (!native_proj(gm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;
+                        const bool u16 = pf_nowiden() && gm.kept_f16();
+                        swiglu_pair(m.sgate, m.sup, m.sh_h, T, st, g16, u16);
+                        if (!native_proj(gm, wsd, m.sh_h, m.shared, T, v.name("ffn_down_shexp.weight"), err)) return false;
                         if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
-                        m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
-                        if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
+                        gm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
+                        if (m.mixed_bf_lo) gm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, 1.0f);
                         return true;
                     };
+                    auto shared_expert = [&]() -> bool { return shared_expert_on(m.gemm, m.cs); };
+                    if (sh_side) {   // STRATA_PF_SIDE_STREAM
+                        if (!shared_expert_on(m.gemm_sh, m.sh_s)) return false;
+                        cudaEventRecord(m.sh_join, m.sh_s);
+                    }
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+                    // STRATA_PF_DEFER_SHARED=1 (opt-in): the streamed walk (stream_all) defers it too.  There every chunk
+                    // of 1024+ tokens synchronizes once per MoE layer for the routed ids, and the GPU sat idle while the
+                    // host grouped them (`host grouping`); the shared expert now fills that gap.  The same kernels on
+                    // the same inputs in the same stream order before the experts' products: the same bits.  The fused
+                    // walk has no host sync and takes the shared expert where it always did (below).
+                    static const bool defer_walk = [] { const char* e = std::getenv("STRATA_PF_DEFER_SHARED"); return e && e[0] == '1'; }();
+                    const bool defer_shared = !sh_side && (!stream_all || defer_walk) && stream_ahead_enabled();
+                    if (!sh_side && !defer_shared && !shared_expert()) return false;
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -3788,6 +3890,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    if (defer_shared && fused_l && !shared_expert()) return false;   // STRATA_PF_DEFER_SHARED: no sync to fill
                     // #583 / #954: the fused layout's GU/H/Xq hold the grouping tables and the int8 rows, sized for
                     // stream_all_min() - 1 tokens of MMQ's rows, so a layer that takes MMQ or the FP16 path at the FULL
                     // chunk would write T*K rows into a (stream_all_min() - 1)*K-row buffer: an illegal access, or a kernel
@@ -3938,6 +4041,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
+                        // STRATA_PF_DEFER_SHARED, the streamed walk: the shared expert goes to the GPU the moment the
+                        // ids are here, before any host work of this layer (the RAM policy's seed below took ~0.8 ms on
+                        // some layers, and the GPU waited for it)
+                        const bool shared_early = defer_shared && defer_walk && stream_all;
+                        if (shared_early) {
+                            pt.fold();   // every mark so far has completed; the two below are folded at the next sync
+                            pt.mark(kPfRouter, cs);
+                            if (!shared_expert()) return false;
+                            pt.mark(kPfHostGroup, cs);
+                        }
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
@@ -3990,11 +4103,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             m.pend_wall = 0;
                         }
-                        pt.fold();
+                        if (!shared_early) pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
                         }
-                        if (defer_shared) {
+                        if (defer_shared && !shared_early) {
                             pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
                             if (!shared_expert()) return false;
                             pt.mark(kPfHostGroup, cs);
@@ -5015,6 +5128,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     pt.mark(kPfCombine, cs);
+                    if (sh_side) cudaStreamWaitEvent(m.cs, m.sh_join, 0);   // STRATA_PF_SIDE_STREAM: the shared expert's rows
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }

@@ -2919,6 +2919,19 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
+// gdn_set_z_ready (STRATA_PF_SIDE_STREAM): the gate z of the next gdn_recurrence on this thread is written on another
+// stream; the stream waits for this event right before the first kernel that reads z (the output norm, or a recurrence
+// kernel that fuses it), so the recurrence itself runs while z is still being computed.
+namespace {
+thread_local cudaEvent_t g_z_ready = nullptr;
+inline void z_wait(void* stream) {
+    if (g_z_ready) {
+        cudaStreamWaitEvent((cudaStream_t) stream, g_z_ready, 0);
+        g_z_ready = nullptr;
+    }
+}
+}  // namespace
+void gdn_set_z_ready(void* event) { g_z_ready = (cudaEvent_t) event; }
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16, bool z_f16) {
@@ -2932,12 +2945,16 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
 #else
     const bool z_here = false;
 #endif
-    if (z_f16 && !z_here) widen16_rows(const_cast<float*>(z), (int64_t) HV * S, (int64_t) HV * S, T, stream);
+    if (z_f16 && !z_here) {   // the widen reads z: STRATA_PF_SIDE_STREAM's event first
+        z_wait(stream);
+        widen16_rows(const_cast<float*>(z), (int64_t) HV * S, (int64_t) HV * S, T, stream);
+    }
 #if defined(__HIPCC__)
     if (variant == 0 || variant == 1) {
         // STRATA_GDN_CHUNKED=1 (opt-in): the chunked recurrence on the gfx11 matrix cores, FP16 operands (other bits;
         // a shorter chunk or another part takes the kernels below)
         static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
+        if (chunked && !serial) z_wait(stream);
         if (chunked && !serial && gdn_rec_wmma(state, h, gate, beta, z, gamma, eps, y, y16, T, (cudaStream_t) stream, ld16)) {
             check("gdn_recurrence (chunked, WMMA)");
             return;
@@ -2946,6 +2963,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
         if (T > 0) {
             gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            z_wait(stream);
             gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
         }
         return;
@@ -2956,6 +2974,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                 gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             else
                 gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            z_wait(stream);
             gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
                 z, gamma, eps, y, y16, T * HV, ld16);
         }
@@ -2972,6 +2991,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             else
                 gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
+            z_wait(stream);
             const unsigned nb = (unsigned) std::min<int64_t>(T * HV, 4096);
             if (noy && z_here)
                 gdn_out_norm_loop_kernel<false, true><<<nb, S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, T * HV, ld16);
@@ -3014,6 +3034,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         if (T > T64)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(
                 state, h + T64 * C, gate + T64 * HV, beta + T64 * HV, y + T64 * (size_t) HV * S, T - T64);
+        z_wait(stream);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     } else if (warp_rec) {
         // =2: the 4-accumulator chain split on the pipelined structure (FP32-level, not bit-exact);
@@ -3023,10 +3044,12 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
                                                                                                 y, T);
         else
             gdn_rec_cols_warp_kernel<<<HV * NCB, S, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        z_wait(stream);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     } else
 #endif
     if (serial || T <= 0 || variant == 2) {
+        z_wait(stream);
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
@@ -3043,6 +3066,7 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        z_wait(stream);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     }
     check("gdn_recurrence");
@@ -3056,6 +3080,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
     gdn_recurrence_variant(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, z_f16);
+    z_wait(stream);   // a path that read no z (T == 0): the event is not left for the next call
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
