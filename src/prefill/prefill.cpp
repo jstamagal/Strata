@@ -3577,46 +3577,56 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
                     if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
-                    rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
-                    // the indexer appends, token by token; then scores + selection for many queries at once:
-                    // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    pt.mark(kPfQsaIdx, cs);
-                    // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
-                    try {
-                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
+                    // the q_idx norm and RoPE, the indexer's appends and the selection, on `sst` (the compute stream, or
+                    // with STRATA_PF_SIDE_STREAM the second one, which already holds q_idx and idx_raw)
+                    auto index_select = [&](cudaStream_t sst) -> bool {
+                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, sst);
+                        rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), sst);
+                        // the indexer appends, token by token; then scores + selection for many queries at once:
+                        // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        if (sst == m.cs) pt.mark(kPfQsaIdx, cs);
+                        // C-2: the chunk's appends in three launches instead of one per token (the same end state:
+                        // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                        try {
+                            static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                            if (!per_token) {
+                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                                 EPS, ib, s, st.max_cells,
+                                                                                 strata::kernels::rope_scaling(), sst);
+                            }
+                            for (int64_t t = 0; per_token && t < T; ++t) {
+                                const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
+                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                           strata::kernels::rope_scaling(), sst);
+                            }
+                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                        if (sst == m.cs) pt.mark(kPfQsaSel, cs);
+                        for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                            const int64_t nb = std::min(m.sel_batch, T - t0);
+                            const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
+                            // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
+                            const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] + 1;
+                            // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
+                            // STRATA_SELECT_OLD=1: the warp kernel
+                            static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                                 sst, active))
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, sst, active);
+                            strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            m.sel_ids + t0 * m.cap, sst, active);
                         }
-                        for (int64_t t = 0; per_token && t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
-                        }
-                    } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
-                    pt.mark(kPfQsaSel, cs);
-                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
-                        const int64_t nb = std::min(m.sel_batch, T - t0);
-                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                        // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
-                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
-                                                                                strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
-                        // STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
-                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                        m.sel_ids + t0 * m.cap, m.cs, active);
-                    }
+                        return true;
+                    };
+                    if (q_side) {   // STRATA_PF_SIDE_STREAM: behind K on the second stream, beside q's and the K/V's work
+                        if (!index_select(m.sh_s)) return false;
+                        cudaEventRecord(m.sh_join2, m.sh_s);
+                        cudaStreamWaitEvent(m.cs, m.sh_join2, 0);
+                    } else if (!index_select(m.cs)) return false;
                     // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
                     // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
                     if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
