@@ -983,6 +983,25 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   Not measured: one card, other packs, other cards than gfx1030 (the switches are not gfx-specific; `STRATA_PREFILL_PIPE=283`
   is this rig's ratio, not a default for others), prompts past 16K, decode (the switches are prompt-only), CUDA and
   SYCL builds (not built).
+- **Expert tiles at 2,048-token chunks: the tiles' heights and a Q2_0 down tile (`STRATA_PF_IQ_TJ=20`,
+  `STRATA_PF_Q2=1`, `STRATA_PF_NL_TJ=20`, opt-in, MMQ's / the default's bits).** At the two-card split's 2,048-token
+  chunks an expert gets about 40 token rows. The IQ tiles took 16 a block (three decodes of the weights for 40 rows),
+  the IQ4_NL down tile 32, and the IQ3_S pack's nine Q2_0 down layers still ran on llama.cpp's MMQ (197 ms of a 16K
+  prompt's stage 0, about twice the IQ4_NL tile's time a layer, plus the copy of those matrices into the group buffer).
+  `STRATA_PF_IQ_TJ` (8 / 12 / 16 / 20 / 24 / 32) and `STRATA_PF_NL_TJ` (16 / 20 / 24 / 40) set the heights; every
+  height gives the same bits, as each output's sum runs over the same values in the same order. `STRATA_PF_Q2=1` runs
+  the Q2_0 down products on the IQ4_NL tile's pattern from MMQ's D4 activations with MMQ's arithmetic: 0 different
+  bits against MMQ on every output of `hip_prefill_expert_bench --type 42` (with `STRATA_PF_DIRECT=1` too, which then
+  reads those matrices in place). Microbench, 16 experts x 40 rows / a skewed 5,120 rows, ms: IQ3_XXS gate/up
+  0.950 -> 0.908 skewed at 20 rows (even at 40), IQ4_NL down 0.101 / 0.499 at 32, 0.086 / 0.461 at 16, 0.096 / 0.434
+  at 20; Q2_0 down MMQ 0.100 / 0.625, the tile at 24 rows 0.089 / 0.483. End to end (2x PRO V620, IQ3_S,
+  `STRATA_PF_SIDE_STREAM=1` in every arm, prompt tok/s at 4K / 16K, one bench run each unless two are given):
+  `STRATA_PF_IQ_TJ` 16: 2023 / 2671, 2025 / 2675; 20: 2033 / 2694, 2037 / 2694, 2033 / 2691, 2023 / 2687; + `STRATA_PF_Q2=1`:
+  2055 / 2707; + `STRATA_PF_NL_TJ=16`: 2058 / 2717, 2051 / 2711; + `STRATA_PF_NL_TJ=20` instead: 2058 / 2727, 2057 / 2718: with all three +1.5% / +1.2% over `STRATA_PF_IQ_TJ=20` alone and +1.7% / +1.9% over the side stream alone.
+  The final residuals of the 3,000- and 9,000-word prompts are unchanged with all three. Before these, a kernel trace
+  with `STRATA_PF_SIDE_STREAM=1` showed that the gap while the host groups a layer's routed ids (0.7 ms a layer without
+  the switch) is already filled by the shared expert on the second stream (0.05-2 ms gaps on stage 0: 143 -> 43 ms), so
+  grouping on the GPU was not built.
 - **Decode: the hyper-connection read on the whole card (`STRATA_HC_WIDE=3`, opt-in).** A verify window reads the
   hyper-connection weights twice per layer (four BF16 matrices of 6.5 MB); on a two-card split of 2x Radeon PRO V620
   that was about a quarter of a window's GPU time (`STRATA_VERIFY_PROFILE=1`: 4.3 of 16.7 ms per window on the first
