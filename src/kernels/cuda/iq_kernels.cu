@@ -4671,6 +4671,202 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
     }
 }
 
+
+#if defined(__HIPCC__)
+// STRATA_EXP_IQ2S=1 keeps mode 8's lane sums, float scaling, butterfly and q8_1 epilogue.
+// IQ2_S's magnitudes (8, 25, 43) fit in two-bit selectors. Pack eight selectors into 16 bits in LDS and
+// use a byte permutation to form the signed weights. IQ3 keeps its positive grids and a 16-word sign table.
+// Its nonzero bytes can be negated as (g ^ mask) + (mask & 0x01010101), without a carry into another byte.
+// Activations stay in global memory. The original fused kernel above remains the switch-off path.
+template<int TG> struct DecodeGuGrid;
+template<> struct DecodeGuGrid<22> {
+    static constexpr int N = 512 + 16;   // 1024 uint16 selectors, then 16 sign-selector words
+    __device__ static uint32_t pack(uint32_t v) {
+        v = (v >> 4) & 0x03030303u;
+        v = (v | (v >> 6)) & 0x000f000fu;
+        return (v | (v >> 12)) & 255;
+    }
+    __device__ static void stage(uint32_t* grid, int tid) {
+        for (int i = tid; i < 512; i += 256) {
+            const uint64_t a = iq2s_grid[2 * i], b = iq2s_grid[2 * i + 1];
+            grid[i] = pack((uint32_t) a) | (pack((uint32_t) (a >> 32)) << 8) |
+                      (pack((uint32_t) b) << 16) | (pack((uint32_t) (b >> 32)) << 24);
+        }
+        if (tid < 16) grid[512 + tid] = ((uint32_t) nib_mask(tid) & 0x01010101u) << 2;
+    }
+};
+template<> struct DecodeGuGrid<18> {
+    static constexpr int N = 272;
+    __device__ static void stage(uint32_t* grid, int tid) {
+        for (int i = tid; i < 256; i += 256) grid[i] = iq3xxs_grid[i];
+        if (tid < 16) grid[256 + tid] = (uint32_t) nib_mask(tid);
+    }
+};
+template<> struct DecodeGuGrid<21> {
+    static constexpr int N = 528;
+    __device__ static void stage(uint32_t* grid, int tid) {
+        for (int i = tid; i < 512; i += 256) grid[i] = iq3s_grid[i];
+        if (tid < 16) grid[512 + tid] = (uint32_t) nib_mask(tid);
+    }
+};
+template<int TG> struct DecodeGuSplit {
+    __device__ static auto load(const void* row, int kbx, int iqs, const uint32_t* grid) {
+        return Split<TG>::template load<true>(row, kbx, iqs, grid);
+    }
+};
+template<> struct DecodeGuSplit<18> {
+    __device__ static Split<18>::W load(const void* row, int kbx, int iqs, const uint32_t* grid) {
+        const block_iq3_xxs* w = (const block_iq3_xxs*) row + kbx;
+        const uint32_t qs0 = (uint32_t) get_int_b2(w->qs, iqs);
+        const uint32_t qs1 = (uint32_t) get_int_b2(w->qs, iqs + 1);
+        const uint32_t aux = (uint32_t) get_int_b2(w->qs, QK_K / 16 + iqs / 2);
+        Split<18>::W r;
+        r.ls = aux >> 28;
+        r.dw = __half2float(w->d);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t qs = j < 2 ? qs0 : qs1;
+            const uint32_t v = (aux >> (7 * j)) & 127;
+            const uint32_t signs = v | ((__popc(v) & 1u) << 7);
+            const uint32_t ml = grid[256 + (signs & 15)], mh = grid[256 + (signs >> 4)];
+            const uint32_t gl = grid[(qs >> (16 * (j & 1))) & 255];
+            const uint32_t gh = grid[(qs >> (16 * (j & 1) + 8)) & 255];
+            r.g[2 * j] = (int) ((gl ^ ml) + (ml & 0x01010101u));
+            r.g[2 * j + 1] = (int) ((gh ^ mh) + (mh & 0x01010101u));
+        }
+        return r;
+    }
+};
+template<> struct DecodeGuSplit<21> {
+    __device__ static Split<21>::W load(const void* row, int kbx, int iqs, const uint32_t* grid) {
+        const block_iq3_s* w = (const block_iq3_s*) row + kbx;
+        const uint32_t qs0 = (uint32_t) get_int_b2(w->qs, iqs);
+        const uint32_t qs1 = (uint32_t) get_int_b2(w->qs, iqs + 1);
+        const uint32_t signs = (uint32_t) get_int_b2(w->signs, iqs / 2);
+        const int qh = w->qh[iqs / 2];
+        Split<21>::W r;
+        r.ls = 1 + 2 * ((w->scales[iqs / 4] >> ((iqs << 1) & 4)) & 15);
+        r.dw = __half2float(w->d);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t qs = j < 2 ? qs0 : qs1;
+            const int idx0 = ((qs >> (16 * (j & 1))) & 255) | ((qh << (8 - 2 * j)) & 0x100);
+            const int idx1 = ((qs >> (16 * (j & 1) + 8)) & 255) | ((qh << (7 - 2 * j)) & 0x100);
+            const uint32_t ml = grid[512 + ((signs >> (8 * j)) & 15)];
+            const uint32_t mh = grid[512 + ((signs >> (8 * j + 4)) & 15)];
+            r.g[2 * j] = (int) ((grid[idx0] ^ ml) + (ml & 0x01010101u));
+            r.g[2 * j + 1] = (int) ((grid[idx1] ^ mh) + (mh & 0x01010101u));
+        }
+        return r;
+    }
+};
+template<> struct DecodeGuSplit<22> {
+    __device__ static Split<22>::W load(const void* row, int kbx, int iqs, const uint32_t* grid) {
+        const block_iq2_s* w = (const block_iq2_s*) row + kbx;
+        const uint32_t qs = (uint32_t) get_int_b2(w->qs, iqs / 2);
+        const uint32_t signs = (uint32_t) get_int_b2(w->qs, QK_K / 32 + iqs / 2);
+        const int qh = w->qh[iqs / 2];
+        Split<22>::W r;
+        r.ls0 = w->scales[iqs / 2] & 15;
+        r.ls1 = w->scales[iqs / 2] >> 4;
+        r.dw = __half2float(w->d);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int idx = ((qs >> (8 * j)) & 255) | ((qh << (8 - 2 * j)) & 0x300);
+            const uint32_t ml = grid[512 + ((signs >> (8 * j)) & 15)];
+            const uint32_t mh = grid[512 + ((signs >> (8 * j + 4)) & 15)];
+            const uint32_t code = ((const uint16_t*) grid)[idx];
+            uint32_t lo = code & 255, hi = code >> 8;
+            lo = (lo | (lo << 12)) & 0x000f000fu;
+            hi = (hi | (hi << 12)) & 0x000f000fu;
+            lo = (lo | (lo << 6)) & 0x03030303u;
+            hi = (hi | (hi << 6)) & 0x03030303u;
+            r.g[2 * j] = (int) __builtin_amdgcn_perm(0x00d5e7f8u, 0x002b1908u, lo | ml);
+            r.g[2 * j + 1] = (int) __builtin_amdgcn_perm(0x00d5e7f8u, 0x002b1908u, hi | mh);
+        }
+        return r;
+    }
+};
+template<int TG>
+__global__ void __launch_bounds__(256) native_gu_iq2s_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_tok,
+                                                              const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                              block_q8_1* __restrict__ hq) {
+    using F = Fmt<TG>;
+    __shared__ uint32_t sgrid[DecodeGuGrid<TG>::N];
+    __shared__ float res[LDS_NT][64];
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    DecodeGuGrid<TG>::stage(sgrid, tid);
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    const int r0 = blockIdx.x * 32;
+    auto wrow = [&](int i) -> const uint8_t* {   // i < 32: gate row r0 + i, else up row r0 + i - 32
+        return blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
+    };
+    for (int c0 = e0; c0 < e1; c0 += LDS_NT) {
+        const int cn = min(LDS_NT, e1 - c0);
+        __syncthreads();
+        for (int p = 0; p < 4; ++p) {
+            const int i0 = p * 16 + warp, i1 = i0 + 8;
+            const uint8_t* w0 = wrow(i0);
+            const uint8_t* w1 = wrow(i1);
+            auto pass = [&](auto ntc) {
+                constexpr int NTC = decltype(ntc)::value;
+                float s0[NTC], s1[NTC];
+#pragma unroll
+                for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                for (int k = lane; k < nb * F::ipb; k += 32) {
+                    const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                    const auto aweight = DecodeGuSplit<TG>::load(w0, kbx, iqs, sgrid);
+                    const auto bweight = DecodeGuSplit<TG>::load(w1, kbx, iqs, sgrid);
+#pragma unroll
+                    for (int j = 0; j < NTC; ++j) {
+                        const block_q8_1* xk = xq + (size_t) ent_tok[c0 + j] * xb + kbx * (F::qk / 32);
+                        const float a = Split<TG>::apply(aweight, xk, iqs);
+                        const float b = Split<TG>::apply(bweight, xk, iqs);
+                        s0[j] += a;
+                        s1[j] += b;
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < NTC; ++j) {
+                    const float a = warp_sum(s0[j]), b = warp_sum(s1[j]);
+                    if (lane == 0) { res[j][i0] = a; res[j][i1] = b; }
+                }
+            };
+            switch (cn) {
+                case 1: pass(std::integral_constant<int, 1>{}); break;
+                case 2: pass(std::integral_constant<int, 2>{}); break;
+                case 3: pass(std::integral_constant<int, 3>{}); break;
+                default: pass(std::integral_constant<int, 4>{}); break;
+            }
+        }
+        __syncthreads();
+        if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
+            const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            const float xi = (gg / (1.0f + __expf(-gg))) * uu;
+            float amax = fabsf(xi), sum = xi;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            const float d = q8_1_finite(amax / 127.0f);   // #606, as q8_1_store: finite blocks bit for bit
+            const int8_t q = q8_1_quant(xi, d, amax);
+            block_q8_1* y = hq + (size_t) (c0 + warp) * hb + blockIdx.x;
+            y->qs[lane] = q;
+            if (lane == 0) y->ds = q8_1_ds(d, sum);
+        }
+    }
+}
+
+#endif
+
 int g_exp_mode = -1;   // native_expert_set_mode (the bench); -1 = STRATA_EXP_MODE, else the card's default
 int exp_mode() {
     static const int m = [] { const char* v = std::getenv("STRATA_EXP_MODE"); return v ? std::atoi(v) : -1; }();
@@ -4859,6 +5055,16 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
+#if defined(__HIPCC__)
+        static const bool iq2s = [] { const char* v = std::getenv("STRATA_EXP_IQ2S"); return v && v[0] == '1'; }();
+        if (iq2s && (L.gu_type == 22 || L.gu_type == 18 || L.gu_type == 21)) {
+            switch (L.gu_type) {
+                case 18: native_gu_iq2s_kernel<18><<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+                case 21: native_gu_iq2s_kernel<21><<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+                default: native_gu_iq2s_kernel<22><<<gl, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            }
+        } else
+#endif
         switch (L.gu_type) {
             case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
             case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;

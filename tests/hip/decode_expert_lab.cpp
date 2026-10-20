@@ -13,6 +13,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,6 +91,7 @@ struct Lab {
     int32_t *start, *n, *dst, *tok;
     int ng = 0;
     size_t scr_bytes = 0;
+    size_t launches[3] = {};
 
     Lab(int gu, int dt, int tokens, int per_layer, std::mt19937& rng, cudaStream_t s) {
         L = k::native_expert_layout(gu, dt, 2560, 640);
@@ -132,11 +134,13 @@ struct Lab {
         cudaFree(arena); cudaFree(xq); cudaFree(scr); cudaFree(out);
         for (auto* p : ptr) cudaFree(p);
         cudaFree(start); cudaFree(n); cudaFree(dst); cudaFree(tok);
+        for (auto* p : ptr_off) cudaFree(p);
     }
     // groups of these sizes (entries); a group's entries are different tokens, as the engine's are
     void plan(const std::vector<int>& sizes, std::mt19937& rng) {
         std::vector<int32_t> st(1, 0), tk, ds(cap);
         for (const int m : sizes) {
+            if (m < 1 || m > T) { std::fprintf(stderr, "invalid group size\n"); std::exit(2); }
             std::vector<int> t(T);
             std::iota(t.begin(), t.end(), 0);
             std::shuffle(t.begin(), t.end(), rng);
@@ -162,6 +166,9 @@ struct Lab {
         for (int l = 0; l < layers; ++l)
             k::native_expert_grouped(L, ptr[l], start, n, dst, tok, cap, cap, xq, scr, out, s, 0);
         ck(cudaStreamEndCapture(s, &g), "capture");
+        size_t nodes = 0;
+        ck(cudaGraphGetNodes(g, nullptr, &nodes), "nodes");
+        launches[phase] = nodes / (size_t) layers;
         ck(cudaGraphInstantiate(&ge, g, 0), "instantiate");
         ck(cudaGraphDestroy(g), "graph");
         k::native_expert_set_mode(-1, 0);
@@ -229,7 +236,16 @@ std::vector<int> shape(int T) {
         case 1: return std::vector<int>(10, 1);
         case 2: { std::vector<int> v(14, 1); v.insert(v.end(), 3, 2); return v; }                          // 17 groups, 20
         case 3: { std::vector<int> v(15, 1); v.insert(v.end(), 6, 2); v.insert(v.end(), 1, 3); return v; }  // 22 groups, 30
-        default: { std::vector<int> v(16, 1); v.insert(v.end(), 9, 2); v.insert(v.end(), 2, 3); return v; } // 27 groups, 40
+        case 4: { std::vector<int> v(16, 1); v.insert(v.end(), 9, 2); v.insert(v.end(), 2, 3); return v; } // 27 groups, 40
+        default: {
+            auto v = shape(4);
+            // Synthetic extension: each extra token shares five experts and adds five.
+            for (int t = 4; t < T; ++t) {
+                for (int j = 0; j < 5; ++j) ++v[(size_t) ((5 * (t - 4) + j) % 27)];
+                v.insert(v.end(), 5, 1);
+            }
+            return v;
+        }
     }
 }
 
@@ -250,11 +266,12 @@ int main(int argc, char** argv) {
             if (only_gu >= 0 && (pr[0] != only_gu || pr[1] != only_d)) continue;
             if (!k::native_expert_supported(pr[0], pr[1], 2560, 640)) continue;
             std::mt19937 rng(1234u + (unsigned) pr[0] * 100u + (unsigned) pr[1]);
-            for (const int T : {1, 2, 3, 4, 7}) {
+            for (int T = 1; T <= 8; ++T) {
+                if (only_T && T != only_T) continue;
                 Lab lab(pr[0], pr[1], T, T * 10, rng, s);
                 for (int v = 0; v < 3; ++v) {
                     std::vector<int> sizes;
-                    if (v == 0) sizes = T <= 4 ? shape(T) : std::vector<int>{7, 6, 5, 4, 3, 2, 1, 1, 1, 5, 5, 4, 1, 1, 1, 1};
+                    if (v == 0) sizes = shape(T);
                     else if (v == 1) sizes = std::vector<int>((size_t) T * 10, 1);
                     else { int left = T * 10; while (left > 0) { const int m = std::min(left, T); sizes.push_back(m); left -= m; } }
                     lab.plan(sizes, rng);
@@ -265,10 +282,14 @@ int main(int argc, char** argv) {
                     ck(cudaStreamSynchronize(s), "sync");
                     std::vector<float> o((size_t) lab.cap * 2560);
                     ck(cudaMemcpy(o.data(), lab.out, o.size() * 4, cudaMemcpyDeviceToHost), "out");
-                    size_t nan = 0;
-                    for (const float f : o) nan += f != f;
-                    std::printf("%-8s/%-7s T %d plan %d (%2zu groups): out %016llx (%zu non-finite)\n", name_of(pr[0]),
-                                name_of(pr[1]), T, v, sizes.size(), (unsigned long long) fnv(o.data(), o.size() * 4), nan);
+                    // Also compare the fused gate/up output before the down projection.
+                    const size_t fa = ((size_t) lab.cap * 640 * 4 + 255) & ~(size_t) 255;
+                    std::vector<uint8_t> hq((size_t) lab.cap * 20 * 36);
+                    ck(cudaMemcpy(hq.data(), lab.scr + 3 * fa, hq.size(), cudaMemcpyDeviceToHost), "hq");
+                    size_t non_finite = 0;
+                    for (const float f : o) non_finite += !std::isfinite(f);
+                    std::printf("%-8s/%-7s T %d plan %d (%2zu groups): out %016llx hq %016llx (%zu non-finite)\n", name_of(pr[0]),
+                                name_of(pr[1]), T, v, sizes.size(), (unsigned long long) fnv(o.data(), o.size() * 4), (unsigned long long) fnv(hq.data(), hq.size()), non_finite);
                 }
             }
         }
@@ -296,7 +317,7 @@ int main(int argc, char** argv) {
         if (only_gu >= 0 && (pr[0] != only_gu || pr[1] != only_d)) continue;
         if (!k::native_expert_supported(pr[0], pr[1], 2560, 640)) { std::printf("%s/%s: not supported\n", name_of(pr[0]), name_of(pr[1])); continue; }
         std::mt19937 rng(99);
-        for (const int T : {1, 2, 3, 4}) {
+        for (int T = 1; T <= 8; ++T) {
             if (only_T && T != only_T) continue;
             Lab lab(pr[0], pr[1], T, T * 10, rng, s);
             const auto sizes = shape(T);
@@ -312,9 +333,9 @@ int main(int argc, char** argv) {
             cudaGraphExec_t gs2 = lab.stream_graph(s, (long long) (lab.L.bytes - lab.L.down_off), 0, sink);
             const float ts2 = median_us(s, gs2);
             std::printf("%-8s/%-7s T %d %2zu groups %2d entries | gate/up %7.1f us %5.0f GB/s (stream %6.1f us %4.0f GB/s) | "
-                        "down %7.1f us %5.0f GB/s (stream %6.1f us %4.0f GB/s) | all %7.1f us\n",
+                        "down %7.1f us %5.0f GB/s (stream %6.1f us %4.0f GB/s) | all %7.1f us | launches %zu/%zu/%zu\n",
                         name_of(pr[0]), name_of(pr[1]), T, sizes.size(), T * 10, t1, gu_mb / t1 * 1e3, ts1, gu_mb / ts1 * 1e3,
-                        t2, d_mb / t2 * 1e3, ts2, d_mb / ts2 * 1e3, t0);
+                        t2, d_mb / t2 * 1e3, ts2, d_mb / ts2 * 1e3, t0, lab.launches[1], lab.launches[2], lab.launches[0]);
             std::fflush(stdout);
             for (auto ge : {g1, g2, g0, gs1, gs2}) cudaGraphExecDestroy(ge);
         }

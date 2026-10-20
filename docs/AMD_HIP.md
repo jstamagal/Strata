@@ -685,6 +685,16 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   summary: [bench/results/2026-10-05-rdna2-rocblas-table](../bench/results/2026-10-05-rdna2-rocblas-table/README.md). Decode does not use these GEMMs and is unchanged. See [Tuning
   table](#tuning-table) for making a table for another rocBLAS build.
 
+- **Decode IQ expert gate/up (`STRATA_EXP_IQ2S=1`, opt-in):** use with `STRATA_EXP_MODE=8`. It covers
+  IQ2_S, IQ3_XXS and IQ3_S gate/up. IQ2_S's shared codebook holds two-bit magnitude selectors; a byte
+  permutation forms the signed weights. IQ3 uses a small sign-mask table. Activations are read from global
+  memory. Unset or `0` keeps the original kernel. Set it before starting the engine. On one PRO V620 (gfx1030),
+  Linux, the 24-layer lab at 4 tokens x 10 experts gave gate/up per layer (IQ4_NL-down pair): IQ2_S
+  84.4 -> 73.0 us, IQ3_XXS 87.6 -> 77.1, IQ3_S 89.7 -> 84.0. IQ3_S at 1 token was slower: 40.1 -> 42.3 us.
+  All 240 cases at 1–8 tokens match both the original q8_1 intermediate and final output bit for bit.
+  [Before/after timings, two-GPU probe rows and limits](../bench/results/2026-10-20-gfx1030-iq2s-decode/README.md).
+  Other HIP cards, Windows, CUDA and SYCL were not tested.
+
 - **IQ prompt expert tiles (`STRATA_PF_IQ2S=1`, `STRATA_PF_IQ3=1`, opt-in, gfx103x):** 256 weight rows by
   16 token rows, scalar activation loads and packed signs. The switches cover IQ2_S and IQ3_XXS / IQ3_S,
   respectively; unset keeps MMQ. With MMQ's q8_1 activations every tested output matched bit for bit
