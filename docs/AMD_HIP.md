@@ -998,11 +998,22 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   | `STRATA_NODE_FUSE=1`, 1 | 129.2 | 118.0 | 353.5 |
   | without, 2 | 126.9 | 116.0 | 347.9 |
   | `STRATA_NODE_FUSE=1`, 2 | 129.2 | 117.9 | 353.2 |
+  | without, 3 | 127.0 | 116.0 | 348.2 |
+  | `STRATA_NODE_FUSE=1`, 3 | 129.2 | 117.9 | 353.2 |
+  | all but the combine (`=508`), 2 runs | 128.7, 128.7 | 117.5, 117.5 | 351.8, 352.1 |
 
-  +1.8% greedy, +1.7% sampled, +1.5% copy-heavy; the greedy and sampled texts are the same hashes in all four runs.
-  Not measured: CUDA and SYCL builds (the new kernels are compiled for every backend; the SYCL port keeps its own
-  copies and is untouched), one card, UD-Q4_K_XL and Q4_0 (whose doorbell graph takes the combine fusion too), a
-  stage split into two token groups (the GDN fusion stays off there), batch windows, long contexts.
+  +1.8% greedy, +1.7% sampled, +1.5% copy-heavy; the greedy and sampled texts are the same hashes in every run. Single
+  fusions alone gave much less than their sum in the whole (one run each, greedy: the GDN one 127.7, the combine
+  126.7, the n-gram and head forms 127.0, the QSA and shared-expert ones 127.2): the two cards run as a pipeline, and
+  shortening one card's stage (the n-gram block is only on the first, the head only on the second) shows little until
+  the other's is shorter too.
+  UD-Q4_K_XL (experts partly in RAM, so the doorbell graph; `--adapt-every 0 STRATA_IQ_MT_MIN=1`, 200 new tokens):
+  the two runs without gave different greedy texts, so that config does not repeat here; both runs with the switch
+  gave the second run's text, the sampled text was the same in all four, and the speeds (72.6-73.6 greedy) are inside
+  that config's run-to-run spread. A 12.7K-token and a 6.4K-token prompt (one run each, greedy, 200 new tokens): the
+  same texts, decode 93.1 -> 94.6 and 94.3 -> 95.8 tok/s. Not measured: CUDA and SYCL builds
+  (the new kernels are compiled for every backend; the SYCL port keeps its own copies and is untouched), one card,
+  Q4_0, a stage split into two token groups (the GDN fusion stays off there), batch windows, contexts past 13K.
 - **File-tier cache rule on gfx906 (`STRATA_FILE_CACHE_OLD_RULE`):** on an MI50 ROCm queues are suspended while the kernel reclaims around the process's HMM-tracked arena (#1752, KevinX8: stalls, prompt 46 -> 360 tok/s once the file tier stops churning the page cache). The gfx906 backend therefore keeps the old rule (the file cache is used only when the room left is at least the bytes read from the files); other HIP cards keep the current rule. `STRATA_FILE_CACHE_OLD_RULE=1` forces the old rule on any Linux build, `=0` the current one.
 - **Windows** (the report above): setup's ready-made Windows engine 0.1.39 runs the RX 6800 beside a 780M iGPU
   (HIP numbers the RX 6800 1; setup points the engine at it), and `tools/hip/build_windows.bat` with
