@@ -1014,6 +1014,25 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   same texts, decode 93.1 -> 94.6 and 94.3 -> 95.8 tok/s. Not measured: CUDA and SYCL builds
   (the new kernels are compiled for every backend; the SYCL port keeps its own copies and is untouched), one card,
   Q4_0, a stage split into two token groups (the GDN fusion stays off there), batch windows, contexts past 13K.
+- **Decode: 7-8 token windows keep the wide hyper-connection down (`STRATA_HC_WIDE8=1`, opt-in).** With
+  `STRATA_NODE_FUSE=1` on, the stage profile (`STRATA_VERIFY_PROFILE=1 STRATA_DECODE_TIMING=1`) of a copy-heavy answer
+  (7.4 tokens a window) showed the hyper-connection down at 0.99 ms and the up at 0.94 ms per window over a card's 18
+  GDN layers, twice their time at 2 tokens. The cause: `STRATA_HC_WIDE`'s one-block-per-row down ran only when the
+  whole window fit one launch of the staged kernel's token chunk, 6 tokens on a 64 KB LDS card, so a 7- or 8-token
+  window fell back to the staged kernel in two launches. The row kernel keeps no tokens in dynamic shared memory;
+  `STRATA_HC_WIDE8=1` gives it all 8 in one launch (its token loop). Every token's sums are the row kernel's:
+  `hip_node_fuse_parity` compares the read with `STRATA_HC_WIDE=3 STRATA_HC_WIDE8=1` against the default (staged,
+  chunked) read, 1-8 tokens, with and without the pending write, every output bitwise. Same setup as the table above,
+  `STRATA_NODE_FUSE=1` in both arms, alternated:
+
+  | run | greedy | sampled | copy-heavy |
+  |---|---|---|---|
+  | without, 1 / 2 / 3 | 129.2 / 129.1 / 129.2 | 117.9 / 117.8 / 117.8 | 353.2 / 353.2 / 353.0 |
+  | `STRATA_HC_WIDE8=1`, 1 / 2 / 3 | 129.2 / 129.2 / 129.1 | 117.6 / 117.6 / 117.5 | 372.0 / 372.0 / 372.1 |
+
+  Copy-heavy +5.3%, greedy unchanged, sampled -0.3% (the first sampled question, 164.3 -> 163.5 in all three pairs;
+  not explained: its windows of 7-8 tokens should only be faster). Same hashes in every run. Not measured: windows
+  of 7-8 tokens on cards whose staged chunk is 8 already (they take the row kernel without the switch).
 - **File-tier cache rule on gfx906 (`STRATA_FILE_CACHE_OLD_RULE`):** on an MI50 ROCm queues are suspended while the kernel reclaims around the process's HMM-tracked arena (#1752, KevinX8: stalls, prompt 46 -> 360 tok/s once the file tier stops churning the page cache). The gfx906 backend therefore keeps the old rule (the file cache is used only when the room left is at least the bytes read from the files); other HIP cards keep the current rule. `STRATA_FILE_CACHE_OLD_RULE=1` forces the old rule on any Linux build, `=0` the current one.
 - **Windows** (the report above): setup's ready-made Windows engine 0.1.39 runs the RX 6800 beside a 780M iGPU
   (HIP numbers the RX 6800 1; setup points the engine at it), and `tools/hip/build_windows.bat` with
