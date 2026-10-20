@@ -94,10 +94,12 @@ class Tables(unittest.TestCase):
 
     def test_the_older_choices_are_as_they_were(self):
         self.assertEqual(list(setup.FAMILIES)[:4], ["qwen", "swift", "coder", "unsloth"])   # the menu's first four
-        self.assertEqual(list(setup.MODELS)[:7], ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ1_M", "UD-Q4_K_XL",
-                                                  "UD-IQ4_XS"])
+        # upstream's order (0.2.0: UD-IQ4_XS first of Unsloth's, then UD-Q4_K_XL ... Q8_0); the community size last
+        self.assertEqual(list(setup.MODELS)[:7], ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ1_M", "UD-IQ4_XS",
+                                                  "UD-Q4_K_XL"])
+        self.assertEqual(list(setup.MODELS)[-1], "Q4_0")
         for f, sizes in (("qwen", ["Q2_0", "IQ2_XS", "IQ3_XXS", "IQ3_S"]), ("swift", ["IQ2_XS", "IQ3_XXS", "IQ3_S"]),
-                         ("coder", ["IQ1_M"]), ("unsloth", ["UD-Q4_K_XL", "UD-IQ4_XS"])):
+                         ("coder", ["IQ1_M"]), ("unsloth", ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])):
             self.assertEqual([m for m in setup.MODELS if f in setup.MODELS[m].get("families", ("qwen", "swift"))],
                              sizes, f)
         for m, gb in (("IQ3_XXS", (75.8, 60, 42.9)), ("IQ3_S", (83.6, 62, 50.3))):
@@ -150,6 +152,7 @@ class Install(unittest.TestCase):
         eng = self.t / "engine"
         eng.mkdir(exist_ok=True)
         (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.43.1", "source": "local", "lib_dirs": ["<rocm>"]}))
+        (eng / "strata-vision").write_bytes(b"x")       # the CPU picture reader (strata_control/vision_reader.py)
         for rel in before:
             f = self.t / "models" / rel
             f.parent.mkdir(parents=True, exist_ok=True)
@@ -256,7 +259,7 @@ class Install(unittest.TestCase):
         val, pack = self.check("bartowski-swift", cfg, out)
         self.assertIn("--compat-bf16", pack)                # its small projections are Q4_0: read as BF16
         self.assertNotIn("--ple-gguf", cfg["args"])         # three shards: the engine finds the PLE table's itself
-        self.assertNotIn("vision", cfg)                     # --yes: images off
+        self.assertIn("vision", cfg)                        # --yes: images on (upstream 0.2.0: wherever the model reads them)
         self.assertIn("Swift Open License 1.0", out)
         self.assertIn("size: Q4_0", out)
         self.assertNotIn("low-RAM mode", out)               # 92 GB: all 68 GB of experts in RAM
@@ -307,7 +310,7 @@ class Install(unittest.TestCase):
         code, out, cfg = self.main("sc117-abl", before=["IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
         self.assertEqual(code, 0, out)
         names = BUILDS["sc117-abl"][4]
-        self.assertEqual([d[1].name for d in self.downloads], names[:1])
+        self.assertEqual([d[1].name for d in self.downloads if "mmproj" not in d[0]], names[:1])
         self.assertIn("shared with IQ3_S (identical file)", out)
         self.assertEqual([v[0] for v in self.verified], names)
 
@@ -315,7 +318,7 @@ class Install(unittest.TestCase):
         code, out, cfg = self.main("sc117-swift-abl",
                                    before=["IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
         self.assertEqual(code, 0, out)
-        self.assertEqual([d[1].name for d in self.downloads], BUILDS["sc117-swift-abl"][4])
+        self.assertEqual([d[1].name for d in self.downloads if "mmproj" not in d[0]], BUILDS["sc117-swift-abl"][4])
 
     def test_q4_0_on_64_gb_is_the_low_ram_mode(self):
         """Not measured with this file: what setup decides for it is what it decides for any size whose experts do
