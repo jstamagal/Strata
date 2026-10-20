@@ -286,6 +286,9 @@ bool run_real_iq3_first_expert(Context & ctx, hipStream_t stream, const std::str
 int main(int argc, char ** argv) {
     try {
         if (argc > 2) throw std::runtime_error("usage: mmq-parity-test [optional-native-pack-dir]");
+        // the K-quant MMQ instances run only with STRATA_MMQ_KQ=1 (the gfx103x engine defaults set it): screen
+        // them unless the caller said otherwise
+        setenv("STRATA_MMQ_KQ", "1", 0);
         hip_check(hipSetDevice(0), "hipSetDevice");
         hipStream_t stream = nullptr;
         hip_check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
@@ -328,6 +331,13 @@ int main(int argc, char ** argv) {
             // activations)
             for (const ggml_type t : {(ggml_type) 145, (ggml_type) 146, (ggml_type) 144}) {
                 if (!supported((int) t)) { std::cout << "type " << (int) t << ": no MMQ instance in this build\n"; continue; }
+                // the overlay build (STRATA_MMQ_TQ_OVERLAY, the pinned llama.cpp) has the device instances but its
+                // host ggml has no traits for these types: no name, no host quantizer for the reference
+                const auto * ttr = (int) t < (int) GGML_TYPE_COUNT ? ggml_get_type_traits(t) : nullptr;
+                if (!ttr || !ttr->type_name || !ttr->from_float_ref || !ttr->to_float) {
+                    std::cout << "type " << (int) t << ": skipped, this ggml has no host traits for it (the agention fork has)\n";
+                    continue;
+                }
                 const std::vector<int> counts{2, 3};
                 const auto src = permutation(5, 1, false), dst = permutation(5, 2, true);
                 const std::string tn = ggml_type_name(t);
