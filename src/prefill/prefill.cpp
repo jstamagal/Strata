@@ -3473,6 +3473,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_PF_SIDE_STREAM: k, v and the indexer's projections (N 512 / 128) and K's norm and RoPE
                     // on the second stream beside the q projection (N 12288); joined before anything reads them
                     const bool q_side = T >= stream_all_min() && side_ready();
+                    bool q16 = false;   // STRATA_PF_NOWIDEN: Qf holds the q projection's FP16 output
                     if (q_side) {
                         side_fork();
                         if (!native_proj(m.gemm_sh, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
@@ -3482,14 +3483,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.sh_s);
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.sh_s);
                         cudaEventRecord(m.sh_join, m.sh_s);
+                        if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                         if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                        q16 = pf_nowiden() && m.gemm.kept_f16();
                         cudaStreamWaitEvent(m.cs, m.sh_join, 0);
                     } else {
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     if (pf_nowiden() && m.f16_io) m.gemm.keep_f16_next();
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
-                    const bool q16 = pf_nowiden() && m.gemm.kept_f16();
+                    q16 = pf_nowiden() && m.gemm.kept_f16();
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
