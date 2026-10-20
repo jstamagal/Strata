@@ -353,6 +353,9 @@ bool time_shape(ggml_type type, int64_t w_rows, int64_t cols, const std::vector<
 
 int main(int argc, char** argv) {
     try {
+        // since the merge of upstream 0.2.0 the K-quant instances run only with STRATA_MMQ_KQ=1 (the gfx103x engine
+        // defaults set it); without it a KQUANTS build skipped here
+        setenv("STRATA_MMQ_KQ", "1", 0);
         if (!mmq::supported(GGML_TYPE_Q4_K) || !mmq::supported(GGML_TYPE_Q5_K) || !mmq::supported(GGML_TYPE_Q6_K)) {
             std::printf("SKIP: this build has no K-quant MMQ instances (-DSTRATA_MMQ_KQUANTS=ON)\n");
             return 77;
