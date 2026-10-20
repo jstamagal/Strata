@@ -8663,6 +8663,20 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        // Lazily allocated only for pipelined requests with penalties. Keep the pinned staging alive
+        // across requests; freeing pinned memory in the decode loop would synchronise the device.
+        struct PipelineHistory {
+            int dev;
+            int32_t* device[2] = {};
+            int32_t* host[2] = {};
+            ~PipelineHistory() {
+                const strata::core::OnDevice on(dev);
+                for (int par = 0; par < 2; ++par) {
+                    if (device[par]) cudaFree(device[par]);
+                    if (host[par]) cudaFreeHost(host[par]);
+                }
+            }
+        } pl_hist{hist_dev};
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -13945,7 +13959,6 @@ int main(int argc, char** argv) {
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -13955,6 +13968,19 @@ int main(int argc, char** argv) {
             }
             if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
                 pl_ran = true;
+                if (hist_n > 0) {
+                    const strata::core::OnDevice on(hist_dev);
+                    for (int par = 0; par < 2; ++par) {
+                        if (pl_hist.device[par] == nullptr &&
+                            (cudaMalloc(&pl_hist.device[par], kHistSlots * sizeof(int32_t)) != cudaSuccess ||
+                             cudaHostAlloc((void**) &pl_hist.host[par], kHistSlots * sizeof(int32_t),
+                                           cudaHostAllocPortable) != cudaSuccess)) {
+                            std::printf("ERR pipeline: penalty-history allocation failed\n");
+                            return 1;
+                        }
+                        PV[0][par]->set_history(pl_hist.device[par], hist_n);   // the whole parity's chain
+                    }
+                }
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -14521,6 +14547,22 @@ int main(int argc, char** argv) {
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
                         if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                        if (hist_n > 0) {
+                            // Only A reaches the head, after its predecessor's real verdict. Thus consumed
+                            // already includes that predecessor's accepted inputs, and A.tok includes its
+                            // actual bonus (the guessed one only when correct). A discarded B/D never uploads.
+                            // pl_finish has completed this parity's previous sampling and H2D copy before
+                            // its pinned rows are rewritten. The head stream orders the upload after all
+                            // previous readers and before this window's launch and sampling.
+                            const int par = A.seq & 1;
+                            strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), A.tok, A.T,
+                                                          hist_n, pl_hist.host[par]);
+                            const strata::core::OnDevice on(hist_dev);
+                            if (cudaMemcpyAsync(pl_hist.device[par], pl_hist.host[par],
+                                                (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                                cudaMemcpyHostToDevice, pl_stream.back()) != cudaSuccess)
+                                return die("uploading the pipeline penalty history failed");
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
