@@ -1150,8 +1150,8 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   | `STRATA_HC_WIDE8=1`, 1 / 2 / 3 | 129.2 / 129.2 / 129.1 | 117.6 / 117.6 / 117.5 | 372.0 / 372.0 / 372.1 |
 
   Copy-heavy +5.3%, greedy unchanged, sampled -0.3%: the first sampled question, 164.3 -> 163.5 in all three pairs,
-  offers 224 draft tokens instead of 219 and keeps the same 196 (the pipelined windows take as many drafts as the
-  chain has ready when a stage launches, so faster stages change the windows, not the text). Same hashes in every
+  offers 224 draft tokens instead of 219 and keeps the same 196: faster stages change how many drafts the pipelined
+  windows carry, not the text (which part of the pipeline sizes them by timing was not traced). Same hashes in every
   run. Not measured: windows of 7-8 tokens on cards whose staged chunk is 8 already (they take the row kernel without
   the switch).
 - **Decode: the wide up kernel's sums as one transposed butterfly (`STRATA_HC_UP_TSUM=1`, opt-in).** The wide
