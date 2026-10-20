@@ -339,8 +339,11 @@ __device__ __forceinline__ int iq_grid_sign(unsigned grid, unsigned signs) {
 // IQ2_S uses the exact signed grid bytes and 16-value scales of MMQ's loader.
 // Decode 128 weights per thread, then reuse them across 16 token rows. The
 // activation address is uniform across the workgroup, allowing scalar loads.
+// TJ: activation rows (tokens) a block takes; each row's sum runs over c and b in the same order whatever TJ is, so
+// every TJ gives the same bits (STRATA_PF_IQ_TJ picks it; 16 is the default)
+template <int TJ>
 __global__ void __launch_bounds__(256) iq2s_sload_kernel(ArgsQ51 a) {
-    constexpr int TJ = 16, NT = 256, CW = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int NT = 256, CW = sizeof(block_q8_1_mmq) / sizeof(int);
     const int e = blockIdx.z;
     const int j0 = a.bounds[e] + (int) blockIdx.y * TJ;
     const int nj = min(TJ, a.bounds[e + 1] - j0);
@@ -392,9 +395,9 @@ __global__ void __launch_bounds__(256) iq2s_sload_kernel(ArgsQ51 a) {
 
 // IQ3 uses one weight scale per 32 values. Keep MMQ's integer dots and
 // floating expression, with the same positive-grid packed sign operation.
-template<bool XXS>
+template<bool XXS, int TJ>
 __global__ void __launch_bounds__(256) iq3_sload_kernel(ArgsQ51 a) {
-    constexpr int TJ = 16, CW = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int CW = sizeof(block_q8_1_mmq) / sizeof(int);
     const int e = blockIdx.z;
     const int j0 = a.bounds[e] + (int) blockIdx.y * TJ;
     const int nj = min(TJ, a.bounds[e+1] - j0);
@@ -486,10 +489,27 @@ void iq_tile_run(const Product& p, cudaStream_t s) {
     a.y = (const int*) p.xq; a.bounds = p.bounds; a.ids = p.ids;
     a.dst = p.dst; a.ld_dst = p.ld_dst; a.ncols_y = p.total_rows;
     a.w_rows = (int) p.w_rows; a.w_cols = (int) p.w_cols;
-    const dim3 g((p.w_rows+255)/256, (p.max_rows+15)/16, p.n);
-    if (p.type == GGML_TYPE_IQ2_S) iq2s_sload_kernel<<<g, 256, 0, s>>>(a);
-    else if (p.type == GGML_TYPE_IQ3_XXS) iq3_sload_kernel<true><<<g, 256, 0, s>>>(a);
-    else iq3_sload_kernel<false><<<g, 256, 0, s>>>(a);
+    // STRATA_PF_IQ_TJ=24 or 32 (opt-in, the same bits): more tokens a block, so each weight row's IQ decode (grid
+    // lookups, signs, scales) serves more of them; at 2,048-token chunks an expert has ~40 rows, three 16-row tiles
+    static const int tj = [] {
+        const char* v = std::getenv("STRATA_PF_IQ_TJ");
+        const int t = v ? std::atoi(v) : 16;
+        return t == 8 || t == 12 || t == 20 || t == 24 || t == 32 ? t : 16;
+    }();
+#define STRATA_IQ_TILE_GO(TJ_)                                                                   \
+    {                                                                                            \
+        const dim3 g((p.w_rows + 255) / 256, (p.max_rows + TJ_ - 1) / TJ_, p.n);                 \
+        if (p.type == GGML_TYPE_IQ2_S) iq2s_sload_kernel<TJ_><<<g, 256, 0, s>>>(a);              \
+        else if (p.type == GGML_TYPE_IQ3_XXS) iq3_sload_kernel<true, TJ_><<<g, 256, 0, s>>>(a);  \
+        else iq3_sload_kernel<false, TJ_><<<g, 256, 0, s>>>(a);                                  \
+    }
+    if (tj == 32) STRATA_IQ_TILE_GO(32)
+    else if (tj == 24) STRATA_IQ_TILE_GO(24)
+    else if (tj == 20) STRATA_IQ_TILE_GO(20)
+    else if (tj == 12) STRATA_IQ_TILE_GO(12)
+    else if (tj == 8) STRATA_IQ_TILE_GO(8)
+    else STRATA_IQ_TILE_GO(16)
+#undef STRATA_IQ_TILE_GO
     ck(cudaGetLastError(), "product (iq tile)");
 }
 
