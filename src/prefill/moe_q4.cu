@@ -506,7 +506,18 @@ struct ArgsN {
     int w_rows, w_cols, split;
 };
 
-template <int TJ>
+// STRATA_PF_NL_PERM=1 (opt-in): the 16 IQ4_NL values held in four registers and picked with v_perm_b32 (llama.cpp's
+// get_int_from_table_16 on HIP) instead of 4 lookups of nl_pairs per 32-bit word, each a 32-address gather through
+// the vector memory path.  The same int8 values, so the same dp4a sums and the same bits.
+__device__ __forceinline__ void nl_perm_decode(uint32_t x, uint32_t& lo, uint32_t& hi) {
+    constexpr uint32_t v0 = 0xBFAD9881u, v1 = 0xF6EADDCFu, v2 = 0x26190D01u, v3 = 0x71594535u;   // kvalues_iq4nl bytes
+    const uint32_t qe = x, qo = x >> 4;
+    const uint32_t el = __builtin_amdgcn_perm(v1, v0, qe & 0x07070707u), ol = __builtin_amdgcn_perm(v1, v0, qo & 0x07070707u);
+    const uint32_t eh = __builtin_amdgcn_perm(v3, v2, qe & 0x07070707u), oh = __builtin_amdgcn_perm(v3, v2, qo & 0x07070707u);
+    lo = __builtin_amdgcn_perm(eh, el, 0x03020100u | ((qe & 0x08080808u) >> 1));
+    hi = __builtin_amdgcn_perm(oh, ol, 0x03020100u | ((qo & 0x08080808u) >> 1));
+}
+template <int TJ, bool PERM = false>
 __global__ void __launch_bounds__(WI) nl_sload_kernel(ArgsN a) {
     constexpr int BLOCK_BYTES = 18;
     const int t = threadIdx.x;
@@ -533,10 +544,14 @@ __global__ void __launch_bounds__(WI) nl_sload_kernel(ArgsN a) {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const uint32_t x = load32(blk + 2 + 4 * k);
+                if constexpr (PERM) {
+                    nl_perm_decode(x, w[b * 8 + k], w[b * 8 + 4 + k]);
+                } else {
                 const uint32_t t0 = nl_pairs.v[x & 0xffu], t1 = nl_pairs.v[(x >> 8) & 0xffu],
                                t2 = nl_pairs.v[(x >> 16) & 0xffu], t3 = nl_pairs.v[x >> 24];
                 w[b * 8 + k] = (t0 & 0xffu) | ((t1 & 0xffu) << 8) | ((t2 & 0xffu) << 16) | (t3 << 24);   // weights 4k .. 4k+3
                 w[b * 8 + 4 + k] = (t0 >> 8) | ((t1 >> 8) << 8) | ((t2 >> 8) << 16) | ((t3 >> 8) << 24);   // 16+4k .. 16+4k+3
+                }
             }
         }
         const uint32_t* aj = a.y + ((size_t) c * (size_t) a.ncols_y + (size_t) j0) * CHUNK_WORDS;
@@ -717,7 +732,9 @@ void nl_run(const mmq::Product& p, void* stream) {
     }();
     const int tj = g_nl_tj > 0 ? g_nl_tj : env_tj > 0 ? env_tj : 32;
     const dim3 g((unsigned) ((p.w_rows + WI - 1) / WI), (unsigned) ((p.max_rows + tj - 1) / tj), (unsigned) p.n);
-    if (tj == 64) nl_sload_kernel<64><<<g, WI, 0, s>>>(a);
+    static const bool perm = [] { const char* v = std::getenv("STRATA_PF_NL_PERM"); return v != nullptr && v[0] == '1'; }();
+    if (perm && tj == 32) nl_sload_kernel<32, true><<<g, WI, 0, s>>>(a);
+    else if (tj == 64) nl_sload_kernel<64><<<g, WI, 0, s>>>(a);
     else if (tj == 48) nl_sload_kernel<48><<<g, WI, 0, s>>>(a);
     else if (tj == 40) nl_sload_kernel<40><<<g, WI, 0, s>>>(a);
     else if (tj == 24) nl_sload_kernel<24><<<g, WI, 0, s>>>(a);
