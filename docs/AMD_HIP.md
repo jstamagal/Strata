@@ -785,6 +785,30 @@ run it; the report below is from a community machine: an RX 6900 XT 16 GB (gfx10
   barriers taken out the inner loop alone runs at about 29 TFLOP/s, so what is left is the LDS-to-register traffic
   and the register budget (the kernel uses 254 of 256 VGPRs). Not measured: one card, another gfx103x card,
   Windows, other packs; CUDA and SYCL builds not built (the new code is HIP-only, with no-op stubs elsewhere).
+- **The FP16 GEMM outputs read without the in-place widening (`STRATA_PF_NOWIDEN=1`, opt-in, HIP, the FP16
+  prompt path, the same bits):** every dense product here is rocBLAS FP16 in / FP16 out, and `widen_rows_f16` then
+  turns the halves into floats in place: about 105 ms of the first stage's GPU time on a 16K prompt
+  (`STRATA_DENSE_TIMING=1`; GDN qkv 26 ms, gate 14, QSA q 12, the shared expert's gate + up 9, the out
+  projections 9, the shared expert's down 9, the rest under 6 each). With the switch the GDN qkv / gate, the QSA q,
+  both attention out projections and the shared expert's gate / up stay as the GEMM wrote them
+  (`Gemm::keep_f16_next`, now also honoured by `native()` and `f16()` when the weight fits the scratch in one piece)
+  and their readers widen each value as they load it: `gdn_conv`'s fused conv + L2 kernel (`STRATA_GDN_CONVL2`),
+  the recurrence's grid-stride out norm (`STRATA_GDN_HEAD`), `split_q`, `gate_attn`, `gr_write_norm_rs` and
+  `swiglu_pair`. Any other variant of those readers gets the rows widened first. `__half2float` is what the
+  widening stores, so the readers see the same floats: `hip_pf_nowiden_parity` checks each reader on the halves
+  against itself on the widened rows (T 1 .. 2048, the same bits), and one 3K-word prompt at temperature 0 (the CPU
+  share off) gives the same final residuals and the same answer with and without the switch, also with
+  `STRATA_HC_DOWNSK=8 STRATA_HC_UPMIX16=1` on in both arms. Widening left on the
+  first stage: 33 ms; its marked GPU time 6,779 -> 6,606 ms (the readers also read half the bytes). On 2x Radeon
+  PRO V620, the IQ3_S abliterated pack, the settings of the paragraph above, the arms alternated on one binary:
+  without 1,890.6 / 1,895.3 tok/s (4K prompt) and 2,500.9 / 2,503.8 (16K), with 1,924.6 / 1,925.8 / 1,923.9 and
+  2,549.7 / 2,551.5 / 2,546.4 (+1.8%, +1.9%). On top of `STRATA_HC_DOWNSK=8 STRATA_HC_UPMIX16=1` (1,937.6 /
+  2,566.7 the same hour): 1,970.7 / 1,966.8 / 1,971.2 and 2,613.2 / 1,924.5 / 2,613.5 (+1.7% and
+  +1.7% without the one low 16K run, not explained (other agents share the box)); against
+  no switch at all +4.1% / +4.4%. Not done: the shared expert's down output
+  (read by the MoE combine's four variants, 9 ms), the router / QSA k / v / indexer products (N 512, 6 ms), GDN
+  alpha / beta (4 ms). Not measured: one card, other gfx103x cards, Windows, other packs; CUDA and SYCL not built
+  (the readers' templates default to their FP32 form there).
 - **Streamed prompt experts by routing (`STRATA_PF_STREAM_ROUTED=1`, opt-in):** a pack that does not fit VRAM (Q4_0
   here: 19.6K of 24.6K expert pairs resident; UD-Q4_K_XL: 17.5-18.8K) streams the rest per prompt chunk. From 1,024
   tokens a chunk on, the engine copies EVERY non-resident expert of every layer, in a fixed order, so that the copies
