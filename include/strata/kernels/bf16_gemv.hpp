@@ -52,6 +52,13 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
 /// the weight read once, every output bit-identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
+/// STRATA_IDX_PAIR (HIP): bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) and
+/// bf16_gemv_fp32_mmvf_multi(x, ldx, w2, y2, ldy2, n_in, n_out2, n_tok) in ONE launch, every output bitwise the two
+/// calls'.  False (nothing launched) off HIP, with STRATA_MMVF_ROWS=1, for one row, or when the input width does not
+/// take the 256-thread block (2,560 does).
+bool bf16_gemv_fp32_mmvf_multi_pair(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int64_t n_out,
+                                    const uint16_t* w2, float* y2, int64_t ldy2, int64_t n_out2, int64_t n_in, int n_tok,
+                                    void* stream);
 /// S26 STRATA_LFUSE: bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) plus the 1-row
 /// bf16_gemv_fp32_mmvf_multi(x, ldx, w_aux, y_aux, ldy_aux, n_in, 1, n_tok) in ONE launch, every output bitwise the
 /// two calls'. Returns false (nothing launched) unless the rows path applies (STRATA_MMVF_ROWS=1, n_out >= 64, 2-8 rows).

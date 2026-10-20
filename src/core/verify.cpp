@@ -159,6 +159,9 @@ inline bool g_qfuse_hc() {
 }
 // STRATA_MMVQ_SET=1 (opt-in): a layer's projections of one input in one launch (native_mmvq_set)
 inline bool g_mmvq_set() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_SET"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+// STRATA_IDX_PAIR=1 / STRATA_QSA_GATE_Q8=1 (opt-in): two more pairs of a QSA layer's launches as one each
+inline bool g_idx_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_IDX_PAIR"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
+inline bool g_gate_q8() { static const bool on = [] { const char* v = std::getenv("STRATA_QSA_GATE_Q8"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -1307,6 +1310,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               IQ * ID, N, IQ * ID, n, df_side_[1]);
                     norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
                 }
+                // STRATA_IDX_PAIR=1 (opt-in, HIP): the indexer's key and query projections, both of this layer's input,
+                // in one launch (the query's rows are normalized and rotated where they were before)
+                bool idx_pair = false;
+                if (qb && !qbr && g_idx_pair() && !prof_on_)
+                    idx_pair = bf16_gemv_fp32_mmvf_multi_pair(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID,
+                                                              ID, ID, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID,
+                                                              IQ * ID, IQ * ID, N, n, cs);
+                if (idx_pair) {
+                } else
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
@@ -1415,6 +1427,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
+                    if (!idx_pair)
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);
                     norm_rope(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ);
@@ -1471,6 +1484,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                // STRATA_QSA_GATE_Q8=1 (opt-in, HIP): the output gate and the q8_1 image of its result in one launch
+                bool gate_q8 = false;
+                if (qb && g_gate_q8() && !prof_on_)
+                    gate_q8 = strata::kernels::native_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD,
+                                                                         attn32_ + tb * NH * HD, xq_, (int) (n * NH), (int) HD, cs);
+                if (gate_q8) {
+                } else
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
@@ -1482,6 +1502,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
+                if (!gate_q8)
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 il_ready = false;
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
