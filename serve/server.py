@@ -7757,8 +7757,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         print(f"[strata] {e}: set a key, or leave it out", file=sys.stderr)
         return 2
     if a.host not in ("127.0.0.1", "localhost", "::1") and not preflight_api_key:
-        print("[strata] a non-loopback bind requires an inference API key", file=sys.stderr, flush=True)
-        return 2
+        # this tree: a warning, as before 0.2.0 (upstream refuses to start); every device on the network can use it
+        print(f"[strata] warning: listening on {a.host} without an API key - anyone who can reach this port can use "
+              f"the server (--api-key or \"api_key\" in the config closes it)", file=sys.stderr, flush=True)
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
